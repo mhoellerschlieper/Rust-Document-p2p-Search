@@ -1,3 +1,5 @@
+# ExpChat.ai
+
 ## Uebersicht
 ExpChat.ai ist ein KI-Chat-Client mit Fokus auf mittelstaendische Anwendungsfaelle und eine verteilte, peer to peer basierte Zusammenarbeit, bei der Kommunikation, Dateiuebertragung sowie lokale und verteilte Suchfaehigkeiten in einem einheitlichen Client zusammengefuehrt werden. Das System adressiert insbesondere Szenarien, in denen Wissensmanagement, sichere Teamkommunikation und datennahe Recherche ueber heterogene Dokumentbestaende hinweg erforderlich sind, ohne dass zwingend ein zentraler Server als Single Point of Failure betrieben werden muss (Schlieper, 2025).
 
@@ -17,10 +19,7 @@ ExpChat.ai ist ein KI-Chat-Client mit Fokus auf mittelstaendische Anwendungsfael
 - Hybrid Suche als zweistufiges Verfahren mit Kandidatengenerierung und Re Ranking.
 
 ## Architektur in Kurzform
-ExpChat.ai kombiniert drei wesentliche Subsysteme, die jeweils auf robuste, in der Praxis bewaehrte Bibliotheken aufsetzen: 
-(1) ein Netzwerk Stack auf Basis von libp2p fuer Discovery und PubSub Transport, 
-(2) ein lokales Indizierungs und Retrieval Subsystem fuer Volltext (Tantivy) sowie Semantik (Embeddings, brute force Cosine Similarity), und 
-(3) eine CLI gesteuerte Interaktionsschicht, welche Chat, Dateioperationen und Suchoperationen vereinheitlicht. Die Index Aktualisierung erfolgt zeitgesteuert, um die Systemlast zu begrenzen und zugleich eine hinreichende Aktualitaet sicherzustellen (Manning et al., 2008).
+ExpChat.ai kombiniert drei wesentliche Subsysteme, die jeweils auf robuste, in der Praxis bewaehrte Bibliotheken aufsetzen: (1) ein Netzwerk Stack auf Basis von libp2p fuer Discovery und PubSub Transport, (2) ein lokales Indizierungs und Retrieval Subsystem fuer Volltext (Tantivy) sowie Semantik (Embeddings, brute force Cosine Similarity), und (3) eine CLI gesteuerte Interaktionsschicht, welche Chat, Dateioperationen und Suchoperationen vereinheitlicht. Die Index Aktualisierung erfolgt zeitgesteuert, um die Systemlast zu begrenzen und zugleich eine hinreichende Aktualitaet sicherzustellen (Manning et al., 2008).
 
 ## Voraussetzungen
 ### Toolchain
@@ -38,12 +37,10 @@ Unter Windows kann zusaetzlich ein MSVC Toolchain Target erforderlich sein:
 ### Build
 - `cargo build --release`
 
-### Start eines Nodes
-`cargo run --release -- --listen /ip4/0.0.0.0/tcp/4001`
+### Start
+- `cargo run --release`
 
-Hinweis: 
-Je nach Projektstand kann die Anwendung automatisch auf TCP und QUIC binden oder optional per CLI Argumenten konfiguriert werden. 
-In Umgebungen mit restriktiven Firewalls ist eine explizite Konfiguration von Listen Adressen zweckmaessig.
+Hinweis: Je nach Projektstand kann die Anwendung automatisch auf TCP und QUIC binden oder optional per CLI Argumenten konfiguriert werden. In Umgebungen mit restriktiven Firewalls ist eine explizite Konfiguration von Listen Adressen zweckmaessig.
 
 ## Nutzung (CLI)
 Die Anwendung stellt typischerweise ein interaktives Prompt zur Verfuegung. Relevante Befehle sind unter anderem:
@@ -140,4 +137,6 @@ ExpChat.ai
 Der KI Chat Client fuer den Mittelstand aus Breckerfeld im Sauerland.
 RPA, KI Agents, KI Internet Research, KI Wissensmanagement.
 Adresse: Epscheider Str21 58339 Breckerfeld
-E-Mail: mschlieper@expchat.ai
+E-Mail: mschlieper@ylook.de
+Telefon: 49 2338 8748862
+Mobil: 49 15115751864
