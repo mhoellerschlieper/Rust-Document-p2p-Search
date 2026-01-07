@@ -1,0 +1,95 @@
+################################################################################
+# Cargo-Konfigurationsdatei
+# -------------------------------------------------------------
+# Projekt      : secure_p2p  –  ExpChat.ai
+# Beschreibung : Der KI-Chat-Client für den Mittelstand aus Breckerfeld
+# Autor        : Marcus Schlieper <mschlieper@expchat.ai>
+# Telefon      : +49 2338 8748862
+# Mobil        : +49 151 15751864
+# Unternehmen  : ExpChat.ai, Epscheider Str. 21, 58339 Breckerfeld
+################################################################################
+
+[package]
+name        = "secure_p2p"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+authors     = ["Marcus Schlieper <mschlieper@expchat.ai>"]
+description = "ExpChat.ai – Der KI-Chat-Client für den Mittelstand aus Breckerfeld im Sauerland."
+homepage    = "https://expchat.ai"
+repository  = "https://github.com/ExpChat-ai/secure_p2p"  # ggf. anpassen
+
+################################################################################
+# Abhängigkeiten
+################################################################################
+[dependencies]
+# ── Konsolen- und Logging-Infrastruktur ───────────────────────────────────────
+console             = { version = "0.16", default-features = true, features = ["ansi-parsing", "unicode-width"] }
+tracing-subscriber  = { version = "0.3.20", features = ["env-filter"] }
+
+# ── Netzwerk (libp2p) ─────────────────────────────────────────────────────────
+libp2p = { version = "0.56", default-features = false, features = [
+    "tcp", "noise", "yamux",
+    "mdns", "gossipsub", "identify", "kad", "ping",
+    "tokio", "macros", "quic"
+] }
+
+# ── Volltext- und Vektor-Suche ────────────────────────────────────────────────
+tantivy      = "0.19"
+rust-bert    = "0.23"
+hnsw         = { version = "0.11.0", features = ["serde"] }
+
+# ── Dokumenten­extraktion ─────────────────────────────────────────────────────
+pdf-extract  = "0.8"
+lopdf        = "0.31"            # Fallback für PDF-Parsing
+calamine     = { version = "0.31", default-features = false }
+zip          = "0.6"
+
+# ── Serialisierung & Persistenz ───────────────────────────────────────────────
+bincode  = "1.3"
+sled     = "0.34"
+smallvec = { version = "1.15", default-features = false, features = ["serde"] }
+
+
+# ── Kryptographie ─────────────────────────────────────────────────────────────
+aes-gcm-siv = { version = "0.11", features = ["std"] }
+rand        = { version = "0.8", features = ["std_rng"] }
+rand_core   = "0.6"
+blsttc      = "8.0"
+sha2        = "0.10"
+
+# ── Asynchronität & Nebenläufigkeit ───────────────────────────────────────────
+tokio        = { version = "1", features = ["full"] }
+futures      = "0.3"
+
+# ── Fehler- und Zeitbehandlung ────────────────────────────────────────────────
+anyhow       = "1"
+thiserror    = "1"
+humantime    = "2"
+chrono    = "0.4"
+
+# ── LLM-Runtime & Hot-Swap ────────────────────────────────────────────────────
+arc-swap       = "1"
+# llama_cpp_sys = { version = "0.3.2" }
+# Beispiel: CPU + OpenBLAS
+# llama_cpp_sys = { version = "0.3.2"}
+# Beispiel: NVIDIA-GPU
+#llama_cpp_sys = { version = "0.4", features = ["build", "cuda"] }
+
+# ── Serde-Ökosystem ───────────────────────────────────────────────────────────
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+
+################################################################################
+# Build-Profile
+################################################################################
+
+[profile.release]
+opt-level       = 3
+lto             = "thin"
+codegen-units   = 1
+debug           = false
+
+[profile.dev]
+debug           = true
+
