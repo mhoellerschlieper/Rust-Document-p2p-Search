@@ -1,0 +1,11 @@
+/target
+/tantivy_idx
+/vec_tracker
+/vector_idx
+/Documents
+/expchat_queue
+/processed_docs
+/.vs
+/.vscode
+Cargo.lock
+ann_graph.bin
