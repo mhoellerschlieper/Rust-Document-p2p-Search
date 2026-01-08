@@ -1,5 +1,5 @@
 ## Overview
-ExpChat.ai is an AI chat client focused on mid-sized business use cases and distributed, peer-to-peer collaboration, in which communication, file transfer, and local as well as distributed search capabilities are consolidated into a unified client. The system particularly addresses scenarios in which knowledge management, secure team communication, and data-proximate research across heterogeneous document collections are required, without necessarily having to operate a central server as a single point of failure (Schlieper, 2025).
+Rust-Document-p2p-Search particularly addresses scenarios in which knowledge management, secure team communication, and data-proximate research across heterogeneous document collections are required, without necessarily having to operate a central server as a single point of failure (Schlieper, 2025).
 
 ## Core Features
 ### Secure P2P Communication
