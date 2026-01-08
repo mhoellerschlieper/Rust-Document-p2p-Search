@@ -1,142 +1,149 @@
+markdown
 # ExpChat.ai
 
-## Uebersicht
-ExpChat.ai ist ein KI-Chat-Client mit Fokus auf mittelstaendische Anwendungsfaelle und eine verteilte, peer to peer basierte Zusammenarbeit, bei der Kommunikation, Dateiuebertragung sowie lokale und verteilte Suchfaehigkeiten in einem einheitlichen Client zusammengefuehrt werden. Das System adressiert insbesondere Szenarien, in denen Wissensmanagement, sichere Teamkommunikation und datennahe Recherche ueber heterogene Dokumentbestaende hinweg erforderlich sind, ohne dass zwingend ein zentraler Server als Single Point of Failure betrieben werden muss (Schlieper, 2025).
+## Overview
+ExpChat.ai is an AI chat client focused on mid-sized business use cases and distributed, peer-to-peer collaboration, in which communication, file transfer, and local as well as distributed search capabilities are consolidated into a unified client. The system particularly addresses scenarios in which knowledge management, secure team communication, and data-proximate research across heterogeneous document collections are required, without necessarily having to operate a central server as a single point of failure (Schlieper, 2025).
 
-## Kernfunktionen
-### Sichere P2P Kommunikation
-- Peer Discovery via mDNS und Messaging via libp2p gossipsub.
-- Ende zu Ende Verschluesselung der Nutzdaten mit AES GCM SIV (256 Bit).
-- Signierungskonzept auf Basis von BLS Threshold Bausteinen (derzeit als Grundstruktur integriert).
+## Core Features
+### Secure P2P Communication
+- Peer discovery via mDNS and messaging via libp2p gossipsub.
+- End-to-end encryption of user payloads using AES GCM SIV (256-bit).
+- A signing concept based on BLS threshold components (currently integrated as a basic structure).
 
-### Dateiuebertragung und DOS aehnliche Befehle
-- Interaktive CLI Befehle fuer Verzeichnislisting und Dateioperationen.
-- Dateiuebertragung als Chunk Payload (Grundstruktur vorhanden; je nach Branch kann der Transfer vereinfacht oder erweitert sein).
+### File Transfer and DOS-like Commands
+- Interactive CLI commands for directory listing and file operations.
+- File transfer implemented as chunked payloads (basic structure available; depending on the branch, transfer may be simplified or extended).
 
-### Lokale und verteilte Suche
-- Volltextsuche via Tantivy (BM25) mit periodischem Crawler fuer das Verzeichnis `./Documents`.
-- Semantische Vektorsuche via Sentence Transformer Embeddings.
-- Hybrid Suche als zweistufiges Verfahren mit Kandidatengenerierung und Re Ranking.
+### Local and Distributed Search
+- Full-text search via Tantivy (BM25) with a periodic crawler for the `./Documents` directory.
+- Semantic vector search via sentence-transformer embeddings.
+- Hybrid search implemented as a two-stage procedure with candidate generation and re-ranking.
 
-## Architektur in Kurzform
-ExpChat.ai kombiniert drei wesentliche Subsysteme, die jeweils auf robuste, in der Praxis bewaehrte Bibliotheken aufsetzen: (1) ein Netzwerk Stack auf Basis von libp2p fuer Discovery und PubSub Transport, (2) ein lokales Indizierungs und Retrieval Subsystem fuer Volltext (Tantivy) sowie Semantik (Embeddings, brute force Cosine Similarity), und (3) eine CLI gesteuerte Interaktionsschicht, welche Chat, Dateioperationen und Suchoperationen vereinheitlicht. Die Index Aktualisierung erfolgt zeitgesteuert, um die Systemlast zu begrenzen und zugleich eine hinreichende Aktualitaet sicherzustellen (Manning et al., 2008).
+## Architecture in Brief
+ExpChat.ai combines three essential subsystems, each building on robust, well-established libraries: (1) a networking stack based on libp2p for discovery and PubSub transport, (2) a local indexing and retrieval subsystem for full text (Tantivy) as well as semantics (embeddings, brute-force cosine similarity), and (3) a CLI-driven interaction layer that unifies chat, file operations, and search operations. Index updates are time-scheduled to limit system load while ensuring sufficient freshness (Manning et al., 2008).
 
-## Voraussetzungen
+## Prerequisites
 ### Toolchain
-- Rust stable (empfohlen: aktuelle rustup Version)
+- Rust stable (recommended: current rustup version)
 - cargo
 
-Beispiel:
+Example:
 - `rustup update`
 
-### Plattform Hinweise
-Unter Windows kann zusaetzlich ein MSVC Toolchain Target erforderlich sein:
+### Platform Notes
+On Windows, an MSVC toolchain target may additionally be required:
 - `rustup target add x86_64-pc-windows-msvc`
 
-## Build und Run
+## Build and Run
 ### Build
 - `cargo build --release`
 
 ### Start
 - `cargo run --release`
 
-Hinweis: Je nach Projektstand kann die Anwendung automatisch auf TCP und QUIC binden oder optional per CLI Argumenten konfiguriert werden. In Umgebungen mit restriktiven Firewalls ist eine explizite Konfiguration von Listen Adressen zweckmaessig.
+Note: Depending on the project state, the application may bind automatically to TCP and QUIC or be optionally configurable via CLI arguments. In environments with restrictive firewalls, explicitly configuring listen addresses is advisable.
 
-## Nutzung (CLI)
-Die Anwendung stellt typischerweise ein interaktives Prompt zur Verfuegung. Relevante Befehle sind unter anderem:
+## Usage (CLI)
+The application typically provides an interactive prompt. Relevant commands include, among others:
 
-- `help` oder `menu`  
-  Zeigt die verfuegbaren Befehle.
+- `help` or `menu`  
+  Displays the available commands.
 
 - `peers`  
-  Listet entdeckte Peers.
+  Lists discovered peers.
 
-- `connect <idx>`  
-  Initiiert eine Session mit einem Peer aus der Peerliste.
+- `connect `  
+  Initiates a session with a peer from the peer list.
 
-- `write <text>`  
-  Sendet eine Chat Nachricht an den verbundenen Peer.
+- `write `  
+  Sends a chat message to the connected peer.
 
 - `dir`  
-  Fordert ein Verzeichnislisting an.
+  Requests a directory listing.
 
-- `type <file>`  
-  Fordert Dateiinhalt an (remote).
+- `type `  
+  Requests file contents (remote).
 
-- `get <file>`  
-  Laedt eine Datei vom Partner.
+- `get `  
+  Downloads a file from the peer.
 
-- `put <path>`  
-  Sendet eine lokale Datei an den Partner.
+- `put `  
+  Sends a local file to the peer.
 
-- `search <query>`  
-  Fuehrt eine BM25 Schlagwortsuche lokal aus und verteilt die Anfrage zusaetzlich im P2P Netz.
+- `search `  
+  Performs a local BM25 keyword search and additionally distributes the query in the P2P network.
 
-- `vec_search <query>`  
-  Fuehrt eine semantische Suche lokal aus und verteilt die Anfrage zusaetzlich im P2P Netz.
+- `vec_search `  
+  Performs a local semantic search and additionally distributes the query in the P2P network.
 
-- `combi_search <query>`  
-  Fuehrt eine hybride Suche aus, typischerweise als Vektor Kandidaten plus BM25 Re Ranking oder umgekehrt, abhaengig von der Implementationsvariante.
+- `combi_search `  
+  Performs a hybrid search, typically as vector candidates plus BM25 re-ranking or vice versa, depending on the implementation variant.
 
-## Dokumentenindexierung
-### Dokumentverzeichnis
-- Standardpfad: `./Documents`
+## Document Indexing
+### Document Directory
+- Default path: `./Documents`
 
-### Unterstuetzte Dateitypen (Extraktion)
-Die Extraktion ist auf typische Office und Text Formate ausgerichtet, unter anderem:
+### Supported File Types (Extraction)
+Extraction is oriented toward typical office and text formats, including:
 - txt
 - pdf
 - docx
 - xlsx, xls, csv
 - pptx
 
-### Index Aktualisierung
-Die Aktualisierung erfolgt periodisch; dabei werden geaenderte Dokumente anhand mtime und optional Hash Tracking erkannt. Dies reduziert Re Index Kosten und erhoeht die Deterministik bei wiederholten Laeufen.
+### Index Updates
+Updates are performed periodically; modified documents are detected via mtime and optionally hash tracking. This reduces re-indexing costs and increases determinism across repeated runs.
 
-## BM25 Char N Grams (Vektor Re Ranking)
-Fuer das BM25 Re Ranking der aus der Vektorsuche selektierten Kandidaten wird eine Char N Gram Tokenisierung eingesetzt, die robust gegen Rechtschreibvarianten, Flexion und gewisse OCR Artefakte ist. Die Groesse der N Grams ist einstellbar ueber eine Umgebungsvariable:
+## BM25 Character N-grams (Vector Re-ranking)
+For BM25 re-ranking of candidates selected via vector search, a character n-gram tokenization is used that is robust against spelling variations, inflection, and certain OCR artifacts. The n-gram size can be configured via an environment variable:
 
-- `BM25_NGRAM` in Range 3..6
+- `BM25_NGRAM` in range 3..6
 - Default: 5
 
-Beispiel (Linux, macOS):
+Example (Linux, macOS):
 - `export BM25_NGRAM=5`
 
-Beispiel (PowerShell):
-- `$env:BM25_NGRAM = "5"`
+Example (PowerShell):
+- `$env:BM25_NGRAM = &quot;5&quot;`
 
-## Sicherheitshinweise
-Das Projekt implementiert kryptographische Bausteine fuer Ende zu Ende Schutz; in produktiven Szenarien sind jedoch insbesondere folgende Punkte zwingend zu beachten:
-- Persistente, sicher verwaltete Schluessel statt Hardcoded Defaults.
-- Rotationskonzepte fuer Schluesselmaterial.
-- Formale Bedrohungsmodellierung und Penetration Tests fuer das konkrete Deployment.
+## Security Notes
+The project implements cryptographic components for end-to-end protection; however, in production scenarios the following points in particular must be strictly observed:
+- Persistent, securely managed keys instead of hardcoded defaults.
+- Rotation concepts for key material.
+- Formal threat modeling and penetration tests for the specific deployment.
 
-## KI Integration (optional)
-In bestimmten Umgebungen wird ein lokaler LLM Server genutzt, beispielsweise via llama.cpp. Ein typischer Ablauf umfasst:
+## AI Integration (Optional)
+In certain environments, a local LLM server is used, for example via llama.cpp. A typical workflow includes:
 - Installation
-- Start eines lokalen Inference Servers
-- Nutzung durch Agents oder Research Workflows
+- Starting a local inference server
+- Use by agents or research workflows
 
-Hinweis: Die konkrete Modellwahl, Lizenzierung und die Absicherung des Inference Endpoints sind in Abhaengigkeit von Einsatzgebiet und Compliance Vorgaben zu gestalten.
+Note: The concrete model selection, licensing, and securing of the inference endpoint must be designed according to the use case and compliance requirements.
 
-## Projektstruktur (Beispiel)
+## Project Structure (Example)
 - `main.rs`  
-  Netzwerklayer, CLI, Payload Handling, Search Dispatch.
+  Network layer, CLI, payload handling, search dispatch.
 - `vector_idx.rs`  
-  Embedding Modell, Vektorindex, Sync, Query, BM25 Re Ranking (Char N Grams).
+  Embedding model, vector index, sync, query, BM25 re-ranking (character n-grams).
 
-## Roadmap (indikativ)
-- Stabilisierung von Schluesselmanagement und Session Handshake.
-- Verbesserte Dateiuebertragung mit Sliding Window ACK und Resume.
-- Optionaler ANN Index fuer groeessere Korpora jenseits von brute force.
-- Erweiterte Observability (Tracing, Metriken, Audit Merkle Root).
+## Roadmap (Indicative)
+- Stabilization of key management and session handshake.
+- Improved file transfer with sliding-window ACK and resume.
+- Optional ANN index for larger corpora beyond brute force.
+- Extended observability (tracing, metrics, audit Merkle root).
 
-## Kontakt
-```text
+## Contact
+text
 ExpChat.ai
-Der KI Chat Client fuer den Mittelstand aus Breckerfeld im Sauerland.
-RPA, KI Agents, KI Internet Research, KI Wissensmanagement.
-Adresse: Epscheider Str21 58339 Breckerfeld
-E-Mail: mschlieper@ylook.de
-Telefon: 49 2338 8748862
-Mobil: 49 15115751864
+The AI chat client for mid-sized businesses from Breckerfeld in the Sauerland region.
+RPA, AI agents, AI internet research, AI knowledge management.
+Address: Epscheider Str21 58339 Breckerfeld
+Email: mschlieper@ylook.de
+Phone: 49 2338 8748862
+Mobile: 49 15115751864
+
+
+## References
+Manning, C. D., Raghavan, P., &amp; Schuetze, H. (2008). *Introduction to Information Retrieval*. Cambridge University Press.
+
+Schlieper, M. (2025). *ExpChat.ai: Secure p2p client with hybrid search and document intelligence* (Unpublished internal project document). ExpChat.ai.
