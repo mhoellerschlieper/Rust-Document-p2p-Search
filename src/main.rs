@@ -23,11 +23,12 @@
  *                                – Verteilte Verarbeitung über neue Payload-Typen
  *                                – Ausgabe lokaler Treffer + Response an Remote-Peer
  *                                – Sichere Kommunikation bleibt unverändert (AES-GCM-SIV)
- * 
- * 
- * 
+ *
+ *
+ *
  **********************************************************************************************/
 #![allow(clippy::needless_return)]
+#![allow(warnings)]
 
 /* ═════════════════════════════════════ Imports ══════════════════════════════════════════════ */
 use aes_gcm_siv::{
@@ -84,9 +85,10 @@ use zip::read::ZipArchive;
 /* --- Eigene Importe ---------------------------------------------------------------------- */
 mod vector_idx;
 
-use crate::vector_idx::VectorIndex;
-use vector_idx::{load_or_init_index, persist_index };
 use crate::vector_idx::cosine;
+use crate::vector_idx::VecSearchHit;
+use crate::vector_idx::VectorIndex;
+use vector_idx::{load_or_init_index, persist_index};
 
 /* ═════════════════════════════════════ Konstanten ══════════════════════════════════════════ */
 const CHUNK_SIZE: usize = 65_536; /* 64 KiB                        */
@@ -98,18 +100,16 @@ const IDX_INTERVAL_SEC: u64 = 30;
 /* ═════════════════════════════ Payload-Strukturen ═════════════════════════════════════════ */
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum PayloadType {
-    /* Chat | Datei */
     Text(String),
     DirRequest,
     DirResponse(String),
     FileRequest(String),
     FileTransfer(FileChunk),
     ChunkAck(u32),
-    /* Verbindung */
     ConnectRequest,
     ConnectAck,
     OfflineFlush,
-    /* Suche */
+
     SearchRequest {
         i_id: u64,
         s_query: String,
@@ -119,6 +119,7 @@ enum PayloadType {
         s_peer: String,
         v_hits: Vec<SearchHit>,
     },
+
     VecSearchRequest {
         i_id: u64,
         s_query: String,
@@ -126,8 +127,9 @@ enum PayloadType {
     VecSearchResponse {
         i_id: u64,
         s_peer: String,
-        v_hits: Vec<(String, f32)>,
+        v_hits: Vec<VecSearchHit>,
     },
+
     CombiSearchRequest {
         i_id: u64,
         s_query: String,
@@ -381,6 +383,100 @@ impl TantivyIndex {
     /* Rekursives Crawling + Indizieren ----------------------------------------------------- */
 }
 
+const I_SNIPPET_MAX_LEN: usize = 320;
+const I_SNIPPET_SCAN_MAX_LEN: usize = 32_000;
+
+fn normalize_for_match(s_in: &str) -> String {
+    // ASCII only, lower, normalize whitespace. Safe, bounded by input length.
+    let mut s_out = String::with_capacity(s_in.len().min(I_SNIPPET_SCAN_MAX_LEN));
+    let mut b_prev_space = false;
+
+    for ch in s_in.chars().take(I_SNIPPET_SCAN_MAX_LEN) {
+        let ch_l = ch.to_ascii_lowercase();
+        if ch_l.is_ascii_alphanumeric() {
+            s_out.push(ch_l);
+            b_prev_space = false;
+        } else {
+            if !b_prev_space {
+                s_out.push(' ');
+                b_prev_space = true;
+            }
+        }
+    }
+
+    s_out.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+fn extract_query_tokens(s_query: &str) -> Vec<String> {
+    // Simple tokenization for snippet bias. Keeps only ascii alnum tokens length >= 2.
+    let s_norm = normalize_for_match(s_query);
+    let mut v_out: Vec<String> = Vec::new();
+    for s_t in s_norm.split_whitespace() {
+        if s_t.len() >= 2 {
+            v_out.push(s_t.to_string());
+        }
+    }
+    v_out
+}
+
+fn build_snippet_for_query(s_text: &str, s_query: &str) -> String {
+    // Query-biased window snippet with safe fallback.
+    // Uses normalized match to find a token position in original text approximately.
+    let s_text_trim = s_text.trim();
+    if s_text_trim.is_empty() {
+        return String::new();
+    }
+
+    let s_norm = normalize_for_match(s_text_trim);
+    if s_norm.is_empty() {
+        // Fallback: first chars from original
+        return s_text_trim
+            .chars()
+            .take(I_SNIPPET_MAX_LEN)
+            .collect::<String>();
+    }
+
+    let v_q = extract_query_tokens(s_query);
+    if v_q.is_empty() {
+        return s_text_trim
+            .chars()
+            .take(I_SNIPPET_MAX_LEN)
+            .collect::<String>();
+    }
+
+    // Find earliest occurrence of any token in normalized text
+    let mut i_best_pos: Option<usize> = None;
+    for s_t in &v_q {
+        if let Some(i_pos) = s_norm.find(s_t) {
+            i_best_pos = match i_best_pos {
+                None => Some(i_pos),
+                Some(old) => Some(old.min(i_pos)),
+            };
+        }
+    }
+
+    // If no token found: prefix snippet
+    let Some(i_pos_norm) = i_best_pos else {
+        return s_text_trim
+            .chars()
+            .take(I_SNIPPET_MAX_LEN)
+            .collect::<String>();
+    };
+
+    // Map normalized position to approximate char position in original by ratio.
+    // This is heuristic but safe and deterministic.
+    let d_ratio = (s_text_trim.len().max(1) as f64) / (s_norm.len().max(1) as f64);
+    let i_pos_orig = ((i_pos_norm as f64) * d_ratio) as usize;
+
+    let i_half = I_SNIPPET_MAX_LEN / 2;
+    let i_start = i_pos_orig.saturating_sub(i_half);
+    let i_end = (i_start + I_SNIPPET_MAX_LEN).min(s_text_trim.len());
+
+    let s_slice = &s_text_trim[i_start..i_end];
+    // Normalize whitespace for console / network
+    s_slice.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
 /* ========================================================================================== *
  *  ░░░ 3.  main.rs – Hilfsroutine combi_search()
  * ========================================================================================== */
@@ -389,19 +485,19 @@ impl TantivyIndex {
 /**********************************************************************************************
  *  Änderung   : 15.11.2025  MS  • Fuzzy-BM25 + Vektor-Fallback
  *********************************************************************************************/
-const GAMMA: f32 = 2.0;      // nicht-lineare Verstärkung
+const GAMMA: f32 = 2.0; // nicht-lineare Verstärkung
 const BM25_WEIGHT: f32 = 0.7; // α
-const VEC_WEIGHT: f32 = 0.3;  // β
+const VEC_WEIGHT: f32 = 0.3; // β
 const EXACT_BONUS: f32 = 0.15;
-const LLM_WEIGHT : f32 = 0.2;
+const LLM_WEIGHT: f32 = 0.2;
 
 /// Re-Ranking mit Aufwertung exakter Treffer
 /* Überarbeitete combi_search() -------------------------------------------------------------*/
 pub fn combi_search(
-    idx_tan : &TantivyIndex,
-    idx_vec : &Arc<VectorIndex>,
-    s_query : &str,
-    i_limit : usize,
+    idx_tan: &TantivyIndex,
+    idx_vec: &Arc<VectorIndex>,
+    s_query: &str,
+    i_limit: usize,
 ) -> Vec<(String, f32)> {
     /* 1. BM25-Kandidaten ------------------------------------------------------*/
     let mut v_bm = idx_tan.search(s_query, 200);
@@ -411,22 +507,19 @@ pub fn combi_search(
 
     /* 2. Embeddings -----------------------------------------------------------*/
     let v_q_vec = idx_vec.encode_query(s_query);
-    
+
     /* 3. Re-Ranking -----------------------------------------------------------*/
     let d_bm_max = v_bm.first().map(|h| h.d_score).unwrap_or(1.0);
     let mut v_combined = Vec::new();
 
     for SearchHit { s_doc, d_score } in v_bm.drain(..) {
-        if let Some(v_doc_vec) =
-            (idx_vec.vec_of(&s_doc))
-        {
+        if let Some(v_doc_vec) = (idx_vec.vec_of(&s_doc)) {
             /* Normierung */
-            let d_bm_n  = d_score / d_bm_max.max(1.0);
+            let d_bm_n = d_score / d_bm_max.max(1.0);
             let d_vec_n = cosine(&v_q_vec, &v_doc_vec).max(0.0); // 0..1
-            
+
             /* Finale Gewichtung */
-            let d_final: f32 =  BM25_WEIGHT * d_bm_n
-                        + VEC_WEIGHT  * d_vec_n;
+            let d_final: f32 = BM25_WEIGHT * d_bm_n + VEC_WEIGHT * d_vec_n;
 
             v_combined.push((s_doc, d_final));
         }
@@ -436,7 +529,6 @@ pub fn combi_search(
     v_combined.truncate(i_limit);
     v_combined
 }
-
 
 /* ────────────────────────────── Alias für Rückgabetyp ─────────────────────────────────────── */
 pub type ResultStr = std::result::Result<String, Box<dyn Error + Send + Sync>>;
@@ -719,7 +811,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     &tx_ack,
                                     idx_tan.clone(),   // BM25-Index
                                     idx_vec.clone(),   // Vektor-Index
-    
+
                                 ).await;
                             }
                         }
@@ -866,22 +958,32 @@ async fn handle_user_input(
         }
         s if s.starts_with("vec_search ") => {
             let s_query = s.strip_prefix("vec_search ").unwrap_or("").to_string();
-            /* 1. lokal */
+
+            // 1. lokal
             {
-                let v_res = idx_vec.query(&s_query, 5);
+                let v_res = idx_vec.query_with_snippets(&s_query, 5);
                 if v_res.is_empty() {
                     println!("(lokal) keine Vektor-Treffer");
                 } else {
                     println!("(lokal)");
-                    for (s_doc, d_score) in &v_res {
-                        println!("  {d_score:.4}  {s_doc}");
+                    for h in &v_res {
+                        println!(
+                            "  {d_score:.4}  {s_doc}",
+                            d_score = h.d_score,
+                            s_doc = h.s_doc
+                        );
+                        if !h.s_snippet.is_empty() {
+                            println!("    snippet: {s}", s = h.s_snippet);
+                        }
                     }
                 }
             }
-            /* 2. distributed */
+
+            // 2. distributed
             *i_search_ctr += 1;
             let i_id = *i_search_ctr;
             let local_id = swarm.local_peer_id().clone();
+
             send_encrypted(
                 &local_id,
                 swarm,
@@ -890,11 +992,12 @@ async fn handle_user_input(
             );
             println!("Vektor-Suche (ID {i_id}) gesendet.");
         }
+
         s if s.starts_with("combi_search ") => {
             let s_query = s.strip_prefix("combi_search ").unwrap_or("").to_string();
 
             /* 1. lokal */
-            let v_res = combi_search(&idx_tan, &idx_vec,  &s_query, 5);
+            let v_res = combi_search(&idx_tan, &idx_vec, &s_query, 5);
             if v_res.is_empty() {
                 println!("(lokal) keine Hybrid-Treffer");
             } else {
@@ -1034,12 +1137,12 @@ async fn handle_incoming(
         /* ------------- Vektor - Suche ------------------------------------------------------------ */
         PayloadType::VecSearchRequest { i_id, s_query } => {
             // 1. Index aktuell halten
-            idx_vec.sync(Path::new(DOC_DIR));
+            idx_vec.sync(std::path::Path::new(DOC_DIR));
 
-            // 2. Jetzt semantisch suchen
-            let v_hits = idx_vec.query(&s_query, 5);
+            // 2. Jetzt semantisch suchen + Snippets
+            let v_hits = idx_vec.query_with_snippets(&s_query, 5);
 
-            // 3. Antwort wie gehabt verschicken
+            // 3. Antwort verschicken
             let local_id = swarm.local_peer_id().clone();
             send_encrypted(
                 &local_id,
@@ -1060,8 +1163,19 @@ async fn handle_incoming(
             if v_hits.is_empty() {
                 println!("(ID {i_id}) {s_peer}: keine Vektor-Treffer");
             } else {
-                for (s_doc, d_score) in v_hits {
-                    println!("(ID {i_id}) {s_peer}: {d_score:.4} {s_doc}");
+                for h in v_hits {
+                    println!(
+                        "(ID {i_id}) {s_peer}: {d_score:.4} {s_doc}",
+                        d_score = h.d_score,
+                        s_doc = h.s_doc
+                    );
+
+                    if !h.s_snippet.trim().is_empty() {
+                        println!(
+                            "(ID {i_id}) {s_peer}: snippet: {s_snippet}",
+                            s_snippet = h.s_snippet
+                        );
+                    }
                 }
             }
         }
@@ -1070,7 +1184,6 @@ async fn handle_incoming(
 
             let v_hits = combi_search(&idx_tan, &idx_vec, &s_query, 5);
 
-            
             /* Lokale Konsolen-Ausgabe */
             if v_hits.is_empty() {
                 println!(

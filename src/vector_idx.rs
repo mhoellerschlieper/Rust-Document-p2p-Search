@@ -59,6 +59,16 @@ const BM25_NGRAM_DEFAULT: usize = 5;
 const BM25_NGRAM_MIN: usize = 3;
 const BM25_NGRAM_MAX: usize = 6;
 
+const I_SNIPPET_MAX_LEN: usize = 320;
+const I_SNIPPET_SCAN_MAX_LEN: usize = 32_000;
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct VecSearchHit {
+    pub s_doc: String,
+    pub d_score: f32,
+    pub s_snippet: String,
+}
+
 /* ----------------------- Aenderungs-Tracker (sled) --------------------------------------- */
 struct VecTracker {
     db: sled::Db,
@@ -119,6 +129,86 @@ pub struct VectorIndex {
     tracker: VecTracker,
 }
 
+fn normalize_for_match(s_in: &str) -> String {
+    let mut s_out = String::with_capacity(s_in.len().min(I_SNIPPET_SCAN_MAX_LEN));
+    let mut b_prev_space = false;
+
+    for ch in s_in.chars().take(I_SNIPPET_SCAN_MAX_LEN) {
+        let ch_l = ch.to_ascii_lowercase();
+        if ch_l.is_ascii_alphanumeric() {
+            s_out.push(ch_l);
+            b_prev_space = false;
+        } else {
+            if !b_prev_space {
+                s_out.push(' ');
+                b_prev_space = true;
+            }
+        }
+    }
+
+    s_out.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+fn extract_query_tokens(s_query: &str) -> Vec<String> {
+    let s_norm = normalize_for_match(s_query);
+    let mut v_out: Vec<String> = Vec::new();
+    for s_t in s_norm.split_whitespace() {
+        if s_t.len() >= 2 {
+            v_out.push(s_t.to_string());
+        }
+    }
+    v_out
+}
+
+fn build_snippet_for_query(s_text: &str, s_query: &str) -> String {
+    let s_text_trim = s_text.trim();
+    if s_text_trim.is_empty() {
+        return String::new();
+    }
+
+    let s_norm = normalize_for_match(s_text_trim);
+    if s_norm.is_empty() {
+        return s_text_trim
+            .chars()
+            .take(I_SNIPPET_MAX_LEN)
+            .collect::<String>();
+    }
+
+    let v_q = extract_query_tokens(s_query);
+    if v_q.is_empty() {
+        return s_text_trim
+            .chars()
+            .take(I_SNIPPET_MAX_LEN)
+            .collect::<String>();
+    }
+
+    let mut i_best_pos: Option<usize> = None;
+    for s_t in &v_q {
+        if let Some(i_pos) = s_norm.find(s_t) {
+            i_best_pos = match i_best_pos {
+                None => Some(i_pos),
+                Some(old) => Some(old.min(i_pos)),
+            };
+        }
+    }
+
+    let Some(i_pos_norm) = i_best_pos else {
+        return s_text_trim
+            .chars()
+            .take(I_SNIPPET_MAX_LEN)
+            .collect::<String>();
+    };
+
+    let d_ratio = (s_text_trim.len().max(1) as f64) / (s_norm.len().max(1) as f64);
+    let i_pos_orig = ((i_pos_norm as f64) * d_ratio) as usize;
+
+    let i_half = I_SNIPPET_MAX_LEN / 2;
+    let i_start = i_pos_orig.saturating_sub(i_half);
+    let i_end = (i_start + I_SNIPPET_MAX_LEN).min(s_text_trim.len());
+
+    let s_slice = &s_text_trim[i_start..i_end];
+    s_slice.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
 /* ----------------------------- Implementierung ------------------------------------------- */
 impl VectorIndex {
     pub fn new() -> Arc<Self> {
@@ -158,6 +248,47 @@ impl VectorIndex {
                 false
             }
         });
+    }
+
+    /******************************************************************************************
+     *  Funktion : query_with_snippets
+     *-----------------------------------------------------------------------------------------
+     *  Zweck    : Liefert Top-K Treffer mit Score und Text Snippet (query-biased).
+     *            Snippet ist laengenbegrenzt und verarbeitet maximal I_SNIPPET_SCAN_MAX_LEN Zeichen.
+     *
+     *  Historie
+     *  08.01.2026   MS   - Neu: Snippet Ausgabe fuer vec_search lokal und remote
+     ******************************************************************************************/
+    pub fn query_with_snippets(self: &Arc<Self>, s_query: &str, i_k: usize) -> Vec<VecSearchHit> {
+        if s_query.trim().is_empty() {
+            return Vec::new();
+        }
+        if i_k == 0 {
+            return Vec::new();
+        }
+
+        // Reuse existing retrieval (vector + bm25 rerank) to get ordered paths and scores.
+        // NOTE: query() currently returns (path, score) after BM25 rerank; keep it as ranking baseline.
+        let v_ranked: Vec<(String, f32)> = self.query(s_query, i_k);
+
+        let mut v_out: Vec<VecSearchHit> = Vec::with_capacity(v_ranked.len());
+        for (s_path, d_score) in v_ranked {
+            // Defensive: bounded extraction. extract_doc_text already handles formats.
+            let s_txt = extract_doc_text(Path::new(&s_path)).unwrap_or_else(|_| String::new());
+            let s_snip = if s_txt.is_empty() {
+                String::new()
+            } else {
+                build_snippet_for_query(&s_txt, s_query)
+            };
+
+            v_out.push(VecSearchHit {
+                s_doc: s_path,
+                d_score,
+                s_snippet: s_snip,
+            });
+        }
+
+        v_out
     }
 
     /******************************************************************************************
@@ -262,7 +393,9 @@ impl VectorIndex {
                     let b_changed = o_self
                         .tracker
                         .state(&s_path)
-                        .map_or(true, |(i_old_ts, a_old_h)| i_old_ts != i_ts || a_old_h != a_hash);
+                        .map_or(true, |(i_old_ts, a_old_h)| {
+                            i_old_ts != i_ts || a_old_h != a_hash
+                        });
 
                     if b_changed {
                         let v_vec = o_self
@@ -327,10 +460,8 @@ impl VectorIndex {
 
         let v_scores = Self::bm25_scores(&v_doc_tokens, &v_q_tokens, BM25_K1, BM25_B);
 
-        let mut v_scored: Vec<(String, f32)> = v_paths
-            .into_iter()
-            .zip(v_scores.into_iter())
-            .collect();
+        let mut v_scored: Vec<(String, f32)> =
+            v_paths.into_iter().zip(v_scores.into_iter()).collect();
 
         v_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         v_scored.truncate(k);
