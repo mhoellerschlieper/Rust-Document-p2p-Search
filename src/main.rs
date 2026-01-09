@@ -533,6 +533,7 @@ struct IamCliState {
 fn print_menu() {
     println!(
         "Verfuegbare Befehle
+  ========================================================================================================
   help | menu                     : Dieses Menue
   peers                           : Peerliste anzeigen
   connect <idx>                   : Verbindung zu Peer herstellen
@@ -544,22 +545,21 @@ fn print_menu() {
   search <query>                  : Schlagwortsuche im P2P Netz
   vec_search <query>              : Vektor Suche im P2P Netz
   combi_search <query>            : Hybrid Suche (BM25 + Vektor)
-
-  iam_help                        : IAM Menue
-  iam_status                      : IAM Status anzeigen
-  iam_group_add <group> <rights>  : Gruppe anlegen (rights als hex oder dezimal)
-  iam_user_add <user> <pass> <group> : User anlegen und Gruppe setzen
-  iam_user_add_to_group <user> <group> : User in Gruppe aufnehmen
+  ========================================================================================================
+  iam_status                                                : IAM Status anzeigen
+  iam_group_add <group> <rights>                            : Gruppe anlegen (rights als hex oder dezimal)
+  iam_user_add <user> <pass> <group>                        : User anlegen und Gruppe setzen
+  iam_user_add_to_group <user> <group>                      : User in Gruppe aufnehmen
   iam_path_add <path> <group_or_dash> <public0or1> <rights> : Pfadregel anlegen
 
-  iam_begin_login <user>          : Challenge erzeugen (lokal)
-  iam_finish_login <user> <challenge_id> <proof_hex_64> : Login abschliessen (lokal)
-  iam_logout                      : Session loeschen (lokal)
+  iam_begin_login <user>                                    : Challenge erzeugen (lokal)
+  iam_finish_login <user> <challenge_id> <proof_hex_64>     : Login abschliessen (lokal)
+  iam_logout                                                : Session loeschen (lokal)
 
-  iam_access_check <path> <right> <public0or1> : Rechte pruefen (lokal)
-  iam_sync                        : IAM Snapshot an Netz senden
-
-  exit                            : Programm beenden"
+  iam_access_check <path> <right> <public0or1>              : Rechte pruefen (lokal)
+  iam_sync                                                  : IAM Snapshot an Netz senden
+  ========================================================================================================
+  exit                                                      : Programm beenden"
     );
 }
 
