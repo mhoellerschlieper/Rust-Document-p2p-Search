@@ -82,13 +82,22 @@ use calamine::{open_workbook_auto, Reader as _};
 use pdf_extract::extract_text;
 use sled::IVec;
 use zip::read::ZipArchive;
-/* --- Eigene Importe ---------------------------------------------------------------------- */
+/* --- Eigene Importe vector---------------------------------------------------------------------- */
 mod vector_idx;
-
 use crate::vector_idx::cosine;
 use crate::vector_idx::VecSearchHit;
 use crate::vector_idx::VectorIndex;
 use vector_idx::{load_or_init_index, persist_index};
+
+/* --- Eigene Importe IAM ---------------------------------------------------------------------- */
+
+mod iam;
+mod iam_net;
+use crate::iam::{
+    iam_config, iam_store, right_admin, right_create, right_local, right_public, right_publish,
+    right_read, right_write,
+};
+use crate::iam_net::{iam_delta_push, iam_delta_request, iam_delta_response};
 
 /* ═════════════════════════════════════ Konstanten ══════════════════════════════════════════ */
 const CHUNK_SIZE: usize = 65_536; /* 64 KiB                        */
@@ -139,6 +148,11 @@ enum PayloadType {
         s_peer: String,
         v_hits: Vec<(String, f32)>,
     },
+
+    /* IAM replication */
+    IamDeltaPush(iam_delta_push),
+    IamDeltaRequest(iam_delta_request),
+    IamDeltaResponse(iam_delta_response),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -733,6 +747,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut idx_timer = tokio::time::interval(Duration::from_secs(IDX_INTERVAL_SEC));
     let mut persist_timer = tokio::time::interval(Duration::from_secs(900)); // 15 min
 
+    /* IAM-Kontext --------------------------------------------------------------- */
+    let iam_topic = gossipsub::IdentTopic::new("expchat-iam");
+
+    swarm.behaviour_mut().gossipsub.subscribe(&iam_topic)?;
+
+    /* IAM store */
+    let cfg_iam = iam_config {
+        s_node_id: swarm.local_peer_id().to_string(),
+    };
+    let iam = std::sync::Arc::new(iam_store::open(cfg_iam).expect("iam open"));
+
     /* Event-Loop ------------------------------------------------------------------------- */
     loop {
         select! {
@@ -751,6 +776,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     &s_line,
                     &mut swarm,
                     &global_topic,
+                    &iam_topic,
                     &mut v_peers,
                     &mut h_peer_index,
                     &mut o_chat_peer,
@@ -759,6 +785,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     idx_vec.clone(),   // Vektor-Index
 
                     &mut i_search_ctr,
+                    iam.clone(),
                 ).await;
             }
 
@@ -811,7 +838,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     &tx_ack,
                                     idx_tan.clone(),   // BM25-Index
                                     idx_vec.clone(),   // Vektor-Index
-
+                                    iam.clone(),
                                 ).await;
                             }
                         }
@@ -830,6 +857,7 @@ async fn handle_user_input(
     s_input: &str,
     swarm: &mut Swarm<Behaviour>,
     global_topic: &gossipsub::IdentTopic,
+    iam_topic: &gossipsub::IdentTopic,
     v_peers: &mut Vec<PeerId>,
     h_peer_index: &mut HashMap<PeerId, usize>,
     o_chat_peer: &mut Option<PeerId>,
@@ -837,6 +865,7 @@ async fn handle_user_input(
     idx_tan: Arc<TantivyIndex>, // BM25
     idx_vec: Arc<VectorIndex>,  // Vektor
     i_search_ctr: &mut u64,
+    iam: Arc<iam_store>,
 ) {
     let s_cmd = s_input.trim();
     match s_cmd {
@@ -967,6 +996,7 @@ async fn handle_user_input(
                 } else {
                     println!("(lokal)");
                     for h in &v_res {
+                        println!("==========================");
                         println!(
                             "  {d_score:.4}  {s_doc}",
                             d_score = h.d_score,
@@ -975,6 +1005,7 @@ async fn handle_user_input(
                         if !h.s_snippet.is_empty() {
                             println!("    snippet: {s}", s = h.s_snippet);
                         }
+                        println!("==========================");
                     }
                 }
             }
@@ -1019,6 +1050,39 @@ async fn handle_user_input(
             );
             println!("Hybrid-Suche (ID {i_id}) gesendet.");
         }
+
+        /* Pseudopatch: innerhalb match s_cmd */
+        s if s.starts_with("iam_init ") => {
+            /* Beispiel: iam_init admins alice ChangeMe123 */
+            /* Validierung und Fehlerausgaben sollten wie im Rest des Projekts erfolgen. */
+        }
+
+        s if s.starts_with("login ") => {
+            /* login <user>
+              1) begin_login -> challenge
+              2) client bildet proof aus lokalem pw_hash_string (oder aus Passwort, falls UI gefragt)
+              3) finish_login -> session token
+            */
+        }
+
+        "iam_sync" => {
+            /* Snapshot senden */
+            let v_events = iam.export_all_events().unwrap_or_default();
+            let msg = iam_delta_push {
+                s_epoch: "full".to_string(),
+                i_ts: 0,
+                v_events,
+                s_merkle_root_hex: "na".to_string(),
+            };
+            let local_id = swarm.local_peer_id().clone();
+            send_encrypted(
+                &local_id,
+                swarm,
+                &iam_topic,
+                &PayloadType::IamDeltaPush(msg),
+            );
+        }
+
         _ => println!("Unbekanntes Kommando – »help« hilft."),
     }
 }
@@ -1036,8 +1100,44 @@ async fn handle_incoming(
     tx_ack: &UnboundedSender<(PeerId, u32)>,
     idx_tan: Arc<TantivyIndex>, // BM25-Index
     idx_vec: Arc<VectorIndex>,  // Vektor-Index
+    iam: Arc<iam_store>,
 ) {
     match msg.payload {
+        PayloadType::IamDeltaPush(p) => {
+            let i_len = p.v_events.len();
+
+            for ev in &p.v_events {
+                let _ = iam.apply_event(ev);
+            }
+
+            println!("iam: applied delta_push events={}", i_len);
+        }
+        PayloadType::IamDeltaRequest(_r) => {
+            /* Minimal: sende full snapshot */
+            let v_events = iam.export_all_events().unwrap_or_default();
+            let resp = iam_delta_response {
+                s_epoch: "full".to_string(),
+                i_ts: 0,
+                v_events,
+                s_merkle_root_hex: "na".to_string(),
+            };
+            let local_id = swarm.local_peer_id().clone();
+            send_encrypted(
+                &local_id,
+                swarm,
+                global_topic,
+                &PayloadType::IamDeltaResponse(resp),
+            );
+        }
+        PayloadType::IamDeltaResponse(r) => {
+            let i_len = r.v_events.len();
+
+            for ev in &r.v_events {
+                let _ = iam.apply_event(ev);
+            }
+
+            println!("iam: applied delta_response events={}", i_len);
+        }
         /* ------------- Chat / Datei ----------------------------------------------------- */
         PayloadType::Text(t) => println!("({src}) {t}"),
         PayloadType::DirRequest => {
@@ -1164,6 +1264,7 @@ async fn handle_incoming(
                 println!("(ID {i_id}) {s_peer}: keine Vektor-Treffer");
             } else {
                 for h in v_hits {
+                    println!("==========================");
                     println!(
                         "(ID {i_id}) {s_peer}: {d_score:.4} {s_doc}",
                         d_score = h.d_score,
@@ -1176,6 +1277,8 @@ async fn handle_incoming(
                             s_snippet = h.s_snippet
                         );
                     }
+
+                    println!("==========================");
                 }
             }
         }
