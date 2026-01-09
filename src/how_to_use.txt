@@ -1,0 +1,150 @@
+# Bedienungsanleitung: ExpChat.ai secure_p2p_ext
+
+## 1. Zweck und Einordnung des Werkzeugs
+Das Tool **secure_p2p_ext** dient als verteilter, peer-to-peer basierter KI- und Wissens-Client mit Chat-, Datei- und Suchfunktionalitaeten, der lokale Dokumentenbestaende indiziert und Suchanfragen sowohl **lokal** als auch **verteilt** im P2P-Verbund ausfuehrt; zentrale Merkmale sind eine verschluesselte Nachrichtenuebertragung, ein chunk-basierter Datei-Transfer, eine Volltextsuche (BM25 via Tantivy), eine semantische Vektorsuche (Sentence-Transformer) sowie eine hybride Suche (BM25 plus Vektor-Re-Ranking), ergaenzt um eine **IAM Benutzerverwaltung** (Identity and Access Management) zur lokalen Autorisierung und Replikation von IAM-Daten zwischen Peers.
+
+## 2. Systemvoraussetzungen und Betriebskontext
+Das Programm wird als **Konsolenanwendung** betrieben und verwendet ein libp2p-basiertes Overlay-Netzwerk mit mDNS Peer-Discovery im lokalen Netz sowie TCP/QUIC als Transport; fuer die Suchfunktionalitaet wird ein lokales Dokumentenverzeichnis (standardmaessig `./Documents`) periodisch gecrawlt, wobei Indizes und Zustandsdaten in lokalen Persistenzspeichern abgelegt werden (u. a. Tantivy Index, sled Datenbanken fuer Queue, Tracker und IAM).
+
+## 3. Verzeichnisstruktur und Datenpersistenz
+Im Standardbetrieb sind insbesondere folgende lokale Datenartefakte relevant:
+
+- `Documents/`  
+  Lokaler Dokumentenbestand, der regelmaessig indiziert wird.
+- `tantivy_idx/`  
+  Persistenter Volltextindex (BM25).
+- `ann_graph.bin` und `vec_tracker/`  
+  Persistenz fuer semantische Vektordaten und Aenderungs-Tracking.
+- `expchat_queue/`  
+  Persistente Offline Queue (sled).
+- `iam_db/`  
+  IAM-Datenbank (Users, Groups, Memberships, Paths, Sessions, Challenges, Audit).
+- `inbox/`  
+  Zielverzeichnis fuer eingehende Datei-Transfers.
+
+## 4. Start, Logging und grundlegende Bedienung
+Nach dem Start lauscht der Node auf dynamischen TCP- und QUIC-Ports und zeigt die verfuegbaren Kommandos an; die Log-Ausgabe kann ueber die Umgebungsvariable `RUST_LOG` beeinflusst werden, wobei das Tool typischerweise ein globales Minimum von `info` setzt und Tantivy auf `warn` reduziert.
+
+### 4.1 Grundkommandos (Menue)
+Das Programm stellt ein interaktives CLI bereit; die wichtigsten Befehle sind:
+
+- `help` oder `menu`  
+  Gibt die Befehlsuebersicht aus.
+- `peers`  
+  Zeigt aktuell entdeckte Peers (Indexliste) an.
+- `connect <idx>`  
+  Baut eine Chat-Beziehung zu einem Peer auf (Chat-Topic wird abgeleitet).
+- `write <text>`  
+  Sendet eine Chat-Nachricht an den verbundenen Peer.
+- `exit`  
+  Beendet den Prozess.
+
+## 5. Peer-Discovery und Verbindungsaufbau (Chat)
+### 5.1 Peers anzeigen
+Der Operator fuehrt `peers` aus, um entdeckte Peers zu listen; jeder Peer erhaelt einen Index, der fuer `connect` verwendet wird.
+
+### 5.2 Verbindung herstellen
+Mit `connect <idx>` wird ein Chat-Topic fuer genau diese Peer-Paarung erzeugt und abonniert; anschliessend wird ein Handshake initiiert, sodass beide Seiten ueber das gleiche Topic kommunizieren koennen.
+
+### 5.3 Chat-Nachrichten
+Nach erfolgreicher Verbindung sendet `write <text>` eine Nachricht an den Chat-Topic; eingehende Nachrichten erscheinen unmittelbar in der Konsole.
+
+## 6. Dateioperationen und Transferpfade
+Das Tool bietet Dateioperationen, die konzeptionell DOS-aehnlichen Kommandos folgen:
+
+- `dir`  
+  Fordert eine Verzeichnisliste vom Partner an.
+- `type <file>`  
+  Fordert eine Datei an und gibt den Inhalt konzeptionell aus (je nach Implementierungsstand kann dies als Transfer erfolgen).
+- `get <file>`  
+  Laedt eine Datei vom Partner herunter.
+- `put <path>`  
+  Laedt eine lokale Datei zum Partner hoch.
+
+Eingehende Dateien werden in `inbox/` gespeichert; das Tool sollte Dateinamen defensiv behandeln, um Pfadmanipulationen zu vermeiden, weshalb praktisch nur der Dateiname (ohne Pfadanteile) persistiert werden sollte.
+
+## 7. Lokale und verteilte Suche
+Das Tool unterscheidet strikt zwischen lokaler Trefferermittlung und verteiltem Query-Fanout ueber den globalen Topic.
+
+### 7.1 Volltextsuche (BM25)
+- `search <query>`  
+  Fuehrt zuerst eine **lokale** BM25-Suche aus, zeigt Top-Treffer, und sendet anschliessend eine `SearchRequest` an alle Peers; Responses werden als `SearchResponse` mit Score ausgegeben.
+
+### 7.2 Semantische Vektorsuche
+- `vec_search <query>`  
+  Fuehrt lokal eine Vektorsuche aus, optional mit Snippet-Ausgabe, und sendet anschliessend eine `VecSearchRequest` an Peers; Antworten erscheinen inklusive Score und Snippet.
+
+### 7.3 Hybride Suche (BM25 plus Vektor)
+- `combi_search <query>`  
+  Ermittelt Kandidaten via BM25 und re-ranked diese per Kosinus-Aehnlichkeit der Embeddings; anschliessend wird die Anfrage verteilt und aggregierte Peer-Ergebnisse werden ausgegeben.
+
+## 8. IAM Benutzerverwaltung (Identity and Access Management)
+### 8.1 Zielsetzung der IAM-Schicht
+Die IAM-Schicht dient der lokalen Autorisierung anhand von:
+
+- **Gruppenrechten** (Rights Mask)
+- **Pfadregeln** (Path Rules) mit optionaler Gruppenzuordnung und Public/Local Scoping
+- **Sessions** (zeitlich begrenzte Tokens)
+
+Wesentlich ist, dass Passwoerter den Node nicht verlassen und die Replikation ausschliesslich strukturierte Events ohne Klartext-Geheimnisse transportiert.
+
+### 8.2 Rechtekonzept (Rights Mask)
+Typische Rechtebits sind:
+
+- `read`, `write`, `create`, `publish`, `local`, `public`, `admin`
+
+Die effektiven Rechte ergeben sich als Schnittmenge aus Gruppenrechten und Pfadrechten, sodass selbst eine administrativ privilegierte Gruppe ohne passende Pfadregel keinen Zugriff erhaelt.
+
+### 8.3 Bootstrap: Default-Admin (initUser)
+Falls die IAM-Datenbank leer ist, kann der Node beim Start automatisch einen initialen Benutzer anlegen, typischerweise:
+
+- User: `admin`
+- Passwort: `admin`
+- Gruppe: `admins` mit administrativen Rechten
+- Optional: Default-Pfadregel fuer `Documents`
+
+Diese Initialisierung muss idempotent implementiert sein, damit ein bestehender IAM-Zustand nicht ueberschrieben wird.
+
+### 8.4 Interaktiver Login (Passwortprompt)
+Der interaktive Login ist so ausgelegt, dass nach `iam_begin_login <user>` unmittelbar ein Passwort abgefragt und lokal gegen den gespeicherten Argon2-Hash verifiziert wird; im Erfolgsfall wird eine Session erstellt und im CLI-Kontext als aktive Identitaet gehalten, wodurch ein separates `iam_finish_login ...` entfaellt.
+
+### 8.5 IAM-CLI Befehle (typische Operator-Sequenzen)
+Die folgenden Befehle sind fuer Administration und Betrieb relevant:
+
+- `iam_help`  
+  Zeigt IAM-spezifische Hilfe.
+- `iam_status`  
+  Zeigt den aktuellen Login-Status (aktiver User und Session).
+- `iam_group_add <group> <rights>`  
+  Legt eine Gruppe an.
+- `iam_user_add <user> <password> <group>`  
+  Legt einen Benutzer an und ordnet initial eine Gruppe zu.
+- `iam_user_add_to_group <user> <group>`  
+  Fuegt eine Membership hinzu.
+- `iam_path_add <path> <group_or_dash> <public_0_1> <rights>`  
+  Definiert eine Pfadregel; `-` signalisiert keine Gruppenkopplung.
+- `iam_begin_login <user>`  
+  Startet Login und fragt Passwort interaktiv ab; setzt Session.
+- `iam_logout`  
+  Entfernt lokale Session aus dem CLI-Kontext.
+- `iam_access_check <path> <right> <public_0_1>`  
+  Prueft, ob die aktuelle Session fuer den Pfad das Recht besitzt.
+- `iam_sync`  
+  Exportiert IAM-Events als Snapshot und sendet diese an Peers.
+
+## 9. IAM-Replikation im P2P-Verbund
+IAM-Daten koennen ueber den dedizierten Topic repliziert werden; konzeptionell erfolgt dies als Event-Delta (Upsert/Delete), wobei der Transport keine Passwoerter und keine Klartext-Secrets enthaelt, sondern nur serialisierte Records, sodass der Empfaenger die Datensaetze materialisiert; der Operator verwendet `iam_sync`, um einen Snapshot in den Verbund zu publizieren, und Peers verarbeiten `IamDeltaPush` bzw. beantworten `IamDeltaRequest` mit `IamDeltaResponse`.
+
+## 10. Sicherheit und Betriebsdisziplin
+Aus Expertensicht sind insbesondere folgende Aspekte als betriebskritisch zu bewerten:
+
+1. **Scope-Definition fuer Remote-Zugriffe**: Wenn Remote-Requests fuer Dateien autorisiert werden sollen, muss die Semantik klar definiert sein, ob Public-Read ohne Identitaet zulaessig ist oder ob echte, kryptographisch gebundene Sessions uebertragen werden; andernfalls besteht ein struktureller Widerspruch zwischen local-only Sessions und Remote-File-Requests.
+2. **Schluesselmanagement**: Ein produktiver Betrieb erfordert persistente und rotierbare Schluesselmaterialien statt fest codierter Keys; dies betrifft insbesondere symmetrische Transportverschluesselung und die Signaturkette.
+3. **Pfadvalidierung**: Dateipfade muessen gegen Traversal, Symlink-Angriffe und ungewollte Verzeichnisgrenzen gehaertet werden, insbesondere bei `put` und beim Schreiben in `inbox/`.
+4. **Indexing-Ressourcen**: Die Indizierung ist ressourcenintensiv (RAM fuer Tantivy Writer, CPU fuer Embeddings); eine abgestimmte Intervallkonfiguration und Limitierung der Dokumenttypen ist fuer Stabilitaet im Mittelstands-Umfeld zweckmaessig.
+
+## 11. Kontakt und Anbieterhinweis
+**ExpChat.ai** ist ein KI Chat Client fuer den Mittelstand aus Breckerfeld im Sauerland mit Fokus auf RPA, KI Agents, KI Internet Research und KI Wissensmanagement; die operative Betreuung erfolgt ueber die angegebenen Kontaktkanaele.
+
+## Literatur (APA)
+Die vorliegende Bedienungsanleitung bezieht sich ausschliesslich auf die im Projektkontext beschriebenen Komponenten und enthaelt keine externen Quellenangaben, da keine zusaetzlichen Referenzen oder Spezifikationen vorgegeben sind.

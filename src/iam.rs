@@ -686,4 +686,193 @@ impl iam_store {
 
         Ok(())
     }
+
+    /******************************************************************************************
+     *  Funktion : has_any_user
+     *-----------------------------------------------------------------------------------------
+     *  Zweck    : Liefert true, falls mindestens ein User im Store existiert.
+     *
+     *  Historie
+     *  09.01.2026  MS  - Neu: Bootstrap-Unterstuetzung fuer initUser
+     ******************************************************************************************/
+    pub fn has_any_user(&self) -> iam_result<bool> {
+        let mut it = self.tr_users.iter();
+        match it.next() {
+            Some(res) => {
+                res.map_err(|_| iam_error::storage)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /******************************************************************************************
+     *  Funktion : ensure_init_user_admin
+     *-----------------------------------------------------------------------------------------
+     *  Zweck    : Legt einen initialen Default-Admin an, falls noch keine User existieren.
+     *            Implementierung ist idempotent und erzeugt nur im leeren Zustand Daten.
+     *
+     *  Historie
+     *  09.01.2026  MS  - Neu: Default initUser (admin/admin) fuer Erstbetrieb
+     ******************************************************************************************/
+    pub fn ensure_init_user_admin(&self, s_user: &str, s_pw: &str) -> iam_result<()> {
+        if !Self::validate_name(s_user) {
+            return Err(iam_error::invalid_input);
+        }
+
+        // NOTE: Das Passwort wird ueber Argon2 gehasht; Mindestlaenge ist im Core definiert.
+        // Der Auftrag verlangt jedoch pw=admin (len=5). Daher muss eine Entscheidung getroffen werden:
+        // - Entweder die Mindestlaenge im Core wird fuer Bootstrap gelockert,
+        // - oder es wird ein anderes Default-Passwort gesetzt.
+        //
+        // Um den Auftrag exakt zu erfuellen, wird hier eine kontrollierte Ausnahme fuer Bootstrap
+        // implementiert: bei ensure_init_user_admin wird die Mindestlaenge auf >= 4 reduziert.
+        if s_pw.len() < 4 || s_pw.len() > 256 {
+            return Err(iam_error::invalid_input);
+        }
+
+        let b_any = self.has_any_user()?;
+        if b_any {
+            return Ok(());
+        }
+
+        // 1) Admin-Gruppe anlegen (falls nicht vorhanden)
+        let s_group = "admins";
+        let i_all_rights: rights_mask =
+            right_read | right_write | right_create | right_publish | right_local | right_public | right_admin;
+
+        let _ = self.add_group("bootstrap", s_group, i_all_rights);
+
+        // 2) User anlegen und Gruppe setzen
+        // add_user() validiert Passwortlaenge >= 8, daher wird hier der Hash direkt erzeugt.
+        // Dies ist bewusst auf den Bootstrap-Fall begrenzt.
+        let now = now_unix_sec();
+        let s_hash = {
+            // Minimaler Hashpfad analog argon2_hash_password(), aber ohne >= 8 Restriktion.
+            let salt = SaltString::generate(&mut OsRng);
+            let argon2 = Argon2::default();
+            argon2
+                .hash_password(s_pw.as_bytes(), &salt)
+                .map_err(|_| iam_error::crypto)?
+                .to_string()
+        };
+
+        let u = user_record {
+            s_user: s_user.to_string(),
+            s_pw_hash: s_hash,
+            b_locked: false,
+            i_created_at: now,
+            i_updated_at: now,
+            i_version: now,
+        };
+
+        let v_u = serde_json::to_vec(&u).map_err(|_| iam_error::storage)?;
+        self.tr_users
+            .insert(s_user.as_bytes(), v_u)
+            .map_err(|_| iam_error::storage)?;
+
+        // Membership (User -> admins)
+        let _ = self.add_user_to_group("bootstrap", s_user, s_group);
+
+        // Optional: Default-Pfadregel fuer Documents, damit read/write sofort funktionieren.
+        let _ = self.add_path(
+            "bootstrap",
+            "Documents",
+            Some(s_group),
+            false,
+            right_read | right_write | right_create,
+        );
+
+        self.audit("bootstrap", "ensure_init_user_admin", s_user, "created");
+        Ok(())
+    }
+
+    /******************************************************************************************
+     *  Funktion : finish_login_with_password
+     *-----------------------------------------------------------------------------------------
+     *  Zweck    : Schliesst einen Login lokal ab, indem das Passwort gegen den gespeicherten
+     *            Argon2 Hash verifiziert wird. Danach wird eine Session erstellt.
+     *
+     *  Hinweise :
+     *  - Passwoerter verlassen den Node niemals.
+     *  - Challenge-Objekt wird weiterhin verwendet (TTL, One-Time-Use), aber Proof wird intern
+     *    durch Passwortverifikation ersetzt.
+     *
+     *  Historie :
+     *  09.01.2026  MS  - Neu: Interaktiver CLI Login ohne externen Proof
+     ******************************************************************************************/
+    pub fn finish_login_with_password(
+        &self,
+        s_user: &str,
+        s_challenge_id: &str,
+        s_password: &str,
+    ) -> iam_result<String> {
+        if !Self::validate_name(s_user) {
+            return Err(iam_error::invalid_input);
+        }
+        if s_challenge_id.trim().len() != 32 {
+            return Err(iam_error::invalid_input);
+        }
+        if s_password.len() < 1 || s_password.len() > 256 {
+            return Err(iam_error::invalid_input);
+        }
+
+        let v_ch = self
+            .tr_challenges
+            .get(s_challenge_id.as_bytes())
+            .map_err(|_| iam_error::storage)?;
+        let Some(v_ch) = v_ch else { return Err(iam_error::not_found) };
+        let mut c: login_challenge = serde_json::from_slice(&v_ch).map_err(|_| iam_error::storage)?;
+
+        let now = now_unix_sec();
+        if c.b_used || c.s_user != s_user {
+            return Err(iam_error::unauthorized);
+        }
+        if now > c.i_expires_at {
+            return Err(iam_error::expired);
+        }
+
+        let u = self.user_get(s_user)?;
+        if u.b_locked {
+            return Err(iam_error::locked);
+        }
+
+        // Verify password using stored Argon2 hash.
+        // This avoids any need for external proof calculation.
+        let parsed_hash = PasswordHash::new(&u.s_pw_hash).map_err(|_| iam_error::crypto)?;
+        let argon2 = Argon2::default();
+
+        if argon2
+            .verify_password(s_password.as_bytes(), &parsed_hash)
+            .is_err()
+        {
+            self.audit(s_user, "finish_login_with_password", s_challenge_id, "bad_password");
+            return Err(iam_error::unauthorized);
+        }
+
+        // Mark challenge as used (one-time).
+        c.b_used = true;
+        let v_ch2 = serde_json::to_vec(&c).map_err(|_| iam_error::storage)?;
+        self.tr_challenges
+            .insert(s_challenge_id.as_bytes(), v_ch2)
+            .map_err(|_| iam_error::storage)?;
+
+        // Create session.
+        let s_session = Self::new_id_hex_32();
+        let i_expires = now.saturating_add(i_session_ttl_sec);
+        let srec = session_record {
+            s_session: s_session.clone(),
+            s_user: s_user.to_string(),
+            i_issued_at: now,
+            i_expires_at: i_expires,
+            i_version: now,
+        };
+        let v_s = serde_json::to_vec(&srec).map_err(|_| iam_error::storage)?;
+        self.tr_sessions
+            .insert(s_session.as_bytes(), v_s)
+            .map_err(|_| iam_error::storage)?;
+
+        self.audit(s_user, "finish_login_with_password", &s_session, "ok");
+        Ok(s_session)
+    }
 }
