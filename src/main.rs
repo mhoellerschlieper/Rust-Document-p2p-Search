@@ -13,6 +13,8 @@
  *  13.11.2025  MS  - RAG Schlagwortsuche (Tantivy)
  *  15.11.2025  MS  - Hybrid combi_search
  *  09.01.2026  MS  - IAM Integration: Menue + Kommandos + Session Handling + Access Checks
+ *  11.01.2026  MS  - Webserver: Integration (start + command bridge + shared state updates)
+ *  11.01.2026  MS  - Initiale Version: zentrale data root Pfade fuer Queue, IAM, Tracker, Indizes
  **********************************************************************************************/
 
 #![allow(clippy::needless_return)]
@@ -86,15 +88,25 @@ use crate::iam::{
 use crate::iam_net::{iam_delta_push, iam_delta_request, iam_delta_response};
 use rpassword;
 
-/* ===================================== Konstanten ======================================== */
-const CHUNK_SIZE: usize = 65_536;
-const GLOBAL_TOPIC: &str = "expchat-main";
-const DOC_DIR: &str = "Documents";
-const IDX_DIR: &str = "tantivy_idx";
-const IDX_INTERVAL_SEC: u64 = 30;
+/* --- Webserver --------------------------------------------------------------------------- */
+mod web_server;
+use crate::web_server::{
+    run_web_server, web_command, web_ok_resp, web_peer_view, web_search_hit, web_search_resp,
+    web_shared_state, web_status_view, I_EVENT_RING_MAX,
+};
 
-/* IAM: Pfad Scope fuer Remote Requests. */
-const IAM_REMOTE_SCOPE_PUBLIC: bool = true;
+mod config;
+
+use crate::config::app_config;
+use crate::config::cfg_get;
+
+fn load_cfg_or_exit() -> app_config {
+    // Defensive: explicit error handling, no panic, ascii messages only
+    config::app_config::load_from_env().unwrap_or_else(|e| {
+        println!("config error: {}", e);
+        std::process::exit(2);
+    })
+}
 
 /* ===================================== Payload =========================================== */
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -218,7 +230,7 @@ struct DocTracker {
 }
 impl DocTracker {
     fn new() -> Self {
-        let db = sled::open("processed_docs").expect("Tracker DB init");
+        let db = sled::open(crate::config::path_processed_docs_dir()).expect("Tracker DB init");
         Self { db }
     }
     fn mtime(&self, s_path: &str) -> Option<u64> {
@@ -260,14 +272,16 @@ struct TantivyIndex {
 }
 impl TantivyIndex {
     fn new(_p_dir: &Path) -> Self {
-        fs::create_dir_all(IDX_DIR).ok();
+        let p_idx_dir = crate::config::path_tantivy_idx_dir();
+
+        fs::create_dir_all(&p_idx_dir).ok();
         let mut schema_builder = Schema::builder();
         let f_path = schema_builder.add_text_field("path", STORED);
         let f_content = schema_builder.add_text_field("content", TEXT);
         let schema = schema_builder.build();
 
-        let idx =
-            Index::open_or_create(MmapDirectory::open(IDX_DIR).unwrap(), schema.clone()).unwrap();
+        let idx = Index::open_or_create(MmapDirectory::open(&p_idx_dir).unwrap(), schema.clone()).unwrap();
+
         let writer = idx.writer(50_000_000).unwrap();
         let reader = idx
             .reader_builder()
@@ -502,7 +516,7 @@ fn extract_pptx_text(p: &Path) -> ResultStr {
 struct PersistenceLayer;
 impl PersistenceLayer {
     fn new() -> Db {
-        sled::open("expchat_queue").expect("DB init")
+        sled::open(crate::config::path_queue_dir()).expect("DB init")
     }
     fn enqueue(db: &Db, peer: &PeerId, v_bytes: &[u8]) {
         let _ = db.insert(peer.to_bytes(), v_bytes);
@@ -644,18 +658,34 @@ fn prompt_password_no_echo(s_prompt: &str) -> Result<String, String> {
 /* ========================================================================================== */
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    /* -------------------- Logging --------------------------------------------------------- */
     let filter = EnvFilter::from_default_env()
         .add_directive("info".parse()?)
         .add_directive("tantivy=warn".parse()?);
-
     fmt().with_env_filter(filter).with_target(false).init();
 
+    {
+        let _ = crate::config::ensure_data_layout();
+    }
+
+    let i_chunk_size: usize = cfg_get().i_chunk_size;
+    let s_global_topic: String = cfg_get().s_global_topic.clone();
+    let s_doc_dir: String = cfg_get().s_doc_dir.clone();
+    let s_idx_dir: String = cfg_get().s_idx_dir.clone();
+    let i_idx_interval_sec: u64 = cfg_get().i_idx_interval_sec as u64;
+    let b_iam_remote_scope_public: bool = cfg_get().b_iam_remote_scope_public;
+    let s_web_bind: String = cfg_get().s_web_bind.clone();
+    let i_max_transmit_size: usize = cfg_get().i_max_transmit_size;
+    let i_persist_interval_sec: u64 = cfg_get().i_persist_interval_sec as u64;
+
+    /* -------------------- Crypto Context -------------------------------------------------- */
     let a_aes_key = *b"01234567012345670123456701234567";
     let sk_set = SecretKeySet::random(1, &mut rand::thread_rng());
     let bls_share = sk_set.secret_key_share(0);
     let ctx_global = CryptoContext::new(&a_aes_key, bls_share);
     let mut auditor = Auditor::new();
 
+    /* -------------------- Swarm ----------------------------------------------------------- */
     let mut swarm: Swarm<Behaviour> = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -674,7 +704,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .validation_mode(gossipsub::ValidationMode::Strict)
                 .heartbeat_interval(Duration::from_secs(10))
                 .message_id_fn(msg_id_fn)
-                .max_transmit_size(1_048_576)
+                .max_transmit_size(cfg_get().i_max_transmit_size)
                 .build()
                 .map_err(io::Error::other)?;
             let gossipsub = gossipsub::Behaviour::new(
@@ -687,10 +717,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })?
         .build();
 
-    let global_topic = gossipsub::IdentTopic::new(GLOBAL_TOPIC);
+    let s_node_id: String = swarm.local_peer_id().to_string();
+    let cfg_iam = iam_config {
+        s_node_id: s_node_id.clone(),
+    };
+
+    let global_topic = gossipsub::IdentTopic::new(s_global_topic.clone());
     swarm.behaviour_mut().gossipsub.subscribe(&global_topic)?;
 
-    let iam_topic = gossipsub::IdentTopic::new("expchat-iam");
+    let iam_topic = gossipsub::IdentTopic::new(cfg_get().s_iam_topic.clone());
     swarm.behaviour_mut().gossipsub.subscribe(&iam_topic)?;
 
     let mut stdin = io::BufReader::new(io::stdin()).lines();
@@ -709,17 +744,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("ExpChat.ai gestartet - help zeigt Menue.");
     print_menu();
 
-    let idx_vec = tokio::task::block_in_place(|| load_or_init_index(Path::new(".")));
-    let idx_tan = Arc::new(TantivyIndex::new(Path::new(DOC_DIR)));
+    /* -------------------- Indizes --------------------------------------------------------- */
+    let p_vec_root = crate::config::path_vector_idx_dir();
+    let idx_vec = tokio::task::block_in_place(|| load_or_init_index(p_vec_root.as_path()));
+    let idx_tan = Arc::new(TantivyIndex::new(Path::new(&s_doc_dir)));
 
-    let mut idx_timer = tokio::time::interval(Duration::from_secs(IDX_INTERVAL_SEC));
-    let mut persist_timer = tokio::time::interval(Duration::from_secs(900));
+    let mut idx_timer = tokio::time::interval(Duration::from_secs(i_idx_interval_sec));
+    let mut persist_timer = tokio::time::interval(Duration::from_secs(i_persist_interval_sec));
 
-    /* IAM store + CLI Session State */
-    //let cfg_iam = iam_config { s_node_id: swarm.local_peer_id().to_string() };
-    //let iam = std::sync::Arc::new(iam_store::open(cfg_iam).expect("iam open"));
-    let mut o_iam_cli: Option<IamCliState> = None;
-    /* IAM store */
+    /* -------------------- IAM -------------------------------------------------------------- */
     let cfg_iam = iam_config {
         s_node_id: swarm.local_peer_id().to_string(),
     };
@@ -729,24 +762,76 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         let r = iam.ensure_init_user_admin("admin", "admin");
         if r.is_ok() {
-            // Absichtlich knapp: CLI Ausgabe als Operator-Hinweis
             println!("iam: bootstrap checked (default admin may be created if iam was empty)");
         } else {
             println!("iam: bootstrap failed");
         }
     }
 
+    let mut o_iam_cli: Option<IamCliState> = None;
+
+    /* -------------------- Webserver: Shared State + Command Channel ------------------------ */
+    let st_web: Arc<Mutex<web_shared_state>> = Arc::new(Mutex::new(web_shared_state::new(
+        swarm.local_peer_id().to_string(),
+    )));
+    {
+        // Initialer Event Eintrag
+        let mut g = st_web.lock().unwrap();
+        g.push_event("web: state initialized".to_string());
+    }
+
+    let (tx_web_cmd, mut rx_web_cmd) = tokio::sync::mpsc::channel::<web_command>(64);
+    {
+        let st_web_clone = st_web.clone();
+        let tx_web_cmd_clone = tx_web_cmd.clone();
+
+        // Webserver Task
+        tokio::spawn(async move {
+            let _ = run_web_server(&cfg_get().s_web_bind, tx_web_cmd_clone, st_web_clone).await;
+        });
+    }
+    println!("web: listening on http://{}", cfg_get().s_web_bind);
+
+    /* ====================================================================================== */
+    /* Event Loop                                                                              */
+    /* ====================================================================================== */
     loop {
         select! {
             _ = idx_timer.tick() => {
-                idx_vec.sync(Path::new(DOC_DIR));
-                idx_tan.sync(Path::new(DOC_DIR));
+                idx_vec.sync(Path::new(&cfg_get().s_doc_dir.clone()));
+                idx_tan.sync(Path::new(&cfg_get().s_doc_dir.clone()));
+                let mut g = st_web.lock().unwrap();
+                g.push_event("idx: sync done".to_string());
             }
 
             _ = persist_timer.tick() => {
-                persist_index(&idx_vec, Path::new("."));
+                persist_index(&idx_vec, p_vec_root.as_path());
+                let mut g = st_web.lock().unwrap();
+                g.push_event("idx: persist done".to_string());
             }
 
+            /* -------------------- Web Commands -------------------------------------------- */
+            Some(cmd) = rx_web_cmd.recv() => {
+                // Historie: 11.01.2026 MS - Web Command Bridge in main loop integriert
+                handle_web_command(
+                    cmd,
+                    &mut swarm,
+                    &global_topic,
+                    &iam_topic,
+                    &mut v_peers,
+                    &mut h_peer_index,
+                    &mut o_chat_peer,
+                    &mut o_chat_topic,
+                    idx_tan.clone(),
+                    idx_vec.clone(),
+                    &mut i_search_ctr,
+                    iam.clone(),
+                    &mut o_iam_cli,
+                    st_web.clone(),
+                ).await;
+            }
+
+            /* -------------------- CLI Input ---------------------------------------------- */
             Ok(Some(s_line)) = stdin.next_line() => {
                 handle_user_input(
                     &s_line,
@@ -765,6 +850,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 ).await;
             }
 
+            /* -------------------- Chunk Ack ---------------------------------------------- */
             Some((pid, i_idx)) = rx_ack.recv() => {
                 if let Some(q) = h_chunk_queue.get_mut(&pid) {
                     while let Some(f) = q.front() {
@@ -773,6 +859,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
 
+            /* -------------------- Swarm Events ------------------------------------------- */
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                     for (pid, _) in list {
@@ -781,6 +868,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             h_peer_index.insert(pid, i_idx);
                             v_peers.push(pid);
                             println!("Peer entdeckt [{i_idx}] {pid}");
+
+                            let mut g = st_web.lock().unwrap();
+                            g.v_peers.push(web_peer_view {
+                                s_peer_id: pid.to_string(),
+                                b_online: true,
+                            });
+                            g.push_event(format!("mdns: discovered peer={}", pid));
                         }
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&pid);
                     }
@@ -791,6 +885,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         if let Some(i) = h_peer_index.remove(&pid) {
                             v_peers.retain(|p| p != &pid);
                             println!("Peer [{i}] {pid} nicht mehr erreichbar.");
+
+                            let mut g = st_web.lock().unwrap();
+                            for pv in g.v_peers.iter_mut() {
+                                if pv.s_peer_id == pid.to_string() {
+                                    pv.b_online = false;
+                                }
+                            }
+                            g.push_event(format!("mdns: expired peer={}", pid));
                         }
                     }
                 }
@@ -801,6 +903,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         if let Some(v_plain) = ctx_global.decrypt(&env.v_payload) {
                             auditor.record(&v_plain);
                             if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&v_plain) {
+                                {
+                                    let mut g = st_web.lock().unwrap();
+                                    g.push_event(format!("gossip: msg from={}", propagation_source));
+                                }
                                 handle_incoming(
                                     msg,
                                     &propagation_source,
@@ -818,9 +924,392 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
-                SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {address}"),
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    println!("Listening on {address}");
+                    let mut g = st_web.lock().unwrap();
+                    g.push_event(format!("swarm: listen addr={}", address));
+                }
                 _ => {}
             }
+        }
+    }
+}
+
+/* ========================================================================================== */
+/* Web Command Handler                                                                         */
+/* ========================================================================================== */
+#[allow(clippy::too_many_arguments)]
+async fn handle_web_command(
+    cmd: web_command,
+    swarm: &mut Swarm<Behaviour>,
+    global_topic: &gossipsub::IdentTopic,
+    iam_topic: &gossipsub::IdentTopic,
+    v_peers: &mut Vec<PeerId>,
+    h_peer_index: &mut HashMap<PeerId, usize>,
+    o_chat_peer: &mut Option<PeerId>,
+    o_chat_topic: &mut Option<gossipsub::IdentTopic>,
+    idx_tan: Arc<TantivyIndex>,
+    idx_vec: Arc<VectorIndex>,
+    i_search_ctr: &mut u64,
+    iam: Arc<iam_store>,
+    o_iam_cli: &mut Option<IamCliState>,
+    st_web: Arc<Mutex<web_shared_state>>,
+) {
+    // Historie: 11.01.2026 MS - zentrale Schaltstelle fuer Web API Kommandos
+
+    match cmd {
+        web_command::status_get { tx } => {
+            let g = st_web.lock().unwrap();
+            let v = web_status_view {
+                s_node_peer_id: g.s_node_peer_id.clone(),
+                i_known_peers: g.v_peers.len(),
+                s_chat_peer: g.s_chat_peer.clone().unwrap_or_else(|| "".to_string()),
+                s_chat_topic: g.s_chat_topic.clone().unwrap_or_else(|| "".to_string()),
+                i_event_ring_len: g.v_event_ring.len(),
+            };
+            let _ = tx.send(v);
+        }
+
+        web_command::peers_get { tx } => {
+            let g = st_web.lock().unwrap();
+            let _ = tx.send(g.v_peers.clone());
+        }
+
+        web_command::events_get { tx } => {
+            let g = st_web.lock().unwrap();
+            let v: Vec<String> = g.v_event_ring.iter().cloned().collect();
+            let _ = tx.send(v);
+        }
+
+        web_command::iam_login_local {
+            s_user,
+            s_password,
+            tx,
+        } => {
+            let r = iam.begin_login(&s_user);
+            let resp = match r {
+                Ok(ch) => {
+                    match iam.finish_login_with_password(&s_user, &ch.s_challenge_id, &s_password) {
+                        Ok(s_session) => {
+                            *o_iam_cli = Some(IamCliState {
+                                s_user: s_user.clone(),
+                                s_session: s_session.clone(),
+                            });
+                            {
+                                let mut g = st_web.lock().unwrap();
+                                g.push_event(format!("iam: login ok user={}", s_user));
+                            }
+                            web_server::web_login_resp {
+                                b_ok: true,
+                                s_session,
+                                s_error: "".to_string(),
+                            }
+                        }
+                        Err(_) => web_server::web_login_resp {
+                            b_ok: false,
+                            s_session: "".to_string(),
+                            s_error: "unauthorized".to_string(),
+                        },
+                    }
+                }
+                Err(_) => web_server::web_login_resp {
+                    b_ok: false,
+                    s_session: "".to_string(),
+                    s_error: "begin_login_failed".to_string(),
+                },
+            };
+            let _ = tx.send(resp);
+        }
+
+        web_command::iam_group_add {
+            s_actor,
+            s_group,
+            s_rights,
+            tx,
+        } => {
+            let i_rights = parse_u64_any(&s_rights).unwrap_or(0);
+            let r = iam.add_group(&s_actor, &s_group, i_rights as rights_mask);
+            let v = match r {
+                Ok(_) => web_ok_resp {
+                    b_ok: true,
+                    s_error: "".to_string(),
+                },
+                Err(_) => web_ok_resp {
+                    b_ok: false,
+                    s_error: "iam_error".to_string(),
+                },
+            };
+            {
+                let mut g = st_web.lock().unwrap();
+                g.push_event(format!("iam: group_add group={} ok={}", s_group, v.b_ok));
+            }
+            let _ = tx.send(v);
+        }
+
+        web_command::iam_user_add {
+            s_actor,
+            s_user,
+            s_password,
+            s_group,
+            tx,
+        } => {
+            let r = iam.add_user(&s_actor, &s_user, &s_password, &s_group);
+            let v = match r {
+                Ok(_) => web_ok_resp {
+                    b_ok: true,
+                    s_error: "".to_string(),
+                },
+                Err(_) => web_ok_resp {
+                    b_ok: false,
+                    s_error: "iam_error".to_string(),
+                },
+            };
+            {
+                let mut g = st_web.lock().unwrap();
+                g.push_event(format!("iam: user_add user={} ok={}", s_user, v.b_ok));
+            }
+            let _ = tx.send(v);
+        }
+
+        web_command::iam_path_add {
+            s_actor,
+            s_path,
+            s_group_or_dash,
+            b_public,
+            s_rights,
+            tx,
+        } => {
+            let i_rights = parse_u64_any(&s_rights).unwrap_or(0);
+            let o_group = if s_group_or_dash.trim() == "-" {
+                None
+            } else {
+                Some(s_group_or_dash.as_str())
+            };
+            let r = iam.add_path(
+                &s_actor,
+                &s_path,
+                o_group,
+                b_public,
+                i_rights as rights_mask,
+            );
+            let v = match r {
+                Ok(_) => web_ok_resp {
+                    b_ok: true,
+                    s_error: "".to_string(),
+                },
+                Err(_) => web_ok_resp {
+                    b_ok: false,
+                    s_error: "iam_error".to_string(),
+                },
+            };
+            {
+                let mut g = st_web.lock().unwrap();
+                g.push_event(format!("iam: path_add path={} ok={}", s_path, v.b_ok));
+            }
+            let _ = tx.send(v);
+        }
+
+        web_command::p2p_connect_by_peer_id { s_peer_id, tx } => {
+            // Web: connect ueber PeerId String. Defensive parse.
+            let peer = match s_peer_id.parse::<PeerId>() {
+                Ok(p) => p,
+                Err(_) => {
+                    let _ = tx.send(web_ok_resp {
+                        b_ok: false,
+                        s_error: "invalid_peer_id".to_string(),
+                    });
+                    return;
+                }
+            };
+
+            // Optional: in peer lists aufnehmen
+            if !h_peer_index.contains_key(&peer) {
+                let i_idx = v_peers.len();
+                v_peers.push(peer);
+                h_peer_index.insert(peer, i_idx);
+            }
+
+            let topic = build_chat_topic(&swarm.local_peer_id(), &peer);
+            let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+
+            *o_chat_peer = Some(peer);
+            *o_chat_topic = Some(topic.clone());
+
+            {
+                let mut g = st_web.lock().unwrap();
+                g.s_chat_peer = Some(peer.to_string());
+                g.s_chat_topic = Some(topic.to_string());
+                g.push_event(format!("p2p: connect initiated peer={}", peer));
+            }
+
+            let local_id = swarm.local_peer_id().clone();
+            send_encrypted(&local_id, swarm, global_topic, &PayloadType::ConnectRequest);
+
+            let _ = tx.send(web_ok_resp {
+                b_ok: true,
+                s_error: "".to_string(),
+            });
+        }
+
+        web_command::p2p_send_text { s_text, tx } => {
+            let Some(topic) = o_chat_topic else {
+                let _ = tx.send(web_ok_resp {
+                    b_ok: false,
+                    s_error: "no_chat_partner".to_string(),
+                });
+                return;
+            };
+
+            let local_id = swarm.local_peer_id().clone();
+            send_encrypted(&local_id, swarm, topic, &PayloadType::Text(s_text.clone()));
+
+            {
+                let mut g = st_web.lock().unwrap();
+                g.push_event("p2p: send_text ok".to_string());
+            }
+
+            let _ = tx.send(web_ok_resp {
+                b_ok: true,
+                s_error: "".to_string(),
+            });
+        }
+
+        web_command::search_local_tantivy {
+            s_query,
+            i_limit,
+            tx,
+        } => {
+            let v_res = idx_tan.search(&s_query, i_limit);
+            let mut v_hits: Vec<web_search_hit> = Vec::new();
+            for h in v_res {
+                v_hits.push(web_search_hit {
+                    s_doc: h.s_doc,
+                    d_score: h.d_score,
+                    s_snippet: "".to_string(),
+                });
+            }
+            let resp = web_search_resp {
+                b_ok: true,
+                s_error: "".to_string(),
+                v_hits,
+            };
+            let _ = tx.send(resp);
+        }
+
+        web_command::search_local_vector {
+            s_query,
+            i_limit,
+            tx,
+        } => {
+            let v_res = idx_vec.query_with_snippets(&s_query, i_limit);
+            let mut v_hits: Vec<web_search_hit> = Vec::new();
+            for h in v_res {
+                v_hits.push(web_search_hit {
+                    s_doc: h.s_doc,
+                    d_score: h.d_score,
+                    s_snippet: h.s_snippet,
+                });
+            }
+            let resp = web_search_resp {
+                b_ok: true,
+                s_error: "".to_string(),
+                v_hits,
+            };
+            let _ = tx.send(resp);
+        }
+
+        web_command::search_local_combi {
+            s_query,
+            i_limit,
+            tx,
+        } => {
+            let v_res = combi_search(&idx_tan, &idx_vec, &s_query, i_limit);
+            let mut v_hits: Vec<web_search_hit> = Vec::new();
+            for (s_doc, d_score) in v_res {
+                v_hits.push(web_search_hit {
+                    s_doc,
+                    d_score,
+                    s_snippet: "".to_string(),
+                });
+            }
+            let resp = web_search_resp {
+                b_ok: true,
+                s_error: "".to_string(),
+                v_hits,
+            };
+            let _ = tx.send(resp);
+        }
+
+        web_command::search_network_tantivy {
+            s_query,
+            i_limit: _,
+            tx,
+        } => {
+            *i_search_ctr += 1;
+            let i_id = *i_search_ctr;
+            let local_id = swarm.local_peer_id().clone();
+            send_encrypted(
+                &local_id,
+                swarm,
+                global_topic,
+                &PayloadType::SearchRequest { i_id, s_query },
+            );
+            {
+                let mut g = st_web.lock().unwrap();
+                g.push_event(format!("search: network tantivy sent id={}", i_id));
+            }
+            let _ = tx.send(web_ok_resp {
+                b_ok: true,
+                s_error: "".to_string(),
+            });
+        }
+
+        web_command::search_network_vector {
+            s_query,
+            i_limit: _,
+            tx,
+        } => {
+            *i_search_ctr += 1;
+            let i_id = *i_search_ctr;
+            let local_id = swarm.local_peer_id().clone();
+            send_encrypted(
+                &local_id,
+                swarm,
+                global_topic,
+                &PayloadType::VecSearchRequest { i_id, s_query },
+            );
+            {
+                let mut g = st_web.lock().unwrap();
+                g.push_event(format!("search: network vector sent id={}", i_id));
+            }
+            let _ = tx.send(web_ok_resp {
+                b_ok: true,
+                s_error: "".to_string(),
+            });
+        }
+
+        web_command::search_network_combi {
+            s_query,
+            i_limit: _,
+            tx,
+        } => {
+            *i_search_ctr += 1;
+            let i_id = *i_search_ctr;
+            let local_id = swarm.local_peer_id().clone();
+            send_encrypted(
+                &local_id,
+                swarm,
+                global_topic,
+                &PayloadType::CombiSearchRequest { i_id, s_query },
+            );
+            {
+                let mut g = st_web.lock().unwrap();
+                g.push_event(format!("search: network combi sent id={}", i_id));
+            }
+            let _ = tx.send(web_ok_resp {
+                b_ok: true,
+                s_error: "".to_string(),
+            });
         }
     }
 }
@@ -1073,7 +1562,12 @@ async fn handle_user_input(
                 return;
             };
 
-            match iam.check_access(&st.s_session, s_path, i_right, b_public) {
+            match iam.check_access(
+                &st.s_session,
+                s_path,
+                i_right,
+                cfg_get().b_iam_remote_scope_public,
+            ) {
                 Ok(dec) => {
                     println!(
                         "iam: allowed={} reason={} effective_rights=0x{:016x}",
@@ -1152,7 +1646,12 @@ async fn handle_user_input(
             };
 
             let i_need = right_read;
-            match iam.check_access(&st.s_session, &s_file, i_need, IAM_REMOTE_SCOPE_PUBLIC) {
+            match iam.check_access(
+                &st.s_session,
+                &s_file,
+                i_need,
+                cfg_get().b_iam_remote_scope_public,
+            ) {
                 Ok(dec) => {
                     if !dec.b_allowed {
                         println!("iam: deny file request reason={}", dec.s_reason);
@@ -1484,7 +1983,7 @@ async fn handle_incoming(
         }
 
         PayloadType::VecSearchRequest { i_id, s_query } => {
-            idx_vec.sync(std::path::Path::new(DOC_DIR));
+            idx_vec.sync(std::path::Path::new(&cfg_get().s_doc_dir.clone()));
             let v_hits = idx_vec.query_with_snippets(&s_query, 5);
 
             let local_id = swarm.local_peer_id().clone();
@@ -1526,7 +2025,7 @@ async fn handle_incoming(
         }
 
         PayloadType::CombiSearchRequest { i_id, s_query } => {
-            idx_vec.sync(Path::new(DOC_DIR));
+            idx_vec.sync(Path::new(&cfg_get().s_doc_dir.clone()));
             let v_hits = combi_search(&idx_tan, &idx_vec, &s_query, 5);
 
             let local_id = swarm.local_peer_id().clone();

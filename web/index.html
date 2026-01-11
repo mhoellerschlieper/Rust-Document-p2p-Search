@@ -1,0 +1,179 @@
+<!--
+==============================================================================================
+Modulname : web_ui
+Datei     : index.html
+Autor     : Marcus Schlieper
+----------------------------------------------------------------------------------------------
+Beschreibung
+- Single Page UI fuer secure_p2p_ext Webserver.
+- Navigation: Status, Peers, Dokumentensuche, Benutzerverwaltung.
+- Das UI konsumiert JSON APIs unter /api/...
+Historie
+11.01.2026  MS  - Initiale Version: Layout, Navigation, Views
+==============================================================================================
+-->
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ExpChat.ai - Secure P2P Console</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand_title">ExpChat.ai</div>
+        <div class="brand_subtitle">Secure P2P Console</div>
+      </div>
+      <div class="topbar_right">
+        <div id="status_badge" class="badge">offline</div>
+      </div>
+    </header>
+
+    <div class="main">
+      <nav class="sidebar">
+        <button class="nav_item active" data-view="view_status">Status</button>
+        <button class="nav_item" data-view="view_peers">Peers</button>
+        <button class="nav_item" data-view="view_search">Dokumentensuche</button>
+        <button class="nav_item" data-view="view_iam">Benutzerverwaltung</button>
+        <button class="nav_item" data-view="view_events">Events</button>
+      </nav>
+
+      <section class="content">
+        <div id="toast" class="toast hidden"></div>
+
+        <div id="view_status" class="view">
+          <h1>Status</h1>
+          <div class="grid2">
+            <div class="card">
+              <h2>Node</h2>
+              <div class="kv"><div class="k">peer_id</div><div class="v" id="st_peer_id">-</div></div>
+              <div class="kv"><div class="k">known_peers</div><div class="v" id="st_known_peers">-</div></div>
+            </div>
+            <div class="card">
+              <h2>Chat</h2>
+              <div class="kv"><div class="k">chat_peer</div><div class="v" id="st_chat_peer">-</div></div>
+              <div class="kv"><div class="k">chat_topic</div><div class="v" id="st_chat_topic">-</div></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Quick Actions</h2>
+            <div class="row">
+              <input id="connect_peer_id" class="input" placeholder="peer_id" />
+              <button id="btn_connect" class="btn">connect</button>
+            </div>
+            <div class="row">
+              <input id="send_text" class="input" placeholder="text message" />
+              <button id="btn_send_text" class="btn">send</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="view_peers" class="view hidden">
+          <h1>Peers</h1>
+          <div class="card">
+            <div class="row">
+              <button id="btn_refresh_peers" class="btn">refresh</button>
+            </div>
+            <table class="table">
+              <thead>
+                <tr><th>peer_id</th><th>online</th><th>action</th></tr>
+              </thead>
+              <tbody id="peers_table"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div id="view_search" class="view hidden">
+          <h1>Dokumentensuche</h1>
+          <div class="card">
+            <div class="row">
+              <select id="search_mode" class="select">
+                <option value="tantivy">tantivy (bm25)</option>
+                <option value="vector">vector</option>
+                <option value="combi">combi</option>
+              </select>
+              <input id="search_query" class="input" placeholder="query" />
+              <input id="search_limit" class="input small" value="5" />
+              <button id="btn_search" class="btn">search</button>
+            </div>
+            <div id="search_results" class="results"></div>
+          </div>
+        </div>
+
+        <div id="view_iam" class="view hidden">
+          <h1>Benutzerverwaltung</h1>
+
+          <div class="grid2">
+            <div class="card">
+              <h2>Login (lokal)</h2>
+              <div class="row">
+                <input id="iam_login_user" class="input" placeholder="user" />
+                <input id="iam_login_pass" class="input" placeholder="password" type="password" />
+                <button id="btn_iam_login" class="btn">login</button>
+              </div>
+              <div class="kv"><div class="k">session</div><div class="v mono" id="iam_session">-</div></div>
+            </div>
+
+            <div class="card">
+              <h2>Group Add</h2>
+              <div class="row">
+                <input id="iam_group" class="input" placeholder="group" />
+                <input id="iam_group_rights" class="input" placeholder="rights (e.g. 0x3)" />
+                <button id="btn_iam_group_add" class="btn">add</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid2">
+            <div class="card">
+              <h2>User Add</h2>
+              <div class="row">
+                <input id="iam_user" class="input" placeholder="user" />
+                <input id="iam_user_pass" class="input" placeholder="password" type="password" />
+                <input id="iam_user_group" class="input" placeholder="group" />
+                <button id="btn_iam_user_add" class="btn">add</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <h2>Path Add</h2>
+              <div class="row">
+                <input id="iam_path" class="input" placeholder="path prefix (e.g. Documents)" />
+                <input id="iam_path_group" class="input" placeholder="group or - " />
+                <select id="iam_path_public" class="select">
+                  <option value="false">public: false</option>
+                  <option value="true">public: true</option>
+                </select>
+                <input id="iam_path_rights" class="input" placeholder="rights (e.g. 0x7)" />
+                <button id="btn_iam_path_add" class="btn">add</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="view_events" class="view hidden">
+          <h1>Events</h1>
+          <div class="card">
+            <div class="row">
+              <button id="btn_refresh_events" class="btn">refresh</button>
+            </div>
+            <pre id="events_box" class="pre"></pre>
+          </div>
+        </div>
+
+      </section>
+    </div>
+
+    <footer class="footer">
+      <div class="footer_left">ExpChat.ai - Breckerfeld (Sauerland)</div>
+      <div class="footer_right">web ui</div>
+    </footer>
+  </div>
+
+  <script defer src="/app.js"></script>
+</body>
+</html>

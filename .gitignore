@@ -1,12 +1,8 @@
+/data
 /target
-/tantivy_idx
-/vec_tracker
-/vector_idx
 /Documents
-/expchat_queue
-/processed_docs
-/iam_db
+/vec_tracker
 /.vs
 /.vscode
 Cargo.lock
-ann_graph.bin
+

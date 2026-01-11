@@ -44,8 +44,8 @@ use sled::IVec;
 /* ------------------------------- Konstanten ----------------------------------------------- */
 const VEC_DIM: usize = 384;
 const ANN_CAPACITY: usize = 30_000;
-const TRACKER_DB: &str = "vec_tracker";
-const GRAPH_FILE: &str = "ann_graph.bin";
+const TRACKER_DB: &str = "data/vec_tracker";
+const GRAPH_FILE: &str = "data/ann/ann_graph.bin";
 
 /* BM25 Parameter */
 const BM25_K1: f32 = 1.5;

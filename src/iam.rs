@@ -38,7 +38,7 @@ pub const right_local: rights_mask = 1 << 4;
 pub const right_public: rights_mask = 1 << 5;
 pub const right_admin: rights_mask = 1 << 63;
 
-const iam_db_dir: &str = "iam_db";
+const iam_db_dir: &str = "data/iam_db";
 const t_users: &str = "users";
 const t_groups: &str = "groups";
 const t_memberships: &str = "memberships";
