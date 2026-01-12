@@ -7,6 +7,7 @@
  *  - P2P Chat Client mit Datei Transfer, Volltext Suche (Tantivy), Vektor Suche, Hybrid Suche.
  *  - IAM Integration (CLI), Webserver Integration (Command Bridge, Shared State).
  *  - Web: Netzwerk Combi Search (dispatch + result polling) mit PeerId pro Hit.
+ *  - Web: Erweiterung fuer Snippets und Dokumentanzeige per Klick (lokal und remote).
  *
  *  Historie
  *  09.11.2025  MS  - Grundversion (Chat, DOS Befehle, Handshake Topic)
@@ -16,6 +17,7 @@
  *  09.01.2026  MS  - IAM Integration: Menue + Kommandos + Session Handling + Access Checks
  *  11.01.2026  MS  - Webserver: Integration (start + command bridge + shared state updates)
  *  11.01.2026  MS  - Web: network combi search dispatch + result cache + peer_id per hit
+ *  12.01.2026  MS  - Web: Snippets fuer local+remote combi search + DocText fetch via P2P
  **********************************************************************************************/
 
 #![allow(clippy::needless_return)]
@@ -29,9 +31,9 @@ use aes_gcm_siv::{
 use blsttc::{SecretKeySet, SecretKeyShare, SignatureShare};
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, mdns, noise,
+    gossipsub, mdns,
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
-    tcp, yamux, PeerId,
+    PeerId,
 };
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
@@ -48,11 +50,9 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-
 use tokio::{
     io,
     io::AsyncBufReadExt,
-    select,
     sync::mpsc::{self, UnboundedSender},
 };
 use tracing_subscriber::{fmt, EnvFilter};
@@ -92,14 +92,20 @@ use rpassword;
 /* --- Webserver --------------------------------------------------------------------------- */
 mod web_server;
 use crate::web_server::{
-    run_web_server, web_command, web_ok_resp, web_peer_view, web_search_dispatch_resp,
-    web_search_hit, web_search_resp, web_shared_state, web_status_view, I_EVENT_RING_MAX,
+    run_web_server, web_command, web_doc_text_resp, web_ok_resp, web_peer_view,
+    web_search_dispatch_resp, web_search_hit, web_search_resp, web_shared_state, web_status_view,
+    I_EVENT_RING_MAX,
 };
 
 mod config;
 use crate::config::app_config;
 use crate::config::cfg_get;
 
+
+mod pdf_text_extractor;
+use crate::pdf_text_extractor::extract_pdf_text;
+
+/* ===================================== Config ============================================ */
 fn load_cfg_or_exit() -> app_config {
     /* Defensive: explicit error handling, no panic, ascii messages only */
     config::app_config::load_from_env().unwrap_or_else(|e| {
@@ -109,6 +115,14 @@ fn load_cfg_or_exit() -> app_config {
 }
 
 /* ===================================== Payload =========================================== */
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct CombiSearchHit {
+    /* Web and P2P: include snippet to avoid follow up calls during result polling */
+    s_doc: String,
+    d_score: f32,
+    s_snippet: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum PayloadType {
     Text(String),
@@ -121,34 +135,35 @@ enum PayloadType {
     ConnectAck,
     OfflineFlush,
 
-    SearchRequest {
-        i_id: u64,
-        s_query: String,
-    },
+    SearchRequest { i_id: u64, s_query: String },
     SearchResponse {
         i_id: u64,
         s_peer: String,
         v_hits: Vec<SearchHit>,
     },
 
-    VecSearchRequest {
-        i_id: u64,
-        s_query: String,
-    },
+    VecSearchRequest { i_id: u64, s_query: String },
     VecSearchResponse {
         i_id: u64,
         s_peer: String,
         v_hits: Vec<VecSearchHit>,
     },
 
-    CombiSearchRequest {
-        i_id: u64,
-        s_query: String,
-    },
+    CombiSearchRequest { i_id: u64, s_query: String },
     CombiSearchResponse {
         i_id: u64,
         s_peer: String,
-        v_hits: Vec<(String, f32)>,
+        v_hits: Vec<CombiSearchHit>,
+    },
+
+    /* Web: click on hit -> request document text from local or remote peer */
+    DocTextRequest { i_id: u64, s_path: String },
+    DocTextResponse {
+        i_id: u64,
+        s_peer: String,
+        s_path: String,
+        s_text: String,
+        s_error: String,
     },
 
     /* IAM replication */
@@ -190,15 +205,18 @@ impl CryptoContext {
             bls_key: bls_share,
         }
     }
+
     fn encrypt(&self, v_plain: &[u8]) -> Vec<u8> {
         let mut a_nonce = [0u8; 12];
         OsRng.fill_bytes(&mut a_nonce);
         let nonce = aes_gcm_siv::Nonce::from_slice(&a_nonce);
-        let mut v_ct = self.cipher.encrypt(nonce, v_plain).expect("encrypt");
+
+        let mut v_ct = self.cipher.encrypt(nonce, v_plain).unwrap_or_default();
         let mut v_out = a_nonce.to_vec();
         v_out.append(&mut v_ct);
         v_out
     }
+
     fn decrypt(&self, v_data: &[u8]) -> Option<Vec<u8>> {
         if v_data.len() <= 12 {
             return None;
@@ -215,10 +233,9 @@ struct Auditor {
 }
 impl Auditor {
     fn new() -> Self {
-        Self {
-            v_hashes: Vec::new(),
-        }
+        Self { v_hashes: Vec::new() }
     }
+
     fn record(&mut self, v_entry: &[u8]) {
         self.v_hashes.push(Sha256::digest(v_entry).into());
     }
@@ -233,6 +250,7 @@ impl DocTracker {
         let db = sled::open(crate::config::path_processed_docs_dir()).expect("Tracker DB init");
         Self { db }
     }
+
     fn mtime(&self, s_path: &str) -> Option<u64> {
         self.db.get(s_path).ok().flatten().map(|ivec| {
             let mut a = [0u8; 8];
@@ -244,13 +262,16 @@ impl DocTracker {
             }
         })
     }
+
     fn set_mtime(&self, s_path: &str, i_mtime: u64) {
         let bytes = i_mtime.to_le_bytes();
         let _ = self.db.insert(s_path, IVec::from(&bytes[..]));
     }
+
     fn remove(&self, s_path: &str) {
         let _ = self.db.remove(s_path);
     }
+
     fn all_paths(&self) -> Vec<String> {
         self.db
             .iter()
@@ -268,6 +289,7 @@ fn canonicalize_best_effort_str(p_in: &Path) -> String {
         Err(_) => p_in.to_string_lossy().into_owned(),
     }
 }
+
 /* ===================================== Tantivy =========================================== */
 struct TantivyIndex {
     index: Index,
@@ -329,7 +351,7 @@ impl TantivyIndex {
             }
         }
 
-        w.commit().unwrap();
+        let _ = w.commit();
         let _ = self.reader.reload();
     }
 
@@ -355,15 +377,14 @@ impl TantivyIndex {
                     let i_mtime = md
                         .modified()
                         .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                        .duration_since(std::time::UNIX_EPOCH)
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
 
                     if tracker.mtime(&s_p).map_or(true, |old| old != i_mtime) {
                         if let Some(s_txt) = extract_doc_text(&p).ok().filter(|s| !s.is_empty()) {
                             w.delete_term(Term::from_field_text(f_path, &s_p));
-                            let _ =
-                                w.add_document(doc!(f_path => s_p.as_str(), f_content => s_txt));
+                            let _ = w.add_document(doc!(f_path => s_p.as_str(), f_content => s_txt));
                             tracker.set_mtime(&s_p, i_mtime);
                         }
                     }
@@ -379,6 +400,7 @@ impl TantivyIndex {
             Ok(q) => q,
             Err(_) => return Vec::new(),
         };
+
         let v_docs = searcher
             .search(&query, &TopDocs::with_limit(i_limit))
             .unwrap_or_default();
@@ -405,36 +427,79 @@ impl TantivyIndex {
 const BM25_WEIGHT: f32 = 0.7;
 const VEC_WEIGHT: f32 = 0.3;
 
-pub fn combi_search(
+const I_SNIPPET_MAX_LEN: usize = 320;
+const I_DOC_TEXT_MAX_LEN: usize = 2_000_000;
+
+fn safe_truncate_chars(s_in: &str, i_max_chars: usize) -> String {
+    /* Defensive: char based truncate, avoids invalid UTF-8 slicing */
+    if i_max_chars == 0 {
+        return String::new();
+    }
+    s_in.chars().take(i_max_chars).collect::<String>()
+}
+
+fn build_snippet_for_query_simple(s_text: &str, s_query: &str) -> String {
+    /* Defensive: simple snippet builder, bounded output, ASCII safe code path */
+    let s_t = s_text.trim();
+    if s_t.is_empty() {
+        return String::new();
+    }
+
+    let s_q = s_query.trim();
+    if s_q.is_empty() {
+        return safe_truncate_chars(s_t, I_SNIPPET_MAX_LEN);
+    }
+
+    let s_low = s_t.to_ascii_lowercase();
+    let s_q_low = s_q.to_ascii_lowercase();
+
+    if let Some(i_pos) = s_low.find(&s_q_low) {
+        let i_half: usize = I_SNIPPET_MAX_LEN / 2;
+        let i_start = i_pos.saturating_sub(i_half);
+
+        /* Note: We must not slice by bytes at arbitrary offsets; use chars */
+        let s_tail = s_t.chars().skip(i_start).collect::<String>();
+        return safe_truncate_chars(&s_tail, I_SNIPPET_MAX_LEN);
+    }
+
+    safe_truncate_chars(s_t, I_SNIPPET_MAX_LEN)
+}
+
+fn combi_search_with_snippets(
     idx_tan: &TantivyIndex,
     idx_vec: &Arc<VectorIndex>,
     s_query: &str,
     i_limit: usize,
-) -> Vec<(String, f32)> {
+) -> Vec<CombiSearchHit> {
+    /* Historie: 12.01.2026 MS - Web: return combi hits with snippets */
     let mut v_bm = idx_tan.search(s_query, 200);
     if v_bm.is_empty() {
-        return idx_vec.query(s_query, i_limit);
+        let v_vec_only = idx_vec.query_with_snippets(s_query, i_limit);
+        return v_vec_only
+            .into_iter()
+            .map(|h| CombiSearchHit {
+                s_doc: h.s_doc,
+                d_score: h.d_score,
+                s_snippet: safe_truncate_chars(&h.s_snippet, I_SNIPPET_MAX_LEN),
+            })
+            .collect();
     }
 
     let v_q_vec = idx_vec.encode_query(s_query);
     let d_bm_max = v_bm.first().map(|h| h.d_score).unwrap_or(1.0);
 
     let mut v_combined: Vec<(String, f32)> = Vec::new();
-    let mut i_missing_vec: usize = 0;
 
     for SearchHit { s_doc, d_score } in v_bm.drain(..) {
         if let Some(v_doc_vec) = idx_vec.vec_of(&s_doc) {
             let d_bm_n = d_score / d_bm_max.max(1.0);
             let d_vec_n = cosine(&v_q_vec, &v_doc_vec).max(0.0);
-
             let d_final: f32 = BM25_WEIGHT * d_bm_n + VEC_WEIGHT * d_vec_n;
             v_combined.push((s_doc, d_final));
-        } else {
-            i_missing_vec = i_missing_vec.saturating_add(1);
         }
     }
 
-    /* Fix: Degradation Strategy - falls keine Vektoren matchen, BM25-only liefern */
+    /* Degradation: if no vec matches exist, fallback to BM25 only */
     if v_combined.is_empty() {
         let mut v_fallback = idx_tan.search(s_query, i_limit);
         v_fallback.sort_by(|a, b| {
@@ -442,19 +507,37 @@ pub fn combi_search(
                 .partial_cmp(&a.d_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+
         return v_fallback
             .into_iter()
-            .map(|h| (h.s_doc, h.d_score))
+            .map(|h| {
+                let s_txt = extract_doc_text(Path::new(&h.s_doc)).unwrap_or_else(|_| String::new());
+                let s_snip = build_snippet_for_query_simple(&s_txt, s_query);
+                CombiSearchHit {
+                    s_doc: h.s_doc,
+                    d_score: h.d_score,
+                    s_snippet: safe_truncate_chars(&s_snip, I_SNIPPET_MAX_LEN),
+                }
+            })
             .collect();
     }
 
     v_combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     v_combined.truncate(i_limit);
 
-    /* Optional: Diagnose zaehler (siehe Diagnosepunkte Abschnitt) */
-    let _ = i_missing_vec;
+    let mut v_out: Vec<CombiSearchHit> = Vec::with_capacity(v_combined.len());
+    for (s_doc, d_score) in v_combined.into_iter() {
+        let s_txt = extract_doc_text(Path::new(&s_doc)).unwrap_or_else(|_| String::new());
+        let s_snip = build_snippet_for_query_simple(&s_txt, s_query);
 
-    v_combined
+        v_out.push(CombiSearchHit {
+            s_doc,
+            d_score,
+            s_snippet: safe_truncate_chars(&s_snip, I_SNIPPET_MAX_LEN),
+        });
+    }
+
+    v_out
 }
 
 /* ===================================== Extraktion ======================================== */
@@ -469,7 +552,7 @@ pub fn extract_doc_text(p_file: &Path) -> ResultStr {
 
     match s_ext.as_str() {
         "txt" => Ok(fs::read_to_string(p_file)?),
-        "pdf" => extract_pdf_text(p_file),
+        "pdf" => call_extract_pdf_text(p_file),
         "docx" => extract_docx_text(p_file),
         "xlsx" | "xls" | "csv" => extract_excel_text(p_file),
         "pptx" => extract_pptx_text(p_file),
@@ -477,9 +560,9 @@ pub fn extract_doc_text(p_file: &Path) -> ResultStr {
     }
 }
 
-fn extract_pdf_text(p_path: &Path) -> ResultStr {
-    let text = extract_text(p_path)?;
-    Ok(text)
+fn call_extract_pdf_text(p_path: &Path) -> ResultStr {
+    let text = extract_pdf_text(p_path)?;
+    Ok(text.s_text)
 }
 
 fn extract_docx_text(p: &Path) -> ResultStr {
@@ -546,9 +629,11 @@ impl PersistenceLayer {
     fn new() -> Db {
         sled::open(crate::config::path_queue_dir()).expect("DB init")
     }
+
     fn enqueue(db: &Db, peer: &PeerId, v_bytes: &[u8]) {
         let _ = db.insert(peer.to_bytes(), v_bytes);
     }
+
     fn dequeue(db: &Db, peer: &PeerId) -> Option<Vec<u8>> {
         db.remove(peer.to_bytes())
             .ok()
@@ -571,6 +656,7 @@ struct IamCliState {
     s_session: String,
 }
 
+/* ===================================== CLI Menu ========================================== */
 fn print_menu() {
     println!(
         "Verfuegbare Befehle
@@ -710,10 +796,7 @@ async fn init_indices() -> (Arc<TantivyIndex>, Arc<VectorIndex>) {
     diag_print_index_paths(p_vec_root.as_path());
 
     /* Vector index: load persisted graph if present. */
-    let idx_vec = tokio::task::block_in_place(|| {
-        /* NOTE: requires vector_idx.rs signature load_or_init_index(root, tracker_dir). */
-        load_or_init_index(p_vec_root.as_path(), p_vec_tracker.as_path())
-    });
+    let idx_vec = tokio::task::block_in_place(|| load_or_init_index(p_vec_root.as_path(), p_vec_tracker.as_path()));
 
     /* Tantivy index: prefer stable canonical doc dir, fallback to configured path. */
     let s_doc_dir: String = cfg_get().s_doc_dir.clone();
@@ -740,6 +823,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive("info".parse()?)
         .add_directive("tantivy=warn".parse()?);
+
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -804,9 +888,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let s_node_id: String = swarm.local_peer_id().to_string();
-    let _cfg_iam = iam_config {
-        s_node_id: s_node_id.clone(),
-    };
+    let _cfg_iam = iam_config { s_node_id: s_node_id.clone() };
 
     let global_topic = libp2p::gossipsub::IdentTopic::new(s_global_topic.clone());
     swarm.behaviour_mut().gossipsub.subscribe(&global_topic)?;
@@ -815,15 +897,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     swarm.behaviour_mut().gossipsub.subscribe(&iam_topic)?;
 
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+
     let mut v_peers: Vec<libp2p::PeerId> = Vec::new();
-    let mut h_peer_index: std::collections::HashMap<libp2p::PeerId, usize> =
-        std::collections::HashMap::new();
+    let mut h_peer_index: std::collections::HashMap<libp2p::PeerId, usize> = std::collections::HashMap::new();
     let mut o_chat_peer: Option<libp2p::PeerId> = None;
     let mut o_chat_topic: Option<libp2p::gossipsub::IdentTopic> = None;
-    let mut h_chunk_queue: std::collections::HashMap<
-        libp2p::PeerId,
-        std::collections::VecDeque<FileChunk>,
-    > = std::collections::HashMap::new();
+
+    let mut h_chunk_queue: std::collections::HashMap<libp2p::PeerId, std::collections::VecDeque<FileChunk>> =
+        std::collections::HashMap::new();
+
     let _db = PersistenceLayer::new();
     let (tx_ack, mut rx_ack) = tokio::sync::mpsc::unbounded_channel::<(libp2p::PeerId, u32)>();
     let mut i_search_ctr: u64 = 0;
@@ -839,13 +921,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let p_vec_root = crate::config::path_vector_idx_dir();
     let mut idx_timer = tokio::time::interval(std::time::Duration::from_secs(i_idx_interval_sec));
-    let mut persist_timer =
-        tokio::time::interval(std::time::Duration::from_secs(i_persist_interval_sec));
+    let mut persist_timer = tokio::time::interval(std::time::Duration::from_secs(i_persist_interval_sec));
 
     /* -------------------- IAM -------------------------------------------------------------- */
-    let cfg_iam = iam_config {
-        s_node_id: swarm.local_peer_id().to_string(),
-    };
+    let cfg_iam = iam_config { s_node_id: swarm.local_peer_id().to_string() };
     let iam = std::sync::Arc::new(iam_store::open(cfg_iam).expect("iam open"));
 
     {
@@ -1004,6 +1083,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     idx_tan.clone(),
                                     idx_vec.clone(),
                                     iam.clone(),
+                                    st_web.clone(),
                                 ).await;
                             }
                         }
@@ -1019,6 +1099,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 }
+
 /* ========================================================================================== */
 /* Web Command Handler                                                                         */
 /* ========================================================================================== */
@@ -1039,7 +1120,7 @@ async fn handle_web_command(
     o_iam_cli: &mut Option<IamCliState>,
     st_web: Arc<Mutex<web_shared_state>>,
 ) {
-    /* Historie: 11.01.2026 MS - zentrale Schaltstelle fuer Web API Kommandos */
+    /* Historie: 12.01.2026 MS - zentrale Schaltstelle fuer Web API Kommandos (inkl. doc text) */
     match cmd {
         web_command::status_get { tx } => {
             let g = st_web.lock().unwrap();
@@ -1071,30 +1152,28 @@ async fn handle_web_command(
         } => {
             let r = iam.begin_login(&s_user);
             let resp = match r {
-                Ok(ch) => {
-                    match iam.finish_login_with_password(&s_user, &ch.s_challenge_id, &s_password) {
-                        Ok(s_session) => {
-                            *o_iam_cli = Some(IamCliState {
-                                s_user: s_user.clone(),
-                                s_session: s_session.clone(),
-                            });
-                            {
-                                let mut g = st_web.lock().unwrap();
-                                g.push_event(format!("iam: login ok user={}", s_user));
-                            }
-                            web_server::web_login_resp {
-                                b_ok: true,
-                                s_session,
-                                s_error: "".to_string(),
-                            }
+                Ok(ch) => match iam.finish_login_with_password(&s_user, &ch.s_challenge_id, &s_password) {
+                    Ok(s_session) => {
+                        *o_iam_cli = Some(IamCliState {
+                            s_user: s_user.clone(),
+                            s_session: s_session.clone(),
+                        });
+                        {
+                            let mut g = st_web.lock().unwrap();
+                            g.push_event(format!("iam: login ok user={}", s_user));
                         }
-                        Err(_) => web_server::web_login_resp {
-                            b_ok: false,
-                            s_session: "".to_string(),
-                            s_error: "unauthorized".to_string(),
-                        },
+                        web_server::web_login_resp {
+                            b_ok: true,
+                            s_session,
+                            s_error: "".to_string(),
+                        }
                     }
-                }
+                    Err(_) => web_server::web_login_resp {
+                        b_ok: false,
+                        s_session: "".to_string(),
+                        s_error: "unauthorized".to_string(),
+                    },
+                },
                 Err(_) => web_server::web_login_resp {
                     b_ok: false,
                     s_session: "".to_string(),
@@ -1113,14 +1192,8 @@ async fn handle_web_command(
             let i_rights = parse_u64_any(&s_rights).unwrap_or(0);
             let r = iam.add_group(&s_actor, &s_group, i_rights as rights_mask);
             let v = match r {
-                Ok(_) => web_ok_resp {
-                    b_ok: true,
-                    s_error: "".to_string(),
-                },
-                Err(_) => web_ok_resp {
-                    b_ok: false,
-                    s_error: "iam_error".to_string(),
-                },
+                Ok(_) => web_ok_resp { b_ok: true, s_error: "".to_string() },
+                Err(_) => web_ok_resp { b_ok: false, s_error: "iam_error".to_string() },
             };
             {
                 let mut g = st_web.lock().unwrap();
@@ -1130,7 +1203,6 @@ async fn handle_web_command(
         }
 
         web_command::iam_groups_get { tx } => {
-            // Historie: 11.01.2026 Marcus Schlieper - Web: expose groups list for UI select
             let v = match iam.list_groups() {
                 Ok(v_groups) => v_groups
                     .into_iter()
@@ -1159,14 +1231,8 @@ async fn handle_web_command(
         } => {
             let r = iam.add_user(&s_actor, &s_user, &s_password, &s_group);
             let v = match r {
-                Ok(_) => web_ok_resp {
-                    b_ok: true,
-                    s_error: "".to_string(),
-                },
-                Err(_) => web_ok_resp {
-                    b_ok: false,
-                    s_error: "iam_error".to_string(),
-                },
+                Ok(_) => web_ok_resp { b_ok: true, s_error: "".to_string() },
+                Err(_) => web_ok_resp { b_ok: false, s_error: "iam_error".to_string() },
             };
             {
                 let mut g = st_web.lock().unwrap();
@@ -1184,27 +1250,11 @@ async fn handle_web_command(
             tx,
         } => {
             let i_rights = parse_u64_any(&s_rights).unwrap_or(0);
-            let o_group = if s_group_or_dash.trim() == "-" {
-                None
-            } else {
-                Some(s_group_or_dash.as_str())
-            };
-            let r = iam.add_path(
-                &s_actor,
-                &s_path,
-                o_group,
-                b_public,
-                i_rights as rights_mask,
-            );
+            let o_group = if s_group_or_dash.trim() == "-" { None } else { Some(s_group_or_dash.as_str()) };
+            let r = iam.add_path(&s_actor, &s_path, o_group, b_public, i_rights as rights_mask);
             let v = match r {
-                Ok(_) => web_ok_resp {
-                    b_ok: true,
-                    s_error: "".to_string(),
-                },
-                Err(_) => web_ok_resp {
-                    b_ok: false,
-                    s_error: "iam_error".to_string(),
-                },
+                Ok(_) => web_ok_resp { b_ok: true, s_error: "".to_string() },
+                Err(_) => web_ok_resp { b_ok: false, s_error: "iam_error".to_string() },
             };
             {
                 let mut g = st_web.lock().unwrap();
@@ -1217,10 +1267,7 @@ async fn handle_web_command(
             let peer = match s_peer_id.parse::<PeerId>() {
                 Ok(p) => p,
                 Err(_) => {
-                    let _ = tx.send(web_ok_resp {
-                        b_ok: false,
-                        s_error: "invalid_peer_id".to_string(),
-                    });
+                    let _ = tx.send(web_ok_resp { b_ok: false, s_error: "invalid_peer_id".to_string() });
                     return;
                 }
             };
@@ -1247,18 +1294,12 @@ async fn handle_web_command(
             let local_id = swarm.local_peer_id().clone();
             send_encrypted(&local_id, swarm, global_topic, &PayloadType::ConnectRequest);
 
-            let _ = tx.send(web_ok_resp {
-                b_ok: true,
-                s_error: "".to_string(),
-            });
+            let _ = tx.send(web_ok_resp { b_ok: true, s_error: "".to_string() });
         }
 
         web_command::p2p_send_text { s_text, tx } => {
             let Some(topic) = o_chat_topic else {
-                let _ = tx.send(web_ok_resp {
-                    b_ok: false,
-                    s_error: "no_chat_partner".to_string(),
-                });
+                let _ = tx.send(web_ok_resp { b_ok: false, s_error: "no_chat_partner".to_string() });
                 return;
             };
 
@@ -1270,18 +1311,10 @@ async fn handle_web_command(
                 g.push_event("p2p: send_text ok".to_string());
             }
 
-            let _ = tx.send(web_ok_resp {
-                b_ok: true,
-                s_error: "".to_string(),
-            });
+            let _ = tx.send(web_ok_resp { b_ok: true, s_error: "".to_string() });
         }
 
-        /* Web: Netzwerk Combi Search (immer Netzwerk, kein local). */
-        web_command::search_network_combi_dispatch {
-            s_query,
-            i_limit,
-            tx,
-        } => {
+        web_command::search_network_combi_dispatch { s_query, i_limit, tx } => {
             *i_search_ctr = i_search_ctr.saturating_add(1);
             let i_id = *i_search_ctr;
 
@@ -1296,48 +1329,40 @@ async fn handle_web_command(
                 ));
             }
 
-            // 1) Local: compute and cache local hits immediately
+            /* 1) Local: compute and cache local hits immediately (WITH snippets) */
             let s_local_peer = swarm.local_peer_id().to_string();
-            let v_local = combi_search(&idx_tan, &idx_vec, &s_query, i_limit);
+            let v_local = combi_search_with_snippets(&idx_tan, &idx_vec, &s_query, i_limit);
 
             if !v_local.is_empty() {
                 let mut v_web_hits: Vec<web_search_hit> = Vec::with_capacity(v_local.len());
-                for (s_doc, d_score) in v_local {
+                for h in v_local {
                     v_web_hits.push(web_search_hit {
                         s_peer_id: s_local_peer.clone(),
-                        s_doc,
-                        d_score,
-                        s_snippet: "".to_string(),
+                        s_doc: h.s_doc,
+                        d_score: h.d_score,
+                        s_snippet: h.s_snippet,
                     });
                 }
 
-                // Borrow-splitting: compute hits_len first, then push_event
                 {
                     let mut g = st_web.lock().unwrap();
                     g.search_cache_add_hits(i_id, v_web_hits);
-
                     let i_hits_len: usize = g.search_cache_hits_len(i_id).unwrap_or(0);
 
-                    g.push_event(format!(
-                        "search: combi local cached id={} hits={}",
-                        i_id, i_hits_len
-                    ));
+                    g.push_event(format!("search: combi local cached id={} hits={}", i_id, i_hits_len));
                 }
             } else {
                 let mut g = st_web.lock().unwrap();
                 g.push_event(format!("search: combi local cached id={} hits=0", i_id));
             }
 
-            // 2) Network: send request to peers (remote hits arrive async)
+            /* 2) Network: send request to peers (remote hits arrive async) */
             let local_id = swarm.local_peer_id().clone();
             send_encrypted(
                 &local_id,
                 swarm,
                 global_topic,
-                &PayloadType::CombiSearchRequest {
-                    i_id,
-                    s_query: s_query.clone(),
-                },
+                &PayloadType::CombiSearchRequest { i_id, s_query: s_query.clone() },
             );
 
             let _ = tx.send(web_search_dispatch_resp {
@@ -1372,7 +1397,71 @@ async fn handle_web_command(
             let _ = tx.send(resp);
         }
 
-        /* Bestehende (alte) search_* web commands werden hier bewusst nicht mehr behandelt. */
+        web_command::doc_text_get { s_peer_id, s_path, tx } => {
+            /* Web click: local read or remote P2P request */
+            let s_local_peer = swarm.local_peer_id().to_string();
+
+            if s_peer_id == s_local_peer {
+                let s_txt = extract_doc_text(Path::new(&s_path)).unwrap_or_else(|_| String::new());
+                let s_out = safe_truncate_chars(&s_txt, I_DOC_TEXT_MAX_LEN);
+
+                let resp = web_doc_text_resp {
+                    b_ok: !s_out.is_empty(),
+                    s_error: if s_out.is_empty() { "doc_empty_or_unreadable".to_string() } else { "".to_string() },
+                    s_peer_id,
+                    s_path,
+                    s_text: s_out,
+                };
+                let _ = tx.send(resp);
+                return;
+            }
+
+            /* Remote: dispatch DocTextRequest and respond immediately with a pending marker */
+            *i_search_ctr = i_search_ctr.saturating_add(1);
+            let i_id = *i_search_ctr;
+
+            {
+                let mut g = st_web.lock().unwrap();
+                g.doc_cache_insert_pending(i_id, s_peer_id.clone(), s_path.clone(), now_ms());
+                g.push_event(format!(
+                    "doc: dispatch id={} peer={} path_len={}",
+                    i_id,
+                    s_peer_id,
+                    s_path.len()
+                ));
+            }
+
+            let peer = match s_peer_id.parse::<PeerId>() {
+                Ok(p) => p,
+                Err(_) => {
+                    let _ = tx.send(web_doc_text_resp {
+                        b_ok: false,
+                        s_error: "invalid_peer_id".to_string(),
+                        s_peer_id,
+                        s_path,
+                        s_text: "".to_string(),
+                    });
+                    return;
+                }
+            };
+
+            /* Ensure topic exists */
+            let topic = build_chat_topic(&swarm.local_peer_id(), &peer);
+            let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+
+            let local_id = swarm.local_peer_id().clone();
+            send_encrypted(&local_id, swarm, &topic, &PayloadType::DocTextRequest { i_id, s_path: s_path.clone() });
+
+            /* For web: immediate response indicates pending; UI can poll doc cache endpoint if added */
+            let _ = tx.send(web_doc_text_resp {
+                b_ok: true,
+                s_error: format!("pending:{}", i_id),
+                s_peer_id,
+                s_path,
+                s_text: "".to_string(),
+            });
+        }
+
         _ => {
             let mut g = st_web.lock().unwrap();
             g.push_event("web: unsupported_command".to_string());
@@ -1407,6 +1496,7 @@ async fn handle_user_input(
     match s_cmd {
         "help" | "menu" => print_menu(),
         "iam_help" => print_iam_help(),
+
         "iam_status" => {
             if let Some(st) = o_iam_cli.as_ref() {
                 println!("iam: logged_in user={} session={}", st.s_user, st.s_session);
@@ -1414,6 +1504,7 @@ async fn handle_user_input(
                 println!("iam: not_logged_in");
             }
         }
+
         "peers" => {
             if v_peers.is_empty() {
                 println!("Keine Peers entdeckt.");
@@ -1423,6 +1514,7 @@ async fn handle_user_input(
                 }
             }
         }
+
         "exit" => {
             println!("Programmende.");
             std::process::exit(0);
@@ -1441,10 +1533,7 @@ async fn handle_user_input(
                 return;
             };
 
-            let s_actor = o_iam_cli
-                .as_ref()
-                .map(|x| x.s_user.as_str())
-                .unwrap_or("local_admin");
+            let s_actor = o_iam_cli.as_ref().map(|x| x.s_user.as_str()).unwrap_or("local_admin");
             match iam.add_group(s_actor, s_group, i_rights as rights_mask) {
                 Ok(_) => println!("iam: group added {}", s_group),
                 Err(e) => println!("iam error: {:?}", e),
@@ -1461,10 +1550,7 @@ async fn handle_user_input(
             let s_pass = v[2];
             let s_group = v[3];
 
-            let s_actor = o_iam_cli
-                .as_ref()
-                .map(|x| x.s_user.as_str())
-                .unwrap_or("local_admin");
+            let s_actor = o_iam_cli.as_ref().map(|x| x.s_user.as_str()).unwrap_or("local_admin");
             match iam.add_user(s_actor, s_user, s_pass, s_group) {
                 Ok(_) => println!("iam: user added {}", s_user),
                 Err(e) => println!("iam error: {:?}", e),
@@ -1480,10 +1566,7 @@ async fn handle_user_input(
             let s_user = v[1];
             let s_group = v[2];
 
-            let s_actor = o_iam_cli
-                .as_ref()
-                .map(|x| x.s_user.as_str())
-                .unwrap_or("local_admin");
+            let s_actor = o_iam_cli.as_ref().map(|x| x.s_user.as_str()).unwrap_or("local_admin");
             match iam.add_user_to_group(s_actor, s_user, s_group) {
                 Ok(_) => println!("iam: membership added user={} group={}", s_user, s_group),
                 Err(e) => println!("iam error: {:?}", e),
@@ -1512,18 +1595,9 @@ async fn handle_user_input(
             };
 
             let o_group = if s_group == "-" { None } else { Some(s_group) };
-            let s_actor = o_iam_cli
-                .as_ref()
-                .map(|x| x.s_user.as_str())
-                .unwrap_or("local_admin");
+            let s_actor = o_iam_cli.as_ref().map(|x| x.s_user.as_str()).unwrap_or("local_admin");
 
-            match iam.add_path(
-                s_actor,
-                s_path,
-                o_group,
-                b_public,
-                i_rights_u64 as rights_mask,
-            ) {
+            match iam.add_path(s_actor, s_path, o_group, b_public, i_rights_u64 as rights_mask) {
                 Ok(s_id) => println!("iam: path rule added id={}", s_id),
                 Err(e) => println!("iam error: {:?}", e),
             }
@@ -1619,12 +1693,7 @@ async fn handle_user_input(
                 return;
             };
 
-            match iam.check_access(
-                &st.s_session,
-                s_path,
-                i_right,
-                cfg_get().b_iam_remote_scope_public,
-            ) {
+            match iam.check_access(&st.s_session, s_path, i_right, cfg_get().b_iam_remote_scope_public) {
                 Ok(dec) => {
                     println!(
                         "iam: allowed={} reason={} effective_rights=0x{:016x}",
@@ -1701,12 +1770,7 @@ async fn handle_user_input(
             };
 
             let i_need = right_read;
-            match iam.check_access(
-                &st.s_session,
-                &s_file,
-                i_need,
-                cfg_get().b_iam_remote_scope_public,
-            ) {
+            match iam.check_access(&st.s_session, &s_file, i_need, cfg_get().b_iam_remote_scope_public) {
                 Ok(dec) => {
                     if !dec.b_allowed {
                         println!("iam: deny file request reason={}", dec.s_reason);
@@ -1785,12 +1849,7 @@ async fn handle_user_input(
             *i_search_ctr += 1;
             let i_id = *i_search_ctr;
             let local_id = swarm.local_peer_id().clone();
-            send_encrypted(
-                &local_id,
-                swarm,
-                global_topic,
-                &PayloadType::SearchRequest { i_id, s_query },
-            );
+            send_encrypted(&local_id, swarm, global_topic, &PayloadType::SearchRequest { i_id, s_query });
             println!("Suche (ID {i_id}) an Peers gesendet.");
         }
 
@@ -1805,11 +1864,7 @@ async fn handle_user_input(
                     println!("(lokal)");
                     for h in &v_res {
                         println!("==========================");
-                        println!(
-                            "  {d_score:.4}  {s_doc}",
-                            d_score = h.d_score,
-                            s_doc = h.s_doc
-                        );
+                        println!("  {d_score:.4}  {s_doc}", d_score = h.d_score, s_doc = h.s_doc);
                         if !h.s_snippet.is_empty() {
                             println!("    snippet: {s}", s = h.s_snippet);
                         }
@@ -1821,37 +1876,27 @@ async fn handle_user_input(
             *i_search_ctr += 1;
             let i_id = *i_search_ctr;
             let local_id = swarm.local_peer_id().clone();
-            send_encrypted(
-                &local_id,
-                swarm,
-                global_topic,
-                &PayloadType::VecSearchRequest { i_id, s_query },
-            );
+            send_encrypted(&local_id, swarm, global_topic, &PayloadType::VecSearchRequest { i_id, s_query });
             println!("Vektor Suche (ID {i_id}) gesendet.");
         }
 
         s if s.starts_with("combi_search ") => {
             let s_query = s.strip_prefix("combi_search ").unwrap_or("").to_string();
 
-            let v_res = combi_search(&idx_tan, &idx_vec, &s_query, 5);
+            let v_res = combi_search_with_snippets(&idx_tan, &idx_vec, &s_query, 5);
             if v_res.is_empty() {
                 println!("(lokal) keine Hybrid Treffer");
             } else {
                 println!("(lokal)");
-                for (s_doc, d_score) in &v_res {
-                    println!("  {:>7.4}  {}", d_score, s_doc);
+                for h in &v_res {
+                    println!("  {:>7.4}  {}", h.d_score, h.s_doc);
                 }
             }
 
             *i_search_ctr += 1;
             let i_id = *i_search_ctr;
             let local_id = swarm.local_peer_id().clone();
-            send_encrypted(
-                &local_id,
-                swarm,
-                global_topic,
-                &PayloadType::CombiSearchRequest { i_id, s_query },
-            );
+            send_encrypted(&local_id, swarm, global_topic, &PayloadType::CombiSearchRequest { i_id, s_query });
             println!("Hybrid Suche (ID {i_id}) gesendet.");
         }
 
@@ -1875,6 +1920,7 @@ async fn handle_incoming(
     idx_tan: Arc<TantivyIndex>,
     idx_vec: Arc<VectorIndex>,
     iam: Arc<iam_store>,
+    st_web: Arc<Mutex<web_shared_state>>,
 ) {
     match msg.payload {
         PayloadType::IamDeltaPush(p) => {
@@ -1893,12 +1939,7 @@ async fn handle_incoming(
                 s_merkle_root_hex: "na".to_string(),
             };
             let local_id = swarm.local_peer_id().clone();
-            send_encrypted(
-                &local_id,
-                swarm,
-                global_topic,
-                &PayloadType::IamDeltaResponse(resp),
-            );
+            send_encrypted(&local_id, swarm, global_topic, &PayloadType::IamDeltaResponse(resp));
         }
         PayloadType::IamDeltaResponse(r) => {
             let i_len = r.v_events.len();
@@ -1914,12 +1955,7 @@ async fn handle_incoming(
             if let Ok(s_listing) = build_dir_listing() {
                 let topic = build_chat_topic(&swarm.local_peer_id(), src);
                 let local_id = swarm.local_peer_id().clone();
-                send_encrypted(
-                    &local_id,
-                    swarm,
-                    &topic,
-                    &PayloadType::DirResponse(s_listing),
-                );
+                send_encrypted(&local_id, swarm, &topic, &PayloadType::DirResponse(s_listing));
             }
         }
         PayloadType::DirResponse(s_ls) => {
@@ -1983,11 +2019,7 @@ async fn handle_incoming(
                 .await
                 .unwrap();
 
-            println!(
-                "Datei Teil {} von {} Bytes empfangen.",
-                chunk.i_index,
-                chunk.v_bytes.len()
-            );
+            println!("Datei Teil {} von {} Bytes empfangen.", chunk.i_index, chunk.v_bytes.len());
             let _ = tx_ack.send((*src, chunk.i_index));
         }
 
@@ -2012,18 +2044,10 @@ async fn handle_incoming(
                 &local_id,
                 swarm,
                 global_topic,
-                &PayloadType::SearchResponse {
-                    i_id,
-                    s_peer: local_id.to_string(),
-                    v_hits,
-                },
+                &PayloadType::SearchResponse { i_id, s_peer: local_id.to_string(), v_hits },
             );
         }
-        PayloadType::SearchResponse {
-            i_id,
-            s_peer,
-            v_hits,
-        } => {
+        PayloadType::SearchResponse { i_id, s_peer, v_hits } => {
             if v_hits.is_empty() {
                 println!("(ID {i_id}) {s_peer}: keine Treffer");
             } else {
@@ -2042,33 +2066,18 @@ async fn handle_incoming(
                 &local_id,
                 swarm,
                 global_topic,
-                &PayloadType::VecSearchResponse {
-                    i_id,
-                    s_peer: local_id.to_string(),
-                    v_hits,
-                },
+                &PayloadType::VecSearchResponse { i_id, s_peer: local_id.to_string(), v_hits },
             );
         }
-        PayloadType::VecSearchResponse {
-            i_id,
-            s_peer,
-            v_hits,
-        } => {
+        PayloadType::VecSearchResponse { i_id, s_peer, v_hits } => {
             if v_hits.is_empty() {
                 println!("(ID {i_id}) {s_peer}: keine Vektor Treffer");
             } else {
                 for h in v_hits {
                     println!("==========================");
-                    println!(
-                        "(ID {i_id}) {s_peer}: {d_score:.4} {s_doc}",
-                        d_score = h.d_score,
-                        s_doc = h.s_doc
-                    );
+                    println!("(ID {i_id}) {s_peer}: {d_score:.4} {s_doc}", d_score = h.d_score, s_doc = h.s_doc);
                     if !h.s_snippet.trim().is_empty() {
-                        println!(
-                            "(ID {i_id}) {s_peer}: snippet: {s_snippet}",
-                            s_snippet = h.s_snippet
-                        );
+                        println!("(ID {i_id}) {s_peer}: snippet: {s_snippet}", s_snippet = h.s_snippet);
                     }
                     println!("==========================");
                 }
@@ -2077,32 +2086,76 @@ async fn handle_incoming(
 
         PayloadType::CombiSearchRequest { i_id, s_query } => {
             idx_vec.sync(Path::new(&cfg_get().s_doc_dir.clone()));
-            let v_hits = combi_search(&idx_tan, &idx_vec, &s_query, 5);
+            let v_hits = combi_search_with_snippets(&idx_tan, &idx_vec, &s_query, 5);
 
             let local_id = swarm.local_peer_id().clone();
             send_encrypted(
                 &local_id,
                 swarm,
                 global_topic,
-                &PayloadType::CombiSearchResponse {
-                    i_id,
-                    s_peer: local_id.to_string(),
-                    v_hits,
-                },
+                &PayloadType::CombiSearchResponse { i_id, s_peer: local_id.to_string(), v_hits },
             );
         }
-        PayloadType::CombiSearchResponse {
-            i_id,
-            s_peer,
-            v_hits,
-        } => {
+        PayloadType::CombiSearchResponse { i_id, s_peer, v_hits } => {
             if v_hits.is_empty() {
                 println!("(ID {i_id}) {s_peer}: keine Hybrid Treffer");
             } else {
-                for (s_doc, d_score) in v_hits {
-                    println!("(ID {i_id}) {s_peer}: {:>7.4} {}", d_score, s_doc);
+                for h in v_hits {
+                    println!("(ID {i_id}) {s_peer}: {:>7.4} {}", h.d_score, h.s_doc);
                 }
             }
+        }
+
+        PayloadType::DocTextRequest { i_id, s_path } => {
+            /* IAM: remote doc requests are evaluated with public scope */
+            let b_allow = {
+                let s_dummy_session = "00000000000000000000000000000000";
+                match iam.check_access(s_dummy_session, &s_path, right_read, true) {
+                    Ok(dec) => dec.b_allowed,
+                    Err(_) => false,
+                }
+            };
+
+            let local_id = swarm.local_peer_id().clone();
+            let topic = build_chat_topic(&swarm.local_peer_id(), src);
+
+            if !b_allow {
+                send_encrypted(
+                    &local_id,
+                    swarm,
+                    &topic,
+                    &PayloadType::DocTextResponse {
+                        i_id,
+                        s_peer: local_id.to_string(),
+                        s_path,
+                        s_text: "".to_string(),
+                        s_error: "iam_deny".to_string(),
+                    },
+                );
+                return;
+            }
+
+            let s_txt = extract_doc_text(Path::new(&s_path)).unwrap_or_else(|_| String::new());
+            let s_out = safe_truncate_chars(&s_txt, I_DOC_TEXT_MAX_LEN);
+
+            send_encrypted(
+                &local_id,
+                swarm,
+                &topic,
+                &PayloadType::DocTextResponse {
+                    i_id,
+                    s_peer: local_id.to_string(),
+                    s_path,
+                    s_text: s_out,
+                    s_error: "".to_string(),
+                },
+            );
+        }
+
+        PayloadType::DocTextResponse { i_id, s_peer, s_path, s_text, s_error } => {
+            let mut g = st_web.lock().unwrap();
+            g.doc_cache_set_result(i_id, s_peer, s_path, s_text, s_error);
+            g.push_event(format!("doc: resp cached id={}", i_id));
         }
     }
 }
@@ -2111,29 +2164,22 @@ async fn handle_incoming(
 /* Web Cache Update (aus Payload)                                                              */
 /* ========================================================================================== */
 fn update_web_cache_from_payload(st_web: Arc<Mutex<web_shared_state>>, payload: &PayloadType) {
-    /* Historie: 11.01.2026 MS - Web: store network combi results with peer_id per hit */
+    /* Historie: 12.01.2026 MS - Web: store network combi results with peer_id per hit + snippet */
     match payload {
-        PayloadType::CombiSearchResponse {
-            i_id,
-            s_peer,
-            v_hits,
-        } => {
+        PayloadType::CombiSearchResponse { i_id, s_peer, v_hits } => {
             let mut v_web_hits: Vec<web_search_hit> = Vec::new();
-            for (s_doc, d_score) in v_hits.iter() {
+            for h in v_hits.iter() {
                 v_web_hits.push(web_search_hit {
                     s_peer_id: s_peer.clone(),
-                    s_doc: s_doc.clone(),
-                    d_score: *d_score,
-                    s_snippet: "".to_string(),
+                    s_doc: h.s_doc.clone(),
+                    d_score: h.d_score,
+                    s_snippet: h.s_snippet.clone(),
                 });
             }
 
             let mut g = st_web.lock().unwrap();
             g.search_cache_add_hits(*i_id, v_web_hits);
-            g.push_event(format!(
-                "search: combi resp cached id={} peer={}",
-                i_id, s_peer
-            ));
+            g.push_event(format!("search: combi resp cached id={} peer={}", i_id, s_peer));
         }
         _ => {}
     }
@@ -2203,10 +2249,7 @@ fn send_encrypted(
         v_payload: v_ct,
     };
     let v_buf = serde_json::to_vec(&v_env).unwrap();
-    let _ = swarm
-        .behaviour_mut()
-        .gossipsub
-        .publish(topic.clone(), v_buf);
+    let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), v_buf);
 }
 
 fn now_ms() -> u64 {

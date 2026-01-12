@@ -40,9 +40,9 @@ rust-bert    = "0.23"
 hnsw         = { version = "0.11.0", features = ["serde"] }
 
 # ── Dokumenten­extraktion ─────────────────────────────────────────────────────
-pdf-extract  = "0.8"
-lopdf        = "0.31"            # Fallback für PDF-Parsing
-calamine     = { version = "0.31", default-features = false }
+pdf-extract  = "0.10.0"
+lopdf        = "0.39.0"            # Fallback für PDF-Parsing
+calamine     = { version = "0.32", default-features = false }
 zip          = "0.6"
 
 # ── Serialisierung & Persistenz ───────────────────────────────────────────────

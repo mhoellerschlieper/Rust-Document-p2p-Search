@@ -269,9 +269,15 @@ function render_search_results(v_hits, b_partial) {
     const s_doc = String((h && h.s_doc) || "");
     const s_peer = String((h && h.s_peer_id) || "");
     const d_score = Number((h && h.d_score) || 0);
+    const s_snip = String((h && h.s_snippet) || "");
 
     const card = document.createElement("div");
     card.className = "hit";
+
+    /* NEW: click opens document */
+    card.addEventListener("click", async () => {
+      await fetch_doc_text(s_peer, s_doc);
+    });
 
     const line1 = document.createElement("div");
     line1.className = "hit_title";
@@ -281,9 +287,22 @@ function render_search_results(v_hits, b_partial) {
     line2.className = "hit_snippet";
     line2.textContent = "peer=" + (s_peer ? s_peer : "-");
 
+    const line3 = document.createElement("div");
+    line3.className = "hit_snippet";
+    line3.textContent = s_snip ? s_snip : "";
+
     card.appendChild(line1);
     card.appendChild(line2);
+    card.appendChild(line3);
     box.appendChild(card);
+  });
+}
+
+const el_doc_clear = opt_by_id("btn_doc_clear");
+if (el_doc_clear) {
+  el_doc_clear.addEventListener("click", () => {
+    set_text("doc_title", "-");
+    by_id("doc_text").textContent = "";
   });
 }
 
@@ -361,6 +380,36 @@ async function do_search() {
   }, 450);
 
   await poll_search_result_once();
+}
+
+async function fetch_doc_text(s_peer_id, s_path) {
+  const s_peer = safe_trim(s_peer_id, 256);
+  const s_p = safe_trim(s_path, 1024);
+
+  if (s_peer.length < 4 || s_p.length < 1) {
+    toast("invalid_doc_request");
+    return;
+  }
+
+  const r = await api.json_post("/api/doc/text_get", { s_peer_id: s_peer, s_path: s_p });
+  if (!r || r.b_ok !== true) {
+    set_text("doc_title", s_p);
+    by_id("doc_text").textContent = "error: " + String((r && r.s_error) || "na");
+    return;
+  }
+
+  /* If remote pending, show pending marker; caller can poll by re-click. */
+  set_text("doc_title", s_peer + "  " + s_p);
+
+  const s_text = String((r && r.s_text) || "");
+  const s_err = String((r && r.s_error) || "");
+
+  if (s_text.length > 0) {
+    by_id("doc_text").textContent = s_text;
+    return;
+  }
+
+  by_id("doc_text").textContent = s_err ? s_err : "pending";
 }
 
 /* -------------------------------- IAM rights bitmask --------------------------------------- */

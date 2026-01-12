@@ -5,9 +5,11 @@ Author      : Marcus Schlieper
 ----------------------------------------------------------------------------------------------
 Description
 - Dashboard layout: left sidebar, top header, content views.
-- Designed for secure_p2p_ext web console.
+- Search view fix: result_list is rendered under the search card, snippet preview is shown on the right.
+- Provides required DOM anchors for app.js: search_results, snippet_box, doc_title, doc_text.
 History
 2026-01-11  Marcus Schlieper  - New layout blueprint: dashboard structure and cards
+2026-01-12  Marcus Schlieper  - Fix: add search_results container and snippet panel (search_results_layout)
 ==============================================================================================-->
 <!DOCTYPE html>
 <html lang="de">
@@ -326,6 +328,7 @@ History
                 <div class="card_head">
                   <div class="card_title">network combi search</div>
                 </div>
+
                 <div class="card_body">
                   <div class="kv_grid">
                     <div class="kv">
@@ -338,6 +341,7 @@ History
                         </select>
                       </div>
                     </div>
+
                     <div class="kv">
                       <div class="k">limit</div>
                       <div class="v">
@@ -353,24 +357,26 @@ History
                     </div>
                   </div>
 
-                  <div class="row">
-                    <form id="search_form" class="row" autocomplete="off">
-                      <input
-                        class="input"
-                        id="search_query"
-                        type="text"
-                        placeholder="query"
-                        autocomplete="off"
-                        inputmode="text"
-                      />
-                      <button class="btn" id="btn_search" type="submit">
-                        search
-                      </button>
-                      <button class="btn secondary" id="btn_search_clear" type="button">
-                        clear
-                      </button>
-                    </form>
-                  </div>
+                  <form id="search_form" class="row" autocomplete="off">
+                    <input
+                      class="input"
+                      id="search_query"
+                      type="text"
+                      placeholder="query"
+                      autocomplete="off"
+                      inputmode="text"
+                    />
+                    <button class="btn" id="btn_search" type="submit">
+                      search
+                    </button>
+                    <button
+                      class="btn secondary"
+                      id="btn_search_clear"
+                      type="button"
+                    >
+                      clear
+                    </button>
+                  </form>
 
                   <div class="kv_grid">
                     <div class="kv">
@@ -383,37 +389,64 @@ History
                     </div>
                   </div>
 
-                  <div class="hint">
-                    The dispatch returns a search_id; results arrive
-                    asynchronously and are polled via
-                    /api/search/combi/result/:search_id. Each hit includes
-                    peer_id for provenance.
-                  </div>
-                </div>
-              </div>
+                  <!-- FIX: result list under search + right side snippet preview -->
+                  <div class="search_results_layout" style="margin-top: 12px">
+                    <div class="search_results_left">
+                      <div class="card" style="margin: 0">
+                        <div class="card_head row_space">
+                          <div class="card_title">result_list</div>
+                          <div class="row">
+                            <button
+                              class="btn small secondary"
+                              id="btn_search_poll_once"
+                              type="button"
+                            >
+                              poll_once
+                            </button>
+                            <button
+                              class="btn small secondary"
+                              id="btn_search_stop_poll"
+                              type="button"
+                            >
+                              stop_poll
+                            </button>
+                          </div>
+                        </div>
+                        <div class="card_body">
+                          <!-- Required by app.js -->
+                          <div id="search_results"></div>
+                          <div class="hint">
+                            Click a hit to fetch full document text.
+                          </div>
+                        </div>
+                      </div>
+                    </div>
 
-              <div class="card">
-                <div class="card_head row_space">
-                  <div class="card_title">results</div>
-                  <div class="row">
-                    <button
-                      class="btn small secondary"
-                      id="btn_search_poll_once"
-                      type="button"
-                    >
-                      poll_once
-                    </button>
-                    <button
-                      class="btn small secondary"
-                      id="btn_search_stop_poll"
-                      type="button"
-                    >
-                      stop_poll
-                    </button>
+                    <div class="search_results_right">
+                      <div class="card">
+                        <div class="card_head row_space">
+                          <div class="card_title">document</div>
+                          <div class="row">
+                            <div class="mono" id="doc_title">-</div>
+                            <button
+                              class="btn small secondary"
+                              id="btn_doc_clear"
+                              type="button"
+                            >
+                              clear
+                            </button>
+                          </div>
+                        </div>
+                        <div class="card_body">
+                          <pre class="events" id="doc_text"></pre>
+                          <div class="hint">
+                            Click a search hit to load and display the extracted
+                            document text from local or remote peer.
+                          </div>
+                        </div>
+                      </div>
+                    </div>
                   </div>
-                </div>
-                <div class="card_body">
-                  <div id="search_results" class="results"></div>
                 </div>
               </div>
             </div>
@@ -475,7 +508,6 @@ History
                     />
                   </div>
 
-                  <!-- Rights checkboxes for group add -->
                   <div class="kv_grid" style="margin-top: 10px">
                     <label class="row"
                       ><input type="checkbox" id="iam_group_right_read" />
@@ -507,7 +539,6 @@ History
                     >
                   </div>
 
-                  <!-- Optional diagnostics: computed mask -->
                   <div class="kv" style="margin-top: 10px">
                     <div class="k">rights_mask_dec</div>
                     <div class="v mono" id="iam_group_rights_preview">0</div>
@@ -550,34 +581,69 @@ History
               </div>
 
               <div class="card">
-                <div class="card_head"><div class="card_title">path add</div></div>
+                <div class="card_head">
+                  <div class="card_title">path add</div>
+                </div>
                 <div class="card_body">
                   <div class="row">
-                    <input class="input" id="iam_path" type="text" placeholder="path" autocomplete="off" />
-                    <input class="input" id="iam_path_group" type="text" placeholder="group or -" autocomplete="off" />
+                    <input
+                      class="input"
+                      id="iam_path"
+                      type="text"
+                      placeholder="path"
+                      autocomplete="off"
+                    />
+                    <input
+                      class="input"
+                      id="iam_path_group"
+                      type="text"
+                      placeholder="group or -"
+                      autocomplete="off"
+                    />
                   </div>
 
-                  <div class="row" style="margin-top: 10px;">
+                  <div class="row" style="margin-top: 10px">
                     <select class="select" id="iam_path_public">
                       <option value="true">public=true</option>
                       <option value="false">public=false</option>
                     </select>
-                    <button class="btn" id="btn_iam_path_add" type="button">add</button>
+                    <button class="btn" id="btn_iam_path_add" type="button">
+                      add
+                    </button>
                   </div>
 
-                  <!-- Rights checkboxes for path add -->
-                  <div class="kv_grid" style="margin-top: 10px;">
-                    <label class="row"><input type="checkbox" id="iam_path_right_read" /> read</label>
-                    <label class="row"><input type="checkbox" id="iam_path_right_write" /> write</label>
-                    <label class="row"><input type="checkbox" id="iam_path_right_create" /> create</label>
-                    <label class="row"><input type="checkbox" id="iam_path_right_publish" /> publish</label>
-                    <label class="row"><input type="checkbox" id="iam_path_right_local" /> local</label>
-                    <label class="row"><input type="checkbox" id="iam_path_right_public" /> public</label>
-                    <label class="row"><input type="checkbox" id="iam_path_right_admin" /> admin</label>
+                  <div class="kv_grid" style="margin-top: 10px">
+                    <label class="row"
+                      ><input type="checkbox" id="iam_path_right_read" />
+                      read</label
+                    >
+                    <label class="row"
+                      ><input type="checkbox" id="iam_path_right_write" />
+                      write</label
+                    >
+                    <label class="row"
+                      ><input type="checkbox" id="iam_path_right_create" />
+                      create</label
+                    >
+                    <label class="row"
+                      ><input type="checkbox" id="iam_path_right_publish" />
+                      publish</label
+                    >
+                    <label class="row"
+                      ><input type="checkbox" id="iam_path_right_local" />
+                      local</label
+                    >
+                    <label class="row"
+                      ><input type="checkbox" id="iam_path_right_public" />
+                      public</label
+                    >
+                    <label class="row"
+                      ><input type="checkbox" id="iam_path_right_admin" />
+                      admin</label
+                    >
                   </div>
 
-                  <!-- Optional diagnostics: computed mask -->
-                  <div class="kv" style="margin-top: 10px;">
+                  <div class="kv" style="margin-top: 10px">
                     <div class="k">rights_mask_dec</div>
                     <div class="v mono" id="iam_path_rights_preview">0</div>
                   </div>
