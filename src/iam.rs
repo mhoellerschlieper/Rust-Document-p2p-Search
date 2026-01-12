@@ -293,6 +293,20 @@ impl iam_store {
         self.audit(s_actor, "add_group", s_group, "ok");
         Ok(())
     }
+    
+    pub fn list_groups(&self) -> iam_result<Vec<group_record>> {
+        let mut v_out: Vec<group_record> = Vec::new();
+
+        for item in self.tr_groups.iter() {
+            let (_k, v) = item.map_err(|_| iam_error::storage)?;
+            let gr: group_record = serde_json::from_slice(&v).map_err(|_| iam_error::storage)?;
+            v_out.push(gr);
+        }
+
+        // Stable sort for deterministic UI rendering
+        v_out.sort_by(|a, b| a.s_group.cmp(&b.s_group));
+        Ok(v_out)
+    }
 
     pub fn add_user(&self, s_actor: &str, s_user: &str, s_password: &str, s_group: &str) -> iam_result<()> {
         if !Self::validate_name(s_user) || !Self::validate_name(s_group) {

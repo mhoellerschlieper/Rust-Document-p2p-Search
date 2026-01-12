@@ -1,24 +1,18 @@
 /**********************************************************************************************
  *  Modulname : vector_idx
- *
  *  Datei     : vector_idx.rs
  *  Autor     : Marcus Schlieper
  *------------------------------------------------------------------------------------------------
+ *  Beschreibung
+ *  - Fix: Persistenzpfad vereinheitlichen (keine verschachtelten relativen data/... Pfade).
+ *  - Fix: Tracker DB Pfad aus config verwenden (kein hardcoded TRACKER_DB).
+ *  - Fix: Stabilere Pfad-Keys via Kanonisierung (best effort).
+ *
  *  Historie
  *  13.11.2025   MS   - Neufassung: semantischer Vektor-Index ohne ANN-Bibliothek
  *  07.01.2026   MS   - Erweiterung: Re-Ranking der Top-K Vektor-Kandidaten via BM25
  *  07.01.2026   MS   - Anpassung: BM25 Tokenisierung via Char-N-Grams (BM25_NGRAM 3..6, Default 5)
- *
- *  Beschreibung
- *  - query(): 2-stufiges Retrieval
- *    1) Vektor-Aehnlichkeit (Kosinus) auf allen Eintraegen
- *    2) BM25 Re-Ranking auf einer Kurzliste (Top-N) mit Char-N-Gram Tokenisierung
- *
- *  Konfiguration
- *  - BM25_NGRAM: Umgebungsvariable, gueltig 3..6, Default 5
- *
- *  Sicherheit
- *  - Defensive Defaults, Validierung, keine Panics in Re-Ranking Pfaden, Fehlerbehandlung per Fallback
+ *  12.01.2026   MS   - Fix: Persistenzpfade und Pfad-Normalisierung fuer stabile Loads nach Neustart
  **********************************************************************************************/
 
 #![allow(clippy::type_complexity)]
@@ -27,7 +21,7 @@
 
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -44,8 +38,9 @@ use sled::IVec;
 /* ------------------------------- Konstanten ----------------------------------------------- */
 const VEC_DIM: usize = 384;
 const ANN_CAPACITY: usize = 30_000;
-const TRACKER_DB: &str = "data/vec_tracker";
-const GRAPH_FILE: &str = "data/ann/ann_graph.bin";
+
+/* Fix: keine verschachtelten relativen Pfade in join(root, ...) */
+const ANN_GRAPH_FILE_NAME: &str = "ann_graph.bin";
 
 /* BM25 Parameter */
 const BM25_K1: f32 = 1.5;
@@ -74,10 +69,9 @@ struct VecTracker {
     db: sled::Db,
 }
 impl VecTracker {
-    fn new() -> Self {
-        Self {
-            db: sled::open(TRACKER_DB).expect("Tracker-DB"),
-        }
+    fn new(p_db_dir: &Path) -> Self {
+        let db = sled::open(p_db_dir).expect("vec_tracker_db_open_failed");
+        Self { db }
     }
 
     fn state(&self, s_path: &str) -> Option<(u64, [u8; 32])> {
@@ -105,15 +99,6 @@ impl VecTracker {
     fn remove(&self, s_path: &str) {
         let _ = self.db.remove(s_path);
     }
-
-    fn all(&self) -> Vec<String> {
-        self.db
-            .iter()
-            .keys()
-            .flatten()
-            .map(|k| String::from_utf8_lossy(&k).into_owned())
-            .collect()
-    }
 }
 
 /* ----------------------------- Datenstruktur --------------------------------------------- */
@@ -127,6 +112,15 @@ pub struct VectorIndex {
     model: SentenceEmbeddingsModel,
     entries: Mutex<Vec<StoredEntry>>,
     tracker: VecTracker,
+}
+
+/* ----------------------------- Pfad Normalisierung ---------------------------------------- */
+fn canonicalize_best_effort(p_in: &Path) -> String {
+    /* Defensive: best effort canonicalize, fallback to display string, ASCII-only safe output. */
+    match fs::canonicalize(p_in) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => p_in.to_string_lossy().into_owned(),
+    }
 }
 
 fn normalize_for_match(s_in: &str) -> String {
@@ -209,17 +203,18 @@ fn build_snippet_for_query(s_text: &str, s_query: &str) -> String {
     let s_slice = &s_text_trim[i_start..i_end];
     s_slice.split_whitespace().collect::<Vec<&str>>().join(" ")
 }
+
 /* ----------------------------- Implementierung ------------------------------------------- */
 impl VectorIndex {
-    pub fn new() -> Arc<Self> {
+    pub fn new(p_tracker_dir: &Path) -> Arc<Self> {
         let model = SentenceEmbeddingsBuilder::remote(SentenceEmbeddingsModelType::AllMiniLmL6V2)
             .create_model()
-            .expect("Sentence-Transformer");
+            .expect("sentence_transformer_model_create_failed");
 
         Arc::new(Self {
             model,
             entries: Mutex::new(Vec::with_capacity(ANN_CAPACITY)),
-            tracker: VecTracker::new(),
+            tracker: VecTracker::new(p_tracker_dir),
         })
     }
 
@@ -250,15 +245,6 @@ impl VectorIndex {
         });
     }
 
-    /******************************************************************************************
-     *  Funktion : query_with_snippets
-     *-----------------------------------------------------------------------------------------
-     *  Zweck    : Liefert Top-K Treffer mit Score und Text Snippet (query-biased).
-     *            Snippet ist laengenbegrenzt und verarbeitet maximal I_SNIPPET_SCAN_MAX_LEN Zeichen.
-     *
-     *  Historie
-     *  08.01.2026   MS   - Neu: Snippet Ausgabe fuer vec_search lokal und remote
-     ******************************************************************************************/
     pub fn query_with_snippets(self: &Arc<Self>, s_query: &str, i_k: usize) -> Vec<VecSearchHit> {
         if s_query.trim().is_empty() {
             return Vec::new();
@@ -267,13 +253,10 @@ impl VectorIndex {
             return Vec::new();
         }
 
-        // Reuse existing retrieval (vector + bm25 rerank) to get ordered paths and scores.
-        // NOTE: query() currently returns (path, score) after BM25 rerank; keep it as ranking baseline.
         let v_ranked: Vec<(String, f32)> = self.query(s_query, i_k);
 
         let mut v_out: Vec<VecSearchHit> = Vec::with_capacity(v_ranked.len());
         for (s_path, d_score) in v_ranked {
-            // Defensive: bounded extraction. extract_doc_text already handles formats.
             let s_txt = extract_doc_text(Path::new(&s_path)).unwrap_or_else(|_| String::new());
             let s_snip = if s_txt.is_empty() {
                 String::new()
@@ -291,16 +274,6 @@ impl VectorIndex {
         v_out
     }
 
-    /******************************************************************************************
-     *  Funktion : query
-     *-----------------------------------------------------------------------------------------
-     *  Zweck    : 2-Phasen Retrieval
-     *            (1) Vektor: Kosinus Aehnlichkeit
-     *            (2) BM25: Char-N-Gram Re-Ranking auf Kurzliste
-     *
-     *  Historie
-     *  07.01.2026   MS   - Umstellung der BM25 Tokenisierung auf Char-N-Grams (3..6, Default 5)
-     ******************************************************************************************/
     pub fn query(self: &Arc<Self>, q: &str, k: usize) -> Vec<(String, f32)> {
         if q.trim().is_empty() {
             return Vec::new();
@@ -332,19 +305,34 @@ impl VectorIndex {
         v_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         v_scored.truncate(i_limit);
 
-        /* BM25 Re-Ranking (Char-N-Grams) */
         let v_scored = Self::bm25_rerank_char_ngrams(&v_scored, q, k);
         v_scored
     }
 
-    pub fn save(&self, dir: &Path) {
+    fn ann_graph_path(p_root: &Path) -> PathBuf {
+        /* root is expected to be config::path_vector_idx_dir() */
+        let mut p = PathBuf::from(p_root);
+        p.push(ANN_GRAPH_FILE_NAME);
+        p
+    }
+
+    pub fn save(&self, p_root: &Path) {
+        let p_file = Self::ann_graph_path(p_root);
+
+        /* Defensive: ensure parent exists. */
+        if let Some(p_parent) = p_file.parent() {
+            let _ = fs::create_dir_all(p_parent);
+        }
+
         if let Ok(buf) = bincode::serialize(&*self.entries.lock().unwrap()) {
-            let _ = fs::write(dir.join(GRAPH_FILE), buf);
+            let _ = fs::write(&p_file, buf);
         }
     }
 
-    pub fn load(&self, dir: &Path) {
-        if let Ok(buf) = fs::read(dir.join(GRAPH_FILE)) {
+    pub fn load(&self, p_root: &Path) {
+        let p_file = Self::ann_graph_path(p_root);
+
+        if let Ok(buf) = fs::read(&p_file) {
             if let Ok(v) = bincode::deserialize::<Vec<StoredEntry>>(&buf) {
                 *self.entries.lock().unwrap() = v;
             }
@@ -372,8 +360,9 @@ impl VectorIndex {
                     continue;
                 }
 
-                let s_path = p_path.display().to_string();
-                v_seen.push(s_path.clone());
+                /* Fix: stabile Schluesselbildung ueber Kanonisierung */
+                let s_path_key = canonicalize_best_effort(&p_path);
+                v_seen.push(s_path_key.clone());
 
                 if let Ok(md) = entry.metadata() {
                     let i_ts = md
@@ -392,10 +381,8 @@ impl VectorIndex {
 
                     let b_changed = o_self
                         .tracker
-                        .state(&s_path)
-                        .map_or(true, |(i_old_ts, a_old_h)| {
-                            i_old_ts != i_ts || a_old_h != a_hash
-                        });
+                        .state(&s_path_key)
+                        .map_or(true, |(i_old_ts, a_old_h)| i_old_ts != i_ts || a_old_h != a_hash);
 
                     if b_changed {
                         let v_vec = o_self
@@ -406,22 +393,20 @@ impl VectorIndex {
                             .unwrap_or_else(|| vec![0.0; VEC_DIM]);
 
                         let mut g = o_self.entries.lock().unwrap();
-                        if let Some(pos) = g.iter().position(|e| e.path == s_path) {
+                        if let Some(pos) = g.iter().position(|e| e.path == s_path_key) {
                             g[pos].vec = v_vec;
                         } else {
                             g.push(StoredEntry {
-                                path: s_path.clone(),
+                                path: s_path_key.clone(),
                                 vec: v_vec,
                             });
                         }
-                        o_self.tracker.set(&s_path, i_ts, a_hash);
+                        o_self.tracker.set(&s_path_key, i_ts, a_hash);
                     }
                 }
             }
         }
     }
-
-    /* ------------------------------ BM25: Char N-Grams ----------------------------------- */
 
     fn bm25_rerank_char_ngrams(
         v_candidates: &[(String, f32)],
@@ -440,7 +425,6 @@ impl VectorIndex {
             return v_out;
         }
 
-        /* Dokumente laden und tokenisieren (nur Kurzliste) */
         let mut v_doc_tokens: Vec<Vec<String>> = Vec::with_capacity(v_candidates.len());
         let mut v_paths: Vec<String> = Vec::with_capacity(v_candidates.len());
 
@@ -451,7 +435,6 @@ impl VectorIndex {
             v_doc_tokens.push(v_toks);
         }
 
-        /* Fallback, falls Inhalte nicht verwertbar sind */
         if v_doc_tokens.iter().all(|t| t.is_empty()) {
             let mut v_out: Vec<(String, f32)> = v_candidates.to_vec();
             v_out.truncate(k);
@@ -460,8 +443,7 @@ impl VectorIndex {
 
         let v_scores = Self::bm25_scores(&v_doc_tokens, &v_q_tokens, BM25_K1, BM25_B);
 
-        let mut v_scored: Vec<(String, f32)> =
-            v_paths.into_iter().zip(v_scores.into_iter()).collect();
+        let mut v_scored: Vec<(String, f32)> = v_paths.into_iter().zip(v_scores.into_iter()).collect();
 
         v_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         v_scored.truncate(k);
@@ -482,7 +464,6 @@ impl VectorIndex {
     }
 
     fn normalize_heuristic(s_text: &str) -> String {
-        /* ASCII-only, lower, nicht-alnum als Space, Whitespace normalisieren */
         let mut s_out = String::with_capacity(s_text.len());
         let mut b_prev_space = false;
 
@@ -554,7 +535,6 @@ impl VectorIndex {
         let i_sum_len: usize = v_doc_lens.iter().sum();
         let d_avgdl = (i_sum_len.max(1) as f32) / (v_doc_lens.len().max(1) as f32);
 
-        /* df */
         let mut h_df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for v_doc in v_docs_tokens.iter() {
             let mut h_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -565,7 +545,6 @@ impl VectorIndex {
             }
         }
 
-        /* idf */
         let mut h_idf: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
         for (s_term, i_df) in h_df.iter() {
             let d_df = *i_df as f32;
@@ -573,9 +552,7 @@ impl VectorIndex {
             h_idf.insert(s_term.clone(), d_idf);
         }
 
-        /* tf je Dokument */
-        let mut v_tf: Vec<std::collections::HashMap<&str, usize>> =
-            Vec::with_capacity(v_docs_tokens.len());
+        let mut v_tf: Vec<std::collections::HashMap<&str, usize>> = Vec::with_capacity(v_docs_tokens.len());
         for v_doc in v_docs_tokens.iter() {
             let mut h_tf: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
             for s_t in v_doc.iter() {
@@ -584,7 +561,6 @@ impl VectorIndex {
             v_tf.push(h_tf);
         }
 
-        /* scoring */
         let mut v_scores: Vec<f32> = Vec::with_capacity(v_docs_tokens.len());
         for (i_idx, h_tf) in v_tf.iter().enumerate() {
             let i_dl = v_doc_lens[i_idx].max(1) as f32;
@@ -626,12 +602,12 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /* ------------------------- Oeffentliche Convenience-Funktionen ---------------------------- */
-pub fn load_or_init_index(root: &Path) -> Arc<VectorIndex> {
-    let idx = VectorIndex::new();
-    idx.load(root);
+pub fn load_or_init_index(p_root: &Path, p_tracker_dir: &Path) -> Arc<VectorIndex> {
+    let idx = VectorIndex::new(p_tracker_dir);
+    idx.load(p_root);
     idx
 }
 
-pub fn persist_index(idx: &VectorIndex, root: &Path) {
-    idx.save(root);
+pub fn persist_index(idx: &VectorIndex, p_root: &Path) {
+    idx.save(p_root);
 }
