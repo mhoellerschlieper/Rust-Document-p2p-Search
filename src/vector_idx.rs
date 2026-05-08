@@ -1,23 +1,24 @@
 /**********************************************************************************************
- *  Modulname : vector_idx
- *  Datei     : vector_idx.rs
- *  Autor     : Marcus Schlieper
+ * Modulname : vector_idx
+ * Datei     : vector_idx.rs
+ * Autor     : Marcus Schlieper
  *------------------------------------------------------------------------------------------------
- *  Beschreibung
- *  - Fix: Persistenzpfad vereinheitlichen (keine verschachtelten relativen data/... Pfade).
- *  - Fix: Tracker DB Pfad aus config verwenden (kein hardcoded TRACKER_DB).
- *  - Fix: Stabilere Pfad-Keys via Kanonisierung (best effort).
+ * Beschreibung
+ * - Persistenter Vektor Index mit Embedding Backend Abstraktion.
+ * - Kein direkter Import von rust_bert oder torch-sys.
+ * - Cross platform robust auf Windows, Linux und macOS.
+ * - BM25 Re Ranking und Snippet Bildung bleiben erhalten.
  *
- *  Historie
- *  13.11.2025   MS   - Neufassung: semantischer Vektor-Index ohne ANN-Bibliothek
- *  07.01.2026   MS   - Erweiterung: Re-Ranking der Top-K Vektor-Kandidaten via BM25
- *  07.01.2026   MS   - Anpassung: BM25 Tokenisierung via Char-N-Grams (BM25_NGRAM 3..6, Default 5)
- *  12.01.2026   MS   - Fix: Persistenzpfade und Pfad-Normalisierung fuer stabile Loads nach Neustart
+ * Historie
+ * 13.11.2025   MS   - Neufassung: semantischer Vektor Index ohne ANN Bibliothek
+ * 07.01.2026   MS   - Erweiterung: Re Ranking der Top K Vektor Kandidaten via BM25
+ * 07.01.2026   MS   - Anpassung: BM25 Tokenisierung via Char N Grams
+ * 12.01.2026   MS   - Fix: Persistenzpfade und Pfad Normalisierung
+ * 08.05.2026   MS   - Umbau: Embedding Backend Abstraktion statt direktem rust_bert Zwang
  **********************************************************************************************/
 
 #![allow(clippy::type_complexity)]
 #![allow(clippy::needless_return)]
-#![allow(warnings)]
 
 use std::{
     fs,
@@ -26,48 +27,35 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::embedding_backend::{create_backend_from_env, EmbeddingBackend, I_VEC_DIM_DEFAULT};
 use crate::extract_doc_text;
-use bincode;
-use rust_bert::pipelines::sentence_embeddings::{
-    SentenceEmbeddingsBuilder, SentenceEmbeddingsModel, SentenceEmbeddingsModelType,
-};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sled::IVec;
 
-/* ------------------------------- Konstanten ----------------------------------------------- */
-const VEC_DIM: usize = 384;
-const ANN_CAPACITY: usize = 30_000;
+const I_ANN_CAPACITY: usize = 30_000;
+const S_ANN_GRAPH_FILE_NAME: &str = "ann_graph.bin";
 
-/* Fix: keine verschachtelten relativen Pfade in join(root, ...) */
-const ANN_GRAPH_FILE_NAME: &str = "ann_graph.bin";
-
-/* BM25 Parameter */
-const BM25_K1: f32 = 1.5;
-const BM25_B: f32 = 0.75;
-
-/* Re-Ranking Parameter: Kurzliste = min(len, k * mult) */
-const BM25_CANDIDATE_MULT: usize = 10;
-
-/* BM25 N-Gram Defaults */
-const BM25_NGRAM_DEFAULT: usize = 5;
-const BM25_NGRAM_MIN: usize = 3;
-const BM25_NGRAM_MAX: usize = 6;
-
+const D_BM25_K1: f32 = 1.5;
+const D_BM25_B: f32 = 0.75;
+const I_BM25_CANDIDATE_MULT: usize = 10;
+const I_BM25_NGRAM_DEFAULT: usize = 5;
+const I_BM25_NGRAM_MIN: usize = 3;
+const I_BM25_NGRAM_MAX: usize = 6;
 const I_SNIPPET_MAX_LEN: usize = 320;
 const I_SNIPPET_SCAN_MAX_LEN: usize = 32_000;
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VecSearchHit {
     pub s_doc: String,
     pub d_score: f32,
     pub s_snippet: String,
 }
 
-/* ----------------------- Aenderungs-Tracker (sled) --------------------------------------- */
 struct VecTracker {
     db: sled::Db,
 }
+
 impl VecTracker {
     fn new(p_db_dir: &Path) -> Self {
         let db = sled::open(p_db_dir).expect("vec_tracker_db_open_failed");
@@ -101,22 +89,19 @@ impl VecTracker {
     }
 }
 
-/* ----------------------------- Datenstruktur --------------------------------------------- */
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct StoredEntry {
     path: String,
     vec: Vec<f32>,
 }
 
 pub struct VectorIndex {
-    model: SentenceEmbeddingsModel,
+    backend: Arc<dyn EmbeddingBackend>,
     entries: Mutex<Vec<StoredEntry>>,
     tracker: VecTracker,
 }
 
-/* ----------------------------- Pfad Normalisierung ---------------------------------------- */
 fn canonicalize_best_effort(p_in: &Path) -> String {
-    /* Defensive: best effort canonicalize, fallback to display string, ASCII-only safe output. */
     match fs::canonicalize(p_in) {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(_) => p_in.to_string_lossy().into_owned(),
@@ -132,25 +117,25 @@ fn normalize_for_match(s_in: &str) -> String {
         if ch_l.is_ascii_alphanumeric() {
             s_out.push(ch_l);
             b_prev_space = false;
-        } else {
-            if !b_prev_space {
-                s_out.push(' ');
-                b_prev_space = true;
-            }
+        } else if !b_prev_space {
+            s_out.push(' ');
+            b_prev_space = true;
         }
     }
 
-    s_out.split_whitespace().collect::<Vec<&str>>().join(" ")
+    s_out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn extract_query_tokens(s_query: &str) -> Vec<String> {
     let s_norm = normalize_for_match(s_query);
     let mut v_out: Vec<String> = Vec::new();
+
     for s_t in s_norm.split_whitespace() {
         if s_t.len() >= 2 {
             v_out.push(s_t.to_string());
         }
     }
+
     v_out
 }
 
@@ -162,18 +147,12 @@ fn build_snippet_for_query(s_text: &str, s_query: &str) -> String {
 
     let s_norm = normalize_for_match(s_text_trim);
     if s_norm.is_empty() {
-        return s_text_trim
-            .chars()
-            .take(I_SNIPPET_MAX_LEN)
-            .collect::<String>();
+        return s_text_trim.chars().take(I_SNIPPET_MAX_LEN).collect::<String>();
     }
 
     let v_q = extract_query_tokens(s_query);
     if v_q.is_empty() {
-        return s_text_trim
-            .chars()
-            .take(I_SNIPPET_MAX_LEN)
-            .collect::<String>();
+        return s_text_trim.chars().take(I_SNIPPET_MAX_LEN).collect::<String>();
     }
 
     let mut i_best_pos: Option<usize> = None;
@@ -181,52 +160,44 @@ fn build_snippet_for_query(s_text: &str, s_query: &str) -> String {
         if let Some(i_pos) = s_norm.find(s_t) {
             i_best_pos = match i_best_pos {
                 None => Some(i_pos),
-                Some(old) => Some(old.min(i_pos)),
+                Some(i_old) => Some(i_old.min(i_pos)),
             };
         }
     }
 
     let Some(i_pos_norm) = i_best_pos else {
-        return s_text_trim
-            .chars()
-            .take(I_SNIPPET_MAX_LEN)
-            .collect::<String>();
+        return s_text_trim.chars().take(I_SNIPPET_MAX_LEN).collect::<String>();
     };
 
     let d_ratio = (s_text_trim.len().max(1) as f64) / (s_norm.len().max(1) as f64);
     let i_pos_orig = ((i_pos_norm as f64) * d_ratio) as usize;
-
     let i_half = I_SNIPPET_MAX_LEN / 2;
     let i_start = i_pos_orig.saturating_sub(i_half);
     let i_end = (i_start + I_SNIPPET_MAX_LEN).min(s_text_trim.len());
 
     let s_slice = &s_text_trim[i_start..i_end];
-    s_slice.split_whitespace().collect::<Vec<&str>>().join(" ")
+    s_slice.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/* ----------------------------- Implementierung ------------------------------------------- */
 impl VectorIndex {
     pub fn new(p_tracker_dir: &Path) -> Arc<Self> {
-        let model = SentenceEmbeddingsBuilder::remote(SentenceEmbeddingsModelType::AllMiniLmL6V2)
-            .create_model()
-            .expect("sentence_transformer_model_create_failed");
+        let backend = create_backend_from_env();
 
         Arc::new(Self {
-            model,
-            entries: Mutex::new(Vec::with_capacity(ANN_CAPACITY)),
+            backend,
+            entries: Mutex::new(Vec::with_capacity(I_ANN_CAPACITY)),
             tracker: VecTracker::new(p_tracker_dir),
         })
     }
 
     pub fn encode_query(&self, s_text: &str) -> Vec<f32> {
-        self.model
-            .encode(&[s_text.to_owned()])
-            .map(|mut v| v.pop().unwrap_or_else(|| vec![0.0; VEC_DIM]))
-            .unwrap_or_else(|_| vec![0.0; VEC_DIM])
+        self.backend
+            .encode_one(s_text)
+            .unwrap_or_else(|_| vec![0.0; self.backend.dim().max(I_VEC_DIM_DEFAULT)])
     }
 
     pub fn vec_of(&self, s_path: &str) -> Option<Vec<f32>> {
-        let g = self.entries.lock().unwrap();
+        let g = self.entries.lock().expect("vector_index_entries_lock_failed");
         g.iter().find(|e| e.path == s_path).map(|e| e.vec.clone())
     }
 
@@ -234,8 +205,8 @@ impl VectorIndex {
         let mut v_seen: Vec<String> = Vec::new();
         Self::crawl(root, self, &mut v_seen);
 
-        let mut guard = self.entries.lock().unwrap();
-        guard.retain(|e| {
+        let mut g = self.entries.lock().expect("vector_index_entries_lock_failed");
+        g.retain(|e| {
             if v_seen.contains(&e.path) {
                 true
             } else {
@@ -246,16 +217,13 @@ impl VectorIndex {
     }
 
     pub fn query_with_snippets(self: &Arc<Self>, s_query: &str, i_k: usize) -> Vec<VecSearchHit> {
-        if s_query.trim().is_empty() {
-            return Vec::new();
-        }
-        if i_k == 0 {
+        if s_query.trim().is_empty() || i_k == 0 {
             return Vec::new();
         }
 
-        let v_ranked: Vec<(String, f32)> = self.query(s_query, i_k);
-
+        let v_ranked = self.query(s_query, i_k);
         let mut v_out: Vec<VecSearchHit> = Vec::with_capacity(v_ranked.len());
+
         for (s_path, d_score) in v_ranked {
             let s_txt = extract_doc_text(Path::new(&s_path)).unwrap_or_else(|_| String::new());
             let s_snip = if s_txt.is_empty() {
@@ -274,67 +242,59 @@ impl VectorIndex {
         v_out
     }
 
-    pub fn query(self: &Arc<Self>, q: &str, k: usize) -> Vec<(String, f32)> {
-        if q.trim().is_empty() {
-            return Vec::new();
-        }
-        if k == 0 {
+    pub fn query(self: &Arc<Self>, s_query: &str, i_k: usize) -> Vec<(String, f32)> {
+        if s_query.trim().is_empty() || i_k == 0 {
             return Vec::new();
         }
 
-        let q_vec = self
-            .model
-            .encode(&[q.to_owned()])
-            .ok()
-            .and_then(|mut v| v.pop())
-            .unwrap_or_else(|| vec![0.0; VEC_DIM]);
+        let v_q = self
+            .backend
+            .encode_one(s_query)
+            .unwrap_or_else(|_| vec![0.0; self.backend.dim().max(I_VEC_DIM_DEFAULT)]);
 
-        let guard = self.entries.lock().unwrap();
-        if guard.is_empty() {
+        let g = self.entries.lock().expect("vector_index_entries_lock_failed");
+        if g.is_empty() {
             return Vec::new();
         }
 
-        let i_target = k.saturating_mul(BM25_CANDIDATE_MULT).max(k);
-        let i_limit = i_target.min(guard.len());
+        let i_target = i_k.saturating_mul(I_BM25_CANDIDATE_MULT).max(i_k);
+        let i_limit = i_target.min(g.len());
 
-        let mut v_scored: Vec<(String, f32)> = guard
+        let mut v_scored: Vec<(String, f32)> = g
             .iter()
-            .map(|e| (e.path.clone(), cosine(&q_vec, &e.vec)))
+            .map(|e| (e.path.clone(), cosine(&v_q, &e.vec)))
             .collect();
 
         v_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         v_scored.truncate(i_limit);
 
-        let v_scored = Self::bm25_rerank_char_ngrams(&v_scored, q, k);
-        v_scored
+        Self::bm25_rerank_char_ngrams(&v_scored, s_query, i_k)
     }
 
     fn ann_graph_path(p_root: &Path) -> PathBuf {
-        /* root is expected to be config::path_vector_idx_dir() */
         let mut p = PathBuf::from(p_root);
-        p.push(ANN_GRAPH_FILE_NAME);
+        p.push(S_ANN_GRAPH_FILE_NAME);
         p
     }
 
     pub fn save(&self, p_root: &Path) {
         let p_file = Self::ann_graph_path(p_root);
 
-        /* Defensive: ensure parent exists. */
         if let Some(p_parent) = p_file.parent() {
             let _ = fs::create_dir_all(p_parent);
         }
 
-        if let Ok(buf) = bincode::serialize(&*self.entries.lock().unwrap()) {
-            let _ = fs::write(&p_file, buf);
+        if let Ok(v_buf) = bincode::serialize(&*self.entries.lock().expect("vector_index_entries_lock_failed")) {
+            let _ = fs::write(&p_file, v_buf);
         }
     }
 
     pub fn load(&self, p_root: &Path) {
         let p_file = Self::ann_graph_path(p_root);
 
-        if let Ok(buf) = fs::read(&p_file) {
-            if let Ok(v) = bincode::deserialize::<Vec<StoredEntry>>(&buf) {
-                *self.entries.lock().unwrap() = v;
+        if let Ok(v_buf) = fs::read(&p_file) {
+            if let Ok(v_entries) = bincode::deserialize::<Vec<StoredEntry>>(&v_buf) {
+                *self.entries.lock().expect("vector_index_entries_lock_failed") = v_entries;
             }
         }
     }
@@ -343,6 +303,7 @@ impl VectorIndex {
         if let Ok(rd) = fs::read_dir(p_dir) {
             for entry in rd.flatten() {
                 let p_path = entry.path();
+
                 if p_path.is_dir() {
                     Self::crawl(&p_path, o_self, v_seen);
                     continue;
@@ -351,16 +312,17 @@ impl VectorIndex {
                 let a_ok_ext = [
                     "txt", "md", "rs", "py", "json", "pdf", "docx", "xlsx", "xls", "csv", "pptx",
                 ];
+
                 let s_ext = p_path
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_ascii_lowercase();
+
                 if !a_ok_ext.contains(&s_ext.as_str()) {
                     continue;
                 }
 
-                /* Fix: stabile Schluesselbildung ueber Kanonisierung */
                 let s_path_key = canonicalize_best_effort(&p_path);
                 v_seen.push(s_path_key.clone());
 
@@ -386,21 +348,20 @@ impl VectorIndex {
 
                     if b_changed {
                         let v_vec = o_self
-                            .model
-                            .encode(&[s_text])
-                            .ok()
-                            .and_then(|mut v| v.pop())
-                            .unwrap_or_else(|| vec![0.0; VEC_DIM]);
+                            .backend
+                            .encode_one(&s_text)
+                            .unwrap_or_else(|_| vec![0.0; o_self.backend.dim().max(I_VEC_DIM_DEFAULT)]);
 
-                        let mut g = o_self.entries.lock().unwrap();
-                        if let Some(pos) = g.iter().position(|e| e.path == s_path_key) {
-                            g[pos].vec = v_vec;
+                        let mut g = o_self.entries.lock().expect("vector_index_entries_lock_failed");
+                        if let Some(i_pos) = g.iter().position(|e| e.path == s_path_key) {
+                            g[i_pos].vec = v_vec;
                         } else {
                             g.push(StoredEntry {
                                 path: s_path_key.clone(),
                                 vec: v_vec,
                             });
                         }
+
                         o_self.tracker.set(&s_path_key, i_ts, a_hash);
                     }
                 }
@@ -411,7 +372,7 @@ impl VectorIndex {
     fn bm25_rerank_char_ngrams(
         v_candidates: &[(String, f32)],
         s_query: &str,
-        k: usize,
+        i_k: usize,
     ) -> Vec<(String, f32)> {
         if v_candidates.is_empty() {
             return Vec::new();
@@ -419,9 +380,10 @@ impl VectorIndex {
 
         let i_ngram = Self::bm25_ngram_from_env();
         let v_q_tokens = Self::tokenize_bm25_char_ngrams(s_query, i_ngram);
+
         if v_q_tokens.is_empty() {
-            let mut v_out: Vec<(String, f32)> = v_candidates.to_vec();
-            v_out.truncate(k);
+            let mut v_out = v_candidates.to_vec();
+            v_out.truncate(i_k);
             return v_out;
         }
 
@@ -436,30 +398,30 @@ impl VectorIndex {
         }
 
         if v_doc_tokens.iter().all(|t| t.is_empty()) {
-            let mut v_out: Vec<(String, f32)> = v_candidates.to_vec();
-            v_out.truncate(k);
+            let mut v_out = v_candidates.to_vec();
+            v_out.truncate(i_k);
             return v_out;
         }
 
-        let v_scores = Self::bm25_scores(&v_doc_tokens, &v_q_tokens, BM25_K1, BM25_B);
-
+        let v_scores = Self::bm25_scores(&v_doc_tokens, &v_q_tokens, D_BM25_K1, D_BM25_B);
         let mut v_scored: Vec<(String, f32)> = v_paths.into_iter().zip(v_scores.into_iter()).collect();
 
         v_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        v_scored.truncate(k);
+        v_scored.truncate(i_k);
         v_scored
     }
 
     fn bm25_ngram_from_env() -> usize {
-        let s_val = std::env::var("BM25_NGRAM").unwrap_or_else(|_| "".to_string());
-        let mut i_n = s_val.trim().parse::<usize>().unwrap_or(BM25_NGRAM_DEFAULT);
+        let s_val = std::env::var("BM25_NGRAM").unwrap_or_else(|_| String::new());
+        let mut i_n = s_val.trim().parse::<usize>().unwrap_or(I_BM25_NGRAM_DEFAULT);
 
-        if i_n < BM25_NGRAM_MIN {
-            i_n = BM25_NGRAM_MIN;
+        if i_n < I_BM25_NGRAM_MIN {
+            i_n = I_BM25_NGRAM_MIN;
         }
-        if i_n > BM25_NGRAM_MAX {
-            i_n = BM25_NGRAM_MAX;
+        if i_n > I_BM25_NGRAM_MAX {
+            i_n = I_BM25_NGRAM_MAX;
         }
+
         i_n
     }
 
@@ -472,15 +434,13 @@ impl VectorIndex {
             if ch_l.is_ascii_alphanumeric() {
                 s_out.push(ch_l);
                 b_prev_space = false;
-            } else {
-                if !b_prev_space {
-                    s_out.push(' ');
-                    b_prev_space = true;
-                }
+            } else if !b_prev_space {
+                s_out.push(' ');
+                b_prev_space = true;
             }
         }
 
-        s_out.split_whitespace().collect::<Vec<&str>>().join(" ")
+        s_out.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     fn to_char_ngrams(s_text: &str, i_n: usize, s_boundary: &str) -> Vec<String> {
@@ -490,11 +450,11 @@ impl VectorIndex {
         }
 
         let mut i_n_eff = i_n;
-        if i_n_eff < BM25_NGRAM_MIN {
-            i_n_eff = BM25_NGRAM_MIN;
+        if i_n_eff < I_BM25_NGRAM_MIN {
+            i_n_eff = I_BM25_NGRAM_MIN;
         }
-        if i_n_eff > BM25_NGRAM_MAX {
-            i_n_eff = BM25_NGRAM_MAX;
+        if i_n_eff > I_BM25_NGRAM_MAX {
+            i_n_eff = I_BM25_NGRAM_MAX;
         }
 
         let mut v_out: Vec<String> = Vec::new();
@@ -506,6 +466,7 @@ impl VectorIndex {
 
             let s_w = format!("{}{}{}", s_boundary, s_word, s_boundary);
             let i_len = s_w.len();
+
             if i_len < i_n_eff {
                 v_out.push(s_w);
                 continue;
@@ -530,12 +491,12 @@ impl VectorIndex {
         d_b: f32,
     ) -> Vec<f32> {
         let i_n_docs = v_docs_tokens.len().max(1) as f32;
-
         let v_doc_lens: Vec<usize> = v_docs_tokens.iter().map(|d| d.len()).collect();
         let i_sum_len: usize = v_doc_lens.iter().sum();
         let d_avgdl = (i_sum_len.max(1) as f32) / (v_doc_lens.len().max(1) as f32);
 
         let mut h_df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
         for v_doc in v_docs_tokens.iter() {
             let mut h_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for s_term in v_doc.iter() {
@@ -562,6 +523,7 @@ impl VectorIndex {
         }
 
         let mut v_scores: Vec<f32> = Vec::with_capacity(v_docs_tokens.len());
+
         for (i_idx, h_tf) in v_tf.iter().enumerate() {
             let i_dl = v_doc_lens[i_idx].max(1) as f32;
             let mut d_score: f32 = 0.0;
@@ -577,6 +539,7 @@ impl VectorIndex {
                 if d_den <= 0.0 {
                     continue;
                 }
+
                 let d_num = d_idf_t * i_f * (d_k1 + 1.0);
                 d_score += d_num / d_den;
             }
@@ -588,20 +551,18 @@ impl VectorIndex {
     }
 }
 
-/* ----------------------------- Hilfsfunktion Kosinus ------------------------------------- */
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let n1 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let n2 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let d_dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let d_n1 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let d_n2 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-    if n1 == 0.0 || n2 == 0.0 {
+    if d_n1 == 0.0 || d_n2 == 0.0 {
         0.0
     } else {
-        dot / (n1 * n2)
+        d_dot / (d_n1 * d_n2)
     }
 }
 
-/* ------------------------- Oeffentliche Convenience-Funktionen ---------------------------- */
 pub fn load_or_init_index(p_root: &Path, p_tracker_dir: &Path) -> Arc<VectorIndex> {
     let idx = VectorIndex::new(p_tracker_dir);
     idx.load(p_root);

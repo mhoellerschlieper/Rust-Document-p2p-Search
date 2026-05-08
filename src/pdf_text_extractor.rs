@@ -1,35 +1,6 @@
-/* ============================================================================
-File: pdf_text_extractor.rs
-Description:
-    Robust PDF text extraction with per-page error isolation and OCR fallback.
-    Output policy: only plausible text is emitted. Garbled output is suppressed.
-
-History:
-    2026-01-12:
-        - Initial version with per-page isolation and OCR fallback.
-    2026-01-12:
-        - Enforce "text only" policy:
-          * Remove unsafe byte-to-char fallback that produced gibberish.
-          * Add gibberish filtering and line sanitization.
-          * Trigger OCR when extracted text is empty or implausible.
-
-Author: Marcus Schlieper
-============================================================================ */
-
-/* Notes (ASCII only):
-- External OCR tooling:
-  - pdftoppm (Poppler) for rasterization
-  - tesseract for OCR
-- This module does not panic on page parse errors.
-- Naming:
-  - snake_case everywhere
-  - i_ prefix for integers
-  - d_ prefix for doubles
-  - s_ prefix for strings
-*/
-
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -82,26 +53,27 @@ pub struct ExtractPdfReport {
     pub i_pages_ok_text: i32,
     pub i_pages_ok_ocr: i32,
     pub i_pages_skipped: i32,
+    pub b_document_persisted: bool,
+    pub p_output_dir: Option<PathBuf>,
 }
 
 /* ----------------------------------------------------------------------------
 Central function: extract_pdf_text
 
 Policy:
-- Never panic.
-- Parse errors are isolated per page.
-- Only plausible text is appended to output.
-- If a page yields empty or implausible text, OCR is attempted.
+- Never panic from this module.
+- Warnings are collected and do not prevent final output.
+- If a page fails parsing or yields implausible text, OCR is attempted.
+- If OCR fails, the page is skipped, but the document continues.
 
 History (function-level):
-    2026-01-12:
-        - Adds "text only" output enforcement using gibberish filters.
+    2026-01-14 (Marcus Schlieper):
+        - Ensure document is indexable and persistable despite warnings.
 ---------------------------------------------------------------------------- */
 pub fn extract_pdf_text(p_path: &Path) -> Result<ExtractPdfReport, ExtractPdfError> {
     validate_pdf_path(p_path)?;
 
     let mut doc = Document::load(p_path)?;
-
     if doc.is_encrypted() {
         if let Err(e) = doc.decrypt("") {
             return Err(ExtractPdfError::PdfError(e));
@@ -141,10 +113,7 @@ pub fn extract_pdf_text(p_path: &Path) -> Result<ExtractPdfReport, ExtractPdfErr
 
         if is_plausible_page_text(&s_page_text) {
             report.i_pages_ok_text += 1;
-            report.s_text.push_str(&s_page_text);
-            if !report.s_text.ends_with('\n') {
-                report.s_text.push('\n');
-            }
+            append_page_text(&mut report.s_text, &s_page_text);
             continue;
         }
 
@@ -153,10 +122,7 @@ pub fn extract_pdf_text(p_path: &Path) -> Result<ExtractPdfReport, ExtractPdfErr
                 let s_ocr = normalize_and_filter_page_text(&s_ocr_raw);
                 if is_plausible_page_text(&s_ocr) {
                     report.i_pages_ok_ocr += 1;
-                    report.s_text.push_str(&s_ocr);
-                    if !report.s_text.ends_with('\n') {
-                        report.s_text.push('\n');
-                    }
+                    append_page_text(&mut report.s_text, &s_ocr);
                 } else {
                     report.i_pages_skipped += 1;
                     report.v_warnings.push(format!(
@@ -178,10 +144,148 @@ pub fn extract_pdf_text(p_path: &Path) -> Result<ExtractPdfReport, ExtractPdfErr
     Ok(report)
 }
 
+fn append_page_text(s_target: &mut String, s_page_text: &str) {
+    s_target.push_str(s_page_text);
+    if !s_target.ends_with('\n') {
+        s_target.push('\n');
+    }
+}
+
+/* ----------------------------------------------------------------------------
+New: persist_index_artifacts
+
+This function guarantees that the pipeline writes output artifacts even if the
+PDF parsing produced warnings. The function is intended to be called after
+extract_pdf_text().
+
+Artifacts:
+- extracted_text.txt: the text used for indexing
+- extract_report.json: structured report for audit/troubleshooting
+
+Behavior:
+- Always writes both files when a writable output directory is provided.
+- Does not fail the indexing pipeline if the text is empty; it still persists
+  a report and an empty text file (for traceability).
+
+History (function-level):
+    2026-01-14 (Marcus Schlieper):
+        - Add persistent output artifacts to ensure indexing despite warnings.
+---------------------------------------------------------------------------- */
+pub fn persist_index_artifacts(
+    p_pdf_path: &Path,
+    p_output_base_dir: &Path,
+    report: &mut ExtractPdfReport,
+) -> Result<(), ExtractPdfError> {
+    validate_pdf_path(p_pdf_path)?;
+    validate_output_dir(p_output_base_dir)?;
+
+    let s_doc_id = make_stable_doc_id_from_path(p_pdf_path);
+    let p_out_dir = p_output_base_dir.join(s_doc_id);
+
+    fs::create_dir_all(&p_out_dir)?;
+
+    let p_text_file = p_out_dir.join("extracted_text.txt");
+    let p_report_file = p_out_dir.join("extract_report.json");
+
+    write_text_file(&p_text_file, &report.s_text)?;
+    write_text_file(&p_report_file, &report_to_json(report, p_pdf_path))?;
+
+    report.b_document_persisted = true;
+    report.p_output_dir = Some(p_out_dir);
+
+    Ok(())
+}
+
+fn write_text_file(p_file: &Path, s_content: &str) -> Result<(), ExtractPdfError> {
+    let mut f = fs::File::create(p_file)?;
+    f.write_all(s_content.as_bytes())?;
+    f.flush()?;
+    Ok(())
+}
+
+fn report_to_json(report: &ExtractPdfReport, p_pdf_path: &Path) -> String {
+    let s_pdf = json_escape(&p_pdf_path.display().to_string());
+    let s_text_len = report.s_text.len().to_string();
+
+    let mut s_warn = String::new();
+    s_warn.push('[');
+    for (i_idx, s_w) in report.v_warnings.iter().enumerate() {
+        if i_idx > 0 {
+            s_warn.push(',');
+        }
+        s_warn.push('"');
+        s_warn.push_str(&json_escape(s_w));
+        s_warn.push('"');
+    }
+    s_warn.push(']');
+
+    format!(
+        "{{\
+\"pdf_path\":\"{s_pdf}\",\
+\"pages_total\":{i_pages_total},\
+\"pages_ok_text\":{i_pages_ok_text},\
+\"pages_ok_ocr\":{i_pages_ok_ocr},\
+\"pages_skipped\":{i_pages_skipped},\
+\"text_len\":{s_text_len},\
+\"document_persisted\":{b_persisted},\
+\"warnings\":{s_warn}\
+}}",
+        s_pdf = s_pdf,
+        i_pages_total = report.i_pages_total,
+        i_pages_ok_text = report.i_pages_ok_text,
+        i_pages_ok_ocr = report.i_pages_ok_ocr,
+        i_pages_skipped = report.i_pages_skipped,
+        s_text_len = s_text_len,
+        b_persisted = if report.b_document_persisted { "true" } else { "false" },
+        s_warn = s_warn
+    )
+}
+
+fn json_escape(s_in: &str) -> String {
+    let mut s_out = String::new();
+    for c in s_in.chars() {
+        match c {
+            '\\' => s_out.push_str("\\\\"),
+            '"' => s_out.push_str("\\\""),
+            '\n' => s_out.push_str("\\n"),
+            '\r' => s_out.push_str("\\r"),
+            '\t' => s_out.push_str("\\t"),
+            _ => s_out.push(c),
+        }
+    }
+    s_out
+}
+
+fn make_stable_doc_id_from_path(p_pdf_path: &Path) -> String {
+    /*
+    Stable, filesystem-safe id derived from filename.
+    For stricter deduplication, this could be replaced by a SHA-256 of file bytes.
+    */
+    let s_name = p_pdf_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("document.pdf");
+
+    let mut s_out = String::new();
+    for c in s_name.chars() {
+        if c.is_ascii_alphanumeric() {
+            s_out.push(c.to_ascii_lowercase());
+        } else {
+            s_out.push('_');
+        }
+    }
+
+    if s_out.is_empty() {
+        "document_pdf".to_string()
+    } else {
+        s_out
+    }
+}
+
 /* ----------------------------------------------------------------------------
 Per-page extraction (best effort)
 - Isolated: returns warning string on failure.
-- Conservative: only collects literal PDF strings from Tj and TJ.
+- Conservative: collects literal PDF strings from Tj and TJ only.
 ---------------------------------------------------------------------------- */
 fn extract_text_single_page_best_effort(
     doc: &Document,
@@ -247,18 +351,13 @@ Strict extraction of a PDF string operand.
 Key change:
 - No byte-to-char fallback.
 - If bytes are not valid UTF-8, the operand is discarded (Err).
-
-Rationale:
-- Prevents gibberish output like sequences of punctuation or random ASCII.
 ---------------------------------------------------------------------------- */
 fn extract_pdf_string_operand_strict(o: &Object) -> Result<String, ()> {
     match o {
-        Object::String(v_bytes, _fmt) => {
-            match String::from_utf8(v_bytes.clone()) {
-                Ok(s_ok) => Ok(s_ok),
-                Err(_) => Err(()),
-            }
-        }
+        Object::String(v_bytes, _fmt) => match String::from_utf8(v_bytes.clone()) {
+            Ok(s_ok) => Ok(s_ok),
+            Err(_) => Err(()),
+        },
         _ => Err(()),
     }
 }
@@ -267,11 +366,10 @@ fn extract_pdf_string_operand_strict(o: &Object) -> Result<String, ()> {
 Normalization and filtering:
 - Remove control characters (except newline and tab).
 - Collapse excessive whitespace.
-- Remove lines that are very likely gibberish (symbol-heavy).
+- Remove lines likely to be gibberish (symbol-heavy).
 ---------------------------------------------------------------------------- */
 fn normalize_and_filter_page_text(s_in: &str) -> String {
     let mut s_clean = String::new();
-
     for c in s_in.chars() {
         if c == '\n' || c == '\t' {
             s_clean.push(c);
@@ -298,15 +396,6 @@ fn normalize_and_filter_page_text(s_in: &str) -> String {
     v_lines_out.join("\n")
 }
 
-/* ----------------------------------------------------------------------------
-Heuristic gibberish detector for single lines.
-The intent is to drop lines like:
-!"#$%&'(&)* + ... or similar symbol-only sequences.
-
-Criteria (conservative):
-- Require a minimal alphanumeric ratio.
-- Reject long runs of punctuation/symbols.
----------------------------------------------------------------------------- */
 fn is_gibberish_line(s_line: &str) -> bool {
     let i_len: i32 = s_line.chars().count() as i32;
     if i_len <= 0 {
@@ -316,7 +405,6 @@ fn is_gibberish_line(s_line: &str) -> bool {
     let mut i_alpha_num: i32 = 0;
     let mut i_printable: i32 = 0;
     let mut i_symbol: i32 = 0;
-
     let mut i_max_symbol_run: i32 = 0;
     let mut i_cur_symbol_run: i32 = 0;
 
@@ -350,11 +438,9 @@ fn is_gibberish_line(s_line: &str) -> bool {
     if d_alpha_ratio < 0.20 && i_printable >= 10 {
         return true;
     }
-
     if d_symbol_ratio > 0.70 && i_printable >= 10 {
         return true;
     }
-
     if i_max_symbol_run >= 12 {
         return true;
     }
@@ -364,7 +450,8 @@ fn is_gibberish_line(s_line: &str) -> bool {
 
 fn is_common_symbol(c: char) -> bool {
     match c {
-        '%' | '&' | '*' | '+' | '-' | '/' | '=' | '<' | '>' | '@' | '#' | '$' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '!' | '?' | ':' | ';' | ',' | '.' => true,
+        '%' | '&' | '*' | '+' | '-' | '/' | '=' | '<' | '>' | '@' | '#' | '$' | '"' | '\''
+        | '(' | ')' | '[' | ']' | '{' | '}' | '!' | '?' | ':' | ';' | ',' | '.' => true,
         _ => false,
     }
 }
@@ -388,10 +475,6 @@ fn collapse_whitespace(s_in: &str) -> String {
     s_out.trim().to_string()
 }
 
-/* ----------------------------------------------------------------------------
-Page-level plausibility check.
-Used to decide if native extraction should be accepted or OCR should be used.
----------------------------------------------------------------------------- */
 fn is_plausible_page_text(s_text: &str) -> bool {
     if s_text.trim().is_empty() {
         return false;
@@ -422,7 +505,6 @@ fn is_plausible_page_text(s_text: &str) -> bool {
     }
 
     let d_alpha_ratio: f64 = (i_alpha_num as f64) / (i_printable as f64);
-
     if d_alpha_ratio < 0.15 && i_printable >= 40 {
         return false;
     }
@@ -435,7 +517,6 @@ OCR: rasterize a single page and run tesseract.
 ---------------------------------------------------------------------------- */
 fn ocr_page_with_external_tools(p_pdf_path: &Path, u_page_num: u32) -> Result<String, ExtractPdfError> {
     let p_tmp_dir = make_temp_dir("pdf_ocr")?;
-
     let s_prefix = format!("page_{}", u_page_num);
     let p_prefix = p_tmp_dir.join(&s_prefix);
 
@@ -454,6 +535,7 @@ fn ocr_page_with_external_tools(p_pdf_path: &Path, u_page_num: u32) -> Result<St
 
     if !out_ppm.status.success() {
         let s_stderr = String::from_utf8(out_ppm.stderr)?;
+        let _ = fs::remove_dir_all(&p_tmp_dir);
         return Err(ExtractPdfError::ExternalToolError(format!(
             "pdftoppm failed for page {}: {}",
             u_page_num,
@@ -463,6 +545,7 @@ fn ocr_page_with_external_tools(p_pdf_path: &Path, u_page_num: u32) -> Result<St
 
     let p_png = p_tmp_dir.join(format!("{}-1.png", s_prefix));
     if !p_png.exists() {
+        let _ = fs::remove_dir_all(&p_tmp_dir);
         return Err(ExtractPdfError::ExternalToolError(format!(
             "pdftoppm did not produce expected output file: {}",
             p_png.display()
@@ -482,6 +565,7 @@ fn ocr_page_with_external_tools(p_pdf_path: &Path, u_page_num: u32) -> Result<St
 
     if !out_ocr.status.success() {
         let s_stderr = String::from_utf8(out_ocr.stderr)?;
+        let _ = fs::remove_dir_all(&p_tmp_dir);
         return Err(ExtractPdfError::ExternalToolError(format!(
             "tesseract failed for page {}: {}",
             u_page_num,
@@ -492,7 +576,6 @@ fn ocr_page_with_external_tools(p_pdf_path: &Path, u_page_num: u32) -> Result<St
     let s_text = String::from_utf8(out_ocr.stdout)?;
 
     let _ = fs::remove_dir_all(&p_tmp_dir);
-
     Ok(s_text)
 }
 
@@ -517,6 +600,22 @@ fn validate_pdf_path(p_path: &Path) -> Result<(), ExtractPdfError> {
         return Err(ExtractPdfError::ExternalToolError(format!(
             "input file extension is not pdf: {}",
             p_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_output_dir(p_output_dir: &Path) -> Result<(), ExtractPdfError> {
+    if !p_output_dir.exists() {
+        return Err(ExtractPdfError::ExternalToolError(format!(
+            "output base dir does not exist: {}",
+            p_output_dir.display()
+        )));
+    }
+    if !p_output_dir.is_dir() {
+        return Err(ExtractPdfError::ExternalToolError(format!(
+            "output base dir is not a directory: {}",
+            p_output_dir.display()
         )));
     }
     Ok(())

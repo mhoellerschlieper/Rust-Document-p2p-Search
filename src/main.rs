@@ -89,6 +89,8 @@ use crate::iam::{
 use crate::iam_net::{iam_delta_push, iam_delta_request, iam_delta_response};
 use rpassword;
 
+pub mod embedding_backend;
+
 /* --- Webserver --------------------------------------------------------------------------- */
 mod web_server;
 use crate::web_server::{
