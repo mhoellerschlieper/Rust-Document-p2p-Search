@@ -24,7 +24,7 @@ History:
         - Added OCR fallback.
         - Added safe validation and error handling.
 ------------------------------------------------------------------------------*/
-
+#![allow(warnings)]
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;

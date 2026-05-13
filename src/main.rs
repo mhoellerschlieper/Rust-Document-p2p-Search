@@ -250,31 +250,54 @@ impl Auditor {
     }
 }
 
-/* ===================================== DocTracker ======================================== */
+/**********************************************************************************************
+ *  Modulname : secure_p2p_ext
+ *  Datei     : main.rs
+ *  Autor     : Marcus Schlieper
+ *---------------------------------------------------------------------------------------------
+ *  Beschreibung
+ *  - Erweiterung des DocTracker um mtime und simhash2 pro Datei.
+ *  - Dadurch werden nur neue oder veraenderte Dateien erneut verarbeitet.
+ *
+ *  Historie
+ *  09.11.2025  MS  - Grundversion Tracker mit mtime
+ *  13.05.2026  MS  - Erweiterung: simhash2 speichern und vergleichen
+ **********************************************************************************************/
+
 struct DocTracker {
     db: sled::Db,
 }
+
 impl DocTracker {
     fn new() -> Self {
-        let db = sled::open(crate::config::path_processed_docs_dir()).expect("Tracker DB init");
+        let db = sled::open(crate::config::path_processed_docs_dir()).expect("tracker_db_init_failed");
         Self { db }
     }
 
-    fn mtime(&self, s_path: &str) -> Option<u64> {
-        self.db.get(s_path).ok().flatten().map(|ivec| {
-            let mut a = [0u8; 8];
-            if ivec.len() == 8 {
-                a.copy_from_slice(&ivec);
-                u64::from_le_bytes(a)
-            } else {
-                0
-            }
-        })
+    fn get_state(&self, s_path: &str) -> Option<(u64, u64)> {
+        let o_val = self.db.get(s_path).ok().flatten()?;
+        if o_val.len() != 16 {
+            return None;
+        }
+
+        let mut a_mtime = [0u8; 8];
+        let mut a_simhash2 = [0u8; 8];
+
+        a_mtime.copy_from_slice(&o_val[0..8]);
+        a_simhash2.copy_from_slice(&o_val[8..16]);
+
+        Some((
+            u64::from_le_bytes(a_mtime),
+            u64::from_le_bytes(a_simhash2),
+        ))
     }
 
-    fn set_mtime(&self, s_path: &str, i_mtime: u64) {
-        let bytes = i_mtime.to_le_bytes();
-        let _ = self.db.insert(s_path, IVec::from(&bytes[..]));
+    fn set_state(&self, s_path: &str, i_mtime: u64, i_simhash2: u64) {
+        let mut v_buf: Vec<u8> = Vec::with_capacity(16);
+        v_buf.extend_from_slice(&i_mtime.to_le_bytes());
+        v_buf.extend_from_slice(&i_simhash2.to_le_bytes());
+
+        let _ = self.db.insert(s_path, sled::IVec::from(v_buf));
     }
 
     fn remove(&self, s_path: &str) {
@@ -289,6 +312,63 @@ impl DocTracker {
             .map(|k| String::from_utf8_lossy(&k).into_owned())
             .collect()
     }
+}
+
+
+/**********************************************************************************************
+ *  Modulname : secure_p2p_ext
+ *  Datei     : main.rs
+ *  Autor     : Marcus Schlieper
+ *---------------------------------------------------------------------------------------------
+ *  Beschreibung
+ *  - Berechnet einen einfachen simhash2 Wert auf Basis von Token Hashes.
+ *  - Dient zur Erkennung inhaltlicher Aenderungen in Dokumenten.
+ *
+ *  Historie
+ *  13.05.2026  MS  - Initiale Version
+ **********************************************************************************************/
+
+fn calc_simhash2(s_text: &str) -> u64 {
+    /*
+     * Defensive:
+     * - Leere Inhalte liefern 0
+     * - Token basierte Gewichtung
+     * - Nur Standard Hashing, keine unsicheren Operationen
+     */
+    let s_norm = s_text.trim().to_ascii_lowercase();
+    if s_norm.is_empty() {
+        return 0;
+    }
+
+    let mut v_acc: [i64; 64] = [0; 64];
+
+    for s_token in s_norm.split_whitespace() {
+        if s_token.is_empty() {
+            continue;
+        }
+
+        let mut hasher = DefaultHasher::new();
+        s_token.hash(&mut hasher);
+        let i_hash = hasher.finish();
+
+        for i_bit in 0..64 {
+            let i_mask = 1u64 << i_bit;
+            if (i_hash & i_mask) != 0 {
+                v_acc[i_bit] += 1;
+            } else {
+                v_acc[i_bit] -= 1;
+            }
+        }
+    }
+
+    let mut i_simhash2: u64 = 0;
+    for i_bit in 0..64 {
+        if v_acc[i_bit] >= 0 {
+            i_simhash2 |= 1u64 << i_bit;
+        }
+    }
+
+    i_simhash2
 }
 
 fn canonicalize_best_effort_str(p_in: &Path) -> String {
@@ -364,43 +444,113 @@ impl TantivyIndex {
         let _ = self.reader.reload();
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn walk_dir(
-        p_dir: &Path,
-        w: &mut IndexWriter,
-        f_path: tantivy::schema::Field,
-        f_content: tantivy::schema::Field,
-        tracker: &DocTracker,
-        v_seen: &mut Vec<String>,
-    ) {
-        if let Ok(rd) = std::fs::read_dir(p_dir) {
-            for entry in rd.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    Self::walk_dir(&p, w, f_path, f_content, tracker, v_seen);
-                } else if let Ok(md) = entry.metadata() {
-                    /* Fix: gleicher Pfad-Key wie im VectorIndex (kanonisiert) */
-                    let s_p = canonicalize_best_effort_str(&p);
-                    v_seen.push(s_p.clone());
+    /**********************************************************************************************
+ *  Modulname : secure_p2p_ext
+ *  Datei     : main.rs
+ *  Autor     : Marcus Schlieper
+ *---------------------------------------------------------------------------------------------
+ *  Beschreibung
+ *  - Durchlaeuft rekursiv das Dokumentenverzeichnis.
+ *  - Verarbeitet nur neue oder veraenderte Dateien.
+ *  - Veraenderung wird ueber mtime und simhash2 erkannt.
+ *
+ *  Historie
+ *  09.11.2025  MS  - Grundversion rekursives Verzeichnis Scannen
+ *  13.05.2026  MS  - Optimierung: nur neue oder geaenderte Dokumente verarbeiten
+ *                  - simhash2 Vergleich integriert
+ **********************************************************************************************/
 
-                    let i_mtime = md
-                        .modified()
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+#[allow(clippy::too_many_arguments)]
+fn walk_dir(
+    p_dir: &Path,
+    w: &mut IndexWriter,
+    f_path: tantivy::schema::Field,
+    f_content: tantivy::schema::Field,
+    tracker: &DocTracker,
+    v_seen: &mut Vec<String>,
+) {
+    if let Ok(rd) = std::fs::read_dir(p_dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
 
-                    if tracker.mtime(&s_p).map_or(true, |old| old != i_mtime) {
-                        if let Some(s_txt) = extract_doc_text(&p).ok().filter(|s| !s.is_empty()) {
-                            w.delete_term(Term::from_field_text(f_path, &s_p));
-                            let _ = w.add_document(doc!(f_path => s_p.as_str(), f_content => s_txt));
-                            tracker.set_mtime(&s_p, i_mtime);
-                        }
-                    }
-                }
+            if p.is_dir() {
+                Self::walk_dir(&p, w, f_path, f_content, tracker, v_seen);
+                continue;
             }
+
+            let md = match entry.metadata() {
+                Ok(x) => x,
+                Err(_) => {
+                    continue;
+                }
+            };
+
+            let s_p = canonicalize_best_effort_str(&p);
+            v_seen.push(s_p.clone());
+
+            let i_mtime = md
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let o_old_state = tracker.get_state(&s_p);
+
+            /*
+             * Schneller Vorfilter:
+             * Wenn mtime gleich ist, wird die Datei sehr wahrscheinlich nicht neu verarbeitet.
+             * Falls kein alter Zustand existiert, ist die Datei neu.
+             */
+            let b_maybe_changed = match o_old_state {
+                Some((i_old_mtime, _i_old_simhash2)) => i_old_mtime != i_mtime,
+                None => true,
+            };
+
+            if !b_maybe_changed {
+                continue;
+            }
+
+            let s_txt = match extract_doc_text(&p) {
+                Ok(s) => s,
+                Err(_) => {
+                    continue;
+                }
+            };
+
+            if s_txt.is_empty() {
+                continue;
+            }
+
+            let i_simhash2_new = calc_simhash2(&s_txt);
+
+            let b_changed = match o_old_state {
+                Some((_i_old_mtime, i_old_simhash2)) => i_old_simhash2 != i_simhash2_new,
+                None => true,
+            };
+
+            if !b_changed {
+                /*
+                 * Inhalt gleich, aber mtime kann anders sein.
+                 * Daher nur Tracker aktualisieren, aber keine Reindexierung.
+                 */
+                tracker.set_state(&s_p, i_mtime, i_simhash2_new);
+                continue;
+            }
+
+            /*
+             * Neue oder geaenderte Datei:
+             * - alten Eintrag loeschen
+             * - neuen Inhalt indexieren
+             * - Tracker Zustand aktualisieren
+             */
+            w.delete_term(Term::from_field_text(f_path, &s_p));
+            let _ = w.add_document(doc!(f_path => s_p.as_str(), f_content => s_txt));
+            tracker.set_state(&s_p, i_mtime, i_simhash2_new);
         }
     }
+}
+
 
     fn search(&self, s_query: &str, i_limit: usize) -> Vec<SearchHit> {
         let searcher = self.reader.searcher();
