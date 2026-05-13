@@ -57,6 +57,9 @@ use tokio::{
 };
 use tracing_subscriber::{fmt, EnvFilter};
 
+use base64::Engine;
+
+
 /* --- Tantivy ------------------------------------------------------------------------------ */
 use tantivy::{
     collector::TopDocs,
@@ -96,8 +99,7 @@ pub mod embedding_backend;
 mod web_server;
 use crate::web_server::{
     run_web_server, web_command, web_doc_text_resp, web_ok_resp, web_peer_view,
-    web_search_dispatch_resp, web_search_hit, web_search_resp, web_shared_state, web_status_view,
-    I_EVENT_RING_MAX,
+    web_search_dispatch_resp, web_search_hit, web_search_resp, web_shared_state, web_status_view, web_file_fetch_resp, I_EVENT_RING_MAX,
 };
 
 mod config;
@@ -165,7 +167,6 @@ enum PayloadType {
         v_hits: Vec<CombiSearchHit>,
     },
 
-    /* Web: click on hit -> request document text from local or remote peer */
     DocTextRequest { i_id: u64, s_path: String },
     DocTextResponse {
         i_id: u64,
@@ -175,7 +176,18 @@ enum PayloadType {
         s_error: String,
     },
 
-    /* IAM replication */
+    /* Web: binary file fetch for browser download or inline display */
+    FileFetchRequest { i_id: u64, s_path: String },
+    FileFetchResponse {
+        i_id: u64,
+        s_peer: String,
+        s_path: String,
+        s_name: String,
+        s_mime: String,
+        s_base64: String,
+        s_error: String,
+    },
+
     IamDeltaPush(iam_delta_push),
     IamDeltaRequest(iam_delta_request),
     IamDeltaResponse(iam_delta_response),
@@ -200,6 +212,7 @@ struct SearchHit {
     s_doc: String,
     d_score: f32,
 }
+
 
 /* ===================================== Kryptographie ===================================== */
 #[derive(Clone)]
@@ -247,6 +260,47 @@ impl Auditor {
 
     fn record(&mut self, v_entry: &[u8]) {
         self.v_hashes.push(Sha256::digest(v_entry).into());
+    }
+}
+
+/**********************************************************************************************
+ *  Modulname : secure_p2p_ext
+ *  Datei     : main.rs
+ *  Autor     : Marcus Schlieper
+ *---------------------------------------------------------------------------------------------
+ *  Beschreibung
+ *  - Hilfsfunktionen fuer sichere Dateiausgabe an Browser.
+ *  - MIME Typ Erkennung und Dateinamen Bereinigung.
+ *
+ *  Historie
+ *  13.05.2026  MS  - Initiale Version fuer Download und Inline Anzeige
+ **********************************************************************************************/
+fn safe_file_name_from_path(s_path: &str) -> String {
+    Path::new(s_path)
+        .file_name()
+        .and_then(|x| x.to_str())
+        .unwrap_or("download.bin")
+        .to_string()
+}
+
+fn mime_from_path(s_path: &str) -> String {
+    let s_ext = Path::new(s_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match s_ext.as_str() {
+        "txt" => "text/plain; charset=utf-8".to_string(),
+        "html" | "htm" => "text/html; charset=utf-8".to_string(),
+        "json" => "application/json".to_string(),
+        "pdf" => "application/pdf".to_string(),
+        "png" => "image/png".to_string(),
+        "jpg" | "jpeg" => "image/jpeg".to_string(),
+        "gif" => "image/gif".to_string(),
+        "svg" => "image/svg+xml".to_string(),
+        "csv" => "text/csv; charset=utf-8".to_string(),
+        _ => "application/octet-stream".to_string(),
     }
 }
 
@@ -1099,9 +1153,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut o_iam_cli: Option<IamCliState> = None;
 
     /* -------------------- Webserver: Shared State + Command Channel ------------------------ */
-    let st_web: Arc<std::sync::Mutex<web_shared_state>> = Arc::new(std::sync::Mutex::new(
+    let st_web: Arc<Mutex<web_shared_state>> = Arc::new(std::sync::Mutex::new(
         web_shared_state::new(swarm.local_peer_id().to_string()),
     ));
+
     {
         let mut g = st_web.lock().unwrap();
         g.push_event("web: state initialized".to_string());
@@ -1620,6 +1675,121 @@ async fn handle_web_command(
                 s_path,
                 s_text: "".to_string(),
             });
+        }
+        web_command::file_fetch_get { s_peer_id, s_path, tx } => {
+            let s_local_peer = swarm.local_peer_id().to_string();
+
+            if s_peer_id == s_local_peer {
+                let v_bytes = match fs::read(&s_path) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let _ = tx.send(web_file_fetch_resp {
+                            b_ok: false,
+                            s_error: "file_read_failed".to_string(),
+                            i_req_id: 0,
+                            s_peer_id,
+                            s_path,
+                            s_name: String::new(),
+                            s_mime: String::new(),
+                            s_base64: String::new(),
+                        });
+                        return;
+                    }
+                };
+
+                let _ = tx.send(web_file_fetch_resp {
+                    b_ok: true,
+                    s_error: String::new(),
+                    i_req_id: 0,
+                    s_peer_id: s_local_peer,
+                    s_path: s_path.clone(),
+                    s_name: safe_file_name_from_path(&s_path),
+                    s_mime: mime_from_path(&s_path),
+                    s_base64: base64::engine::general_purpose::STANDARD.encode(v_bytes),
+                });
+                return;
+            }
+
+            *i_search_ctr = i_search_ctr.saturating_add(1);
+            let i_id = *i_search_ctr;
+
+            {
+                let mut g = st_web.lock().unwrap();
+                g.file_cache_insert_pending(i_id, s_peer_id.clone(), s_path.clone(), now_ms());
+                g.push_event(format!("file: dispatch id={} peer={}", i_id, s_peer_id));
+            }
+
+            let peer = match s_peer_id.parse::<PeerId>() {
+                Ok(p) => p,
+                Err(_) => {
+                    let _ = tx.send(web_file_fetch_resp {
+                        b_ok: false,
+                        s_error: "invalid_peer_id".to_string(),
+                        i_req_id: 0,
+                        s_peer_id,
+                        s_path,
+                        s_name: String::new(),
+                        s_mime: String::new(),
+                        s_base64: String::new(),
+                    });
+                    return;
+                }
+            };
+
+            let topic = build_chat_topic(&swarm.local_peer_id(), &peer);
+            let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+
+            let local_id = swarm.local_peer_id().clone();
+            send_encrypted(
+                &local_id,
+                swarm,
+                &topic,
+                &PayloadType::FileFetchRequest {
+                    i_id,
+                    s_path: s_path.clone(),
+                },
+            );
+
+            let _ = tx.send(web_file_fetch_resp {
+                b_ok: true,
+                s_error: format!("pending:{}", i_id),
+                i_req_id: i_id,
+                s_peer_id,
+                s_path,
+                s_name: String::new(),
+                s_mime: String::new(),
+                s_base64: String::new(),
+            });
+        }
+
+        web_command::file_fetch_result_get { i_req_id, tx } => {
+            let resp = {
+                let g = st_web.lock().unwrap();
+                match g.file_cache_get(i_req_id) {
+                    Some(st) => web_file_fetch_resp {
+                        b_ok: st.b_done && st.s_error.is_empty(),
+                        s_error: st.s_error.clone(),
+                        i_req_id: st.i_req_id,
+                        s_peer_id: st.s_peer_id.clone(),
+                        s_path: st.s_path.clone(),
+                        s_name: st.s_name.clone(),
+                        s_mime: st.s_mime.clone(),
+                        s_base64: st.s_base64.clone(),
+                    },
+                    None => web_file_fetch_resp {
+                        b_ok: false,
+                        s_error: "not_found".to_string(),
+                        i_req_id,
+                        s_peer_id: String::new(),
+                        s_path: String::new(),
+                        s_name: String::new(),
+                        s_mime: String::new(),
+                        s_base64: String::new(),
+                    },
+                }
+            };
+
+            let _ = tx.send(resp);
         }
 
         _ => {
@@ -2394,14 +2564,101 @@ async fn handle_incoming(
             g.doc_cache_set_result(i_id, s_peer, s_path, s_text, s_error);
             g.push_event(format!("doc: resp cached id={}", i_id));
         }
+
+        PayloadType::FileFetchRequest { i_id, s_path } => {
+            let b_allow = {
+                let s_dummy_session = "00000000000000000000000000000000";
+                match iam.check_access(s_dummy_session, &s_path, right_read, true) {
+                    Ok(dec) => dec.b_allowed,
+                    Err(_) => false,
+                }
+            };
+
+            let local_id = swarm.local_peer_id().clone();
+            let topic = build_chat_topic(&swarm.local_peer_id(), src);
+
+            if !b_allow {
+                send_encrypted(
+                    &local_id,
+                    swarm,
+                    &topic,
+                    &PayloadType::FileFetchResponse {
+                        i_id,
+                        s_peer: local_id.to_string(),
+                        s_path,
+                        s_name: "download.bin".to_string(),
+                        s_mime: "application/octet-stream".to_string(),
+                        s_base64: String::new(),
+                        s_error: "iam_deny".to_string(),
+                    },
+                );
+                return;
+            }
+
+            let v_bytes = match fs::read(&s_path) {
+                Ok(v) => v,
+                Err(_) => {
+                    send_encrypted(
+                        &local_id,
+                        swarm,
+                        &topic,
+                        &PayloadType::FileFetchResponse {
+                            i_id,
+                            s_peer: local_id.to_string(),
+                            s_path: s_path.clone(),
+                            s_name: safe_file_name_from_path(&s_path),
+                            s_mime: mime_from_path(&s_path),
+                            s_base64: String::new(),
+                            s_error: "file_read_failed".to_string(),
+                        },
+                    );
+                    return;
+                }
+            };
+
+            let s_base64 = base64::engine::general_purpose::STANDARD.encode(v_bytes);
+
+            send_encrypted(
+                &local_id,
+                swarm,
+                &topic,
+                &PayloadType::FileFetchResponse {
+                    i_id,
+                    s_peer: local_id.to_string(),
+                    s_path: s_path.clone(),
+                    s_name: safe_file_name_from_path(&s_path),
+                    s_mime: mime_from_path(&s_path),
+                    s_base64,
+                    s_error: String::new(),
+                },
+            );
+        }
+
+        PayloadType::FileFetchResponse {
+            i_id,
+            s_peer,
+            s_path,
+            s_name,
+            s_mime,
+            s_base64,
+            s_error,
+        } => {
+            let mut g = st_web.lock().unwrap();
+            g.file_cache_set_result(i_id, s_peer, s_path, s_name, s_mime, s_base64, s_error);
+            g.push_event(format!("file: resp cached id={}", i_id));
+        }
+
+        _ => {}
+    
     }
 }
+
 
 /* ========================================================================================== */
 /* Web Cache Update (aus Payload)                                                              */
 /* ========================================================================================== */
+/* ===================================== Web Cache Update (aus Payload) =================== */
 fn update_web_cache_from_payload(st_web: Arc<Mutex<web_shared_state>>, payload: &PayloadType) {
-    /* Historie: 12.01.2026 MS - Web: store network combi results with peer_id per hit + snippet */
     match payload {
         PayloadType::CombiSearchResponse { i_id, s_peer, v_hits } => {
             let mut v_web_hits: Vec<web_search_hit> = Vec::new();
@@ -2418,9 +2675,33 @@ fn update_web_cache_from_payload(st_web: Arc<Mutex<web_shared_state>>, payload: 
             g.search_cache_add_hits(*i_id, v_web_hits);
             g.push_event(format!("search: combi resp cached id={} peer={}", i_id, s_peer));
         }
+
+        PayloadType::FileFetchResponse {
+            i_id,
+            s_peer,
+            s_path,
+            s_name,
+            s_mime,
+            s_base64,
+            s_error,
+        } => {
+            let mut g = st_web.lock().unwrap();
+            g.file_cache_set_result(
+                *i_id,
+                s_peer.clone(),
+                s_path.clone(),
+                s_name.clone(),
+                s_mime.clone(),
+                s_base64.clone(),
+                s_error.clone(),
+            );
+            g.push_event(format!("file: fetch resp cached id={}", i_id));
+        }
+
         _ => {}
     }
 }
+
 
 /* ========================================================================================== */
 /* Utils                                                                                      */

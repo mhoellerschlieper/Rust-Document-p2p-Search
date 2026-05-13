@@ -391,61 +391,75 @@ History
 
                   <!-- FIX: result list under search + right side snippet preview -->
                   <div class="search_results_layout" style="margin-top: 12px">
-                    <div class="search_results_left">
-                      <div class="card" style="margin: 0">
-                        <div class="card_head row_space">
-                          <div class="card_title">result_list</div>
-                          <div class="row">
-                            <button
-                              class="btn small secondary"
-                              id="btn_search_poll_once"
-                              type="button"
-                            >
-                              poll_once
-                            </button>
-                            <button
-                              class="btn small secondary"
-                              id="btn_search_stop_poll"
-                              type="button"
-                            >
-                              stop_poll
-                            </button>
+                      <div class="search_results_left">
+                          <div class="card" style="margin: 0">
+                              <div class="card_head row_space">
+                                  <div class="card_title">result_list</div>
+                                  <div class="row">
+                                      <button class="btn small secondary"
+                                              id="btn_search_poll_once"
+                                              type="button">
+                                          poll_once
+                                      </button>
+                                      <button class="btn small secondary"
+                                              id="btn_search_stop_poll"
+                                              type="button">
+                                          stop_poll
+                                      </button>
+                                  </div>
+                              </div>
+                              <div class="card_body">
+                                  <!-- Required by app.js -->
+                                  <div id="search_results"></div>
+                                  <div class="hint">
+                                      Click a hit to fetch full document text.
+                                  </div>
+                              </div>
                           </div>
-                        </div>
-                        <div class="card_body">
-                          <!-- Required by app.js -->
-                          <div id="search_results"></div>
-                          <div class="hint">
-                            Click a hit to fetch full document text.
-                          </div>
-                        </div>
                       </div>
-                    </div>
 
-                    <div class="search_results_right">
-                      <div class="card">
-                        <div class="card_head row_space">
-                          <div class="card_title">document</div>
-                          <div class="row">
-                            <div class="mono" id="doc_title">-</div>
-                            <button
-                              class="btn small secondary"
-                              id="btn_doc_clear"
-                              type="button"
-                            >
-                              clear
-                            </button>
+                      
+                      <div class="search_results_right">
+                          <div class="card">
+                              <div class="card_head row_space">
+                                  <div class="card_title">document</div>
+                                  <div class="row">
+                                      <div class="mono" id="doc_title">-</div>
+                                      <button class="btn small secondary" id="btn_doc_clear" type="button">
+                                          clear
+                                      </button>
+                                  </div>
+                              </div>
+                              <div class="card_body">
+                                  <div id="doc_text_wrap">
+                                      <pre class="events" id="doc_text"></pre>
+                                      <div class="hint">
+                                          Click a search hit to load and display the extracted document text from
+                                          local or remote peer.
+                                      </div>
+                                  </div>
+
+                                  <div id="doc_preview_wrap" class="hidden">
+                                      <div class="card" style="margin-top: 12px">
+                                          <div class="card_head row_space">
+                                              <div class="card_title">document_preview</div>
+                                              <div class="muted">pdf_inline_view</div>
+                                          </div>
+                                          <div class="card_body">
+                                              <iframe id="doc_file_preview"
+                                                      title="document_preview"
+                                                      style="width: 100%; min-height: 480px; border: 1px solid #ccc; background: #fff;"></iframe>
+                                              <div class="hint">
+                                                  If a document cannot be shown here, it is downloaded automatically.
+                                              </div>
+                                          </div>
+                                      </div>
+                                  </div>
+                              </div>
                           </div>
-                        </div>
-                        <div class="card_body">
-                          <pre class="events" id="doc_text"></pre>
-                          <div class="hint">
-                            Click a search hit to load and display the extracted
-                            document text from local or remote peer.
-                          </div>
-                        </div>
                       </div>
-                    </div>
+
+
                   </div>
                 </div>
               </div>

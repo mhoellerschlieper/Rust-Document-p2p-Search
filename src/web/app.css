@@ -471,6 +471,34 @@ body {
   display: none !important;
 }
 
+.hit_actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+#doc_file_preview {
+    width: 100%;
+    min-height: 480px;
+    border: 1px solid #d0d0d0;
+    background: #ffffff;
+}
+
+
+#doc_preview_wrap.hidden,
+#doc_text_wrap.hidden,
+#doc_text.hidden {
+    display: none;
+}
+
+#doc_file_preview {
+    width: 100%;
+    min-height: 480px;
+    border: 1px solid #d0d0d0;
+    background: #ffffff;
+}
+
+
 /* Responsive */
 @media (max-width: 1040px) {
   .app_shell {

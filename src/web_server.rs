@@ -148,6 +148,23 @@ pub struct web_doc_state {
     pub s_error: String,
 }
 
+/* ============================================================================================
+ * Shared state
+ * ============================================================================================ */
+
+#[derive(Clone, Debug)]
+pub struct web_file_state {
+    pub i_req_id: u64,
+    pub s_peer_id: String,
+    pub s_path: String,
+    pub i_created_ms: u64,
+    pub b_done: bool,
+    pub s_name: String,
+    pub s_mime: String,
+    pub s_base64: String,
+    pub s_error: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct web_shared_state {
     pub s_node_peer_id: String,
@@ -157,6 +174,7 @@ pub struct web_shared_state {
     pub v_event_ring: VecDeque<String>,
     pub h_search_cache: HashMap<u64, web_search_state>,
     pub h_doc_cache: HashMap<u64, web_doc_state>,
+    pub h_file_cache: HashMap<u64, web_file_state>,
 }
 
 impl web_shared_state {
@@ -169,21 +187,36 @@ impl web_shared_state {
             v_event_ring: VecDeque::new(),
             h_search_cache: HashMap::new(),
             h_doc_cache: HashMap::new(),
+            h_file_cache: HashMap::new(),
         }
     }
-
     pub fn push_event(&mut self, s_event: String) {
         self.v_event_ring.push_back(s_event);
         while self.v_event_ring.len() > I_EVENT_RING_MAX {
-            self.v_event_ring.pop_front();
+            let _ = self.v_event_ring.pop_front();
         }
     }
 
-    pub fn search_cache_hits_len(&self, i_search_id: u64) -> Option<usize> {
-        self.h_search_cache.get(&i_search_id).map(|st| st.v_hits.len())
+    pub fn search_cache_add_hits(&mut self, i_search_id: u64, mut v_hits: Vec<web_search_hit>) {
+        if let Some(st) = self.h_search_cache.get_mut(&i_search_id) {
+            st.v_hits.append(&mut v_hits);
+            st.v_hits.sort_by(|a, b| {
+                b.d_score.partial_cmp(&a.d_score).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if st.v_hits.len() > st.i_limit {
+                st.v_hits.truncate(st.i_limit);
+            }
+            st.b_partial = true;
+        }
     }
 
-    pub fn search_cache_insert_new(&mut self, i_search_id: u64, s_query: String, i_limit: usize, i_now_ms: u64) {
+    pub fn search_cache_insert_new(
+        &mut self,
+        i_search_id: u64,
+        s_query: String,
+        i_limit: usize,
+        i_now_ms: u64,
+    ) {
         let st = web_search_state {
             i_search_id,
             s_query,
@@ -192,38 +225,48 @@ impl web_shared_state {
             b_partial: true,
             v_hits: Vec::new(),
         };
+
         self.h_search_cache.insert(i_search_id, st);
     }
 
-    pub fn search_cache_add_hits(&mut self, i_search_id: u64, mut v_hits: Vec<web_search_hit>) {
-        if let Some(st) = self.h_search_cache.get_mut(&i_search_id) {
-            st.v_hits.append(&mut v_hits);
-            st.v_hits.sort_by(|a, b| b.d_score.partial_cmp(&a.d_score).unwrap_or(std::cmp::Ordering::Equal));
-            if st.v_hits.len() > st.i_limit {
-                st.v_hits.truncate(st.i_limit);
-            }
-            st.b_partial = true;
-        }
+    pub fn search_cache_hits_len(&self, i_search_id: u64) -> Option<usize> {
+        self.h_search_cache.get(&i_search_id).map(|st| st.v_hits.len())
     }
 
-    pub fn search_cache_get(&mut self, i_search_id: u64) -> Option<web_search_state> {
+    
+    pub fn search_cache_get(&self, i_search_id: u64) -> Option<web_search_state> {
         self.h_search_cache.get(&i_search_id).cloned()
     }
 
-    /* Doc cache helpers */
-    pub fn doc_cache_insert_pending(&mut self, i_req_id: u64, s_peer_id: String, s_path: String, i_now_ms: u64) {
-        self.h_doc_cache.insert(i_req_id, web_doc_state {
+    pub fn doc_cache_insert_pending(
+        &mut self,
+        i_req_id: u64,
+        s_peer_id: String,
+        s_path: String,
+        i_now_ms: u64,
+    ) {
+        self.h_doc_cache.insert(
             i_req_id,
-            s_peer_id,
-            s_path,
-            i_created_ms: i_now_ms,
-            b_done: false,
-            s_text: "".to_string(),
-            s_error: "pending".to_string(),
-        });
+            web_doc_state {
+                i_req_id,
+                s_peer_id,
+                s_path,
+                i_created_ms: i_now_ms,
+                b_done: false,
+                s_text: String::new(),
+                s_error: "pending".to_string(),
+            },
+        );
     }
 
-    pub fn doc_cache_set_result(&mut self, i_req_id: u64, s_peer_id: String, s_path: String, s_text: String, s_error: String) {
+    pub fn doc_cache_set_result(
+        &mut self,
+        i_req_id: u64,
+        s_peer_id: String,
+        s_path: String,
+        s_text: String,
+        s_error: String,
+    ) {
         if let Some(st) = self.h_doc_cache.get_mut(&i_req_id) {
             st.b_done = true;
             st.s_peer_id = s_peer_id;
@@ -231,21 +274,84 @@ impl web_shared_state {
             st.s_text = s_text;
             st.s_error = s_error;
         } else {
-            self.h_doc_cache.insert(i_req_id, web_doc_state {
+            self.h_doc_cache.insert(
+                i_req_id,
+                web_doc_state {
+                    i_req_id,
+                    s_peer_id,
+                    s_path,
+                    i_created_ms: now_ms(),
+                    b_done: true,
+                    s_text,
+                    s_error,
+                },
+            );
+        }
+    }
+    pub fn file_cache_insert_pending(
+        &mut self,
+        i_req_id: u64,
+        s_peer_id: String,
+        s_path: String,
+        i_now_ms: u64,
+    ) {
+        self.h_file_cache.insert(
+            i_req_id,
+            web_file_state {
+                i_req_id,
+                s_peer_id,
+                s_path,
+                i_created_ms: i_now_ms,
+                b_done: false,
+                s_name: String::new(),
+                s_mime: String::new(),
+                s_base64: String::new(),
+                s_error: "pending".to_string(),
+            },
+        );
+    }
+
+    pub fn file_cache_set_result(
+        &mut self,
+        i_req_id: u64,
+        s_peer_id: String,
+        s_path: String,
+        s_name: String,
+        s_mime: String,
+        s_base64: String,
+        s_error: String,
+    ) {
+        self.h_file_cache.insert(
+            i_req_id,
+            web_file_state {
                 i_req_id,
                 s_peer_id,
                 s_path,
                 i_created_ms: now_ms(),
                 b_done: true,
-                s_text,
+                s_name,
+                s_mime,
+                s_base64,
                 s_error,
-            });
-        }
+            },
+        );
     }
 
-    pub fn doc_cache_get(&self, i_req_id: u64) -> Option<web_doc_state> {
-        self.h_doc_cache.get(&i_req_id).cloned()
+    pub fn file_cache_get(&self, i_req_id: u64) -> Option<web_file_state> {
+        self.h_file_cache.get(&i_req_id).cloned()
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct web_file_fetch_resp {
+    pub b_ok: bool,
+    pub s_error: String,
+    pub i_req_id: u64,
+    pub s_peer_id: String,
+    pub s_path: String,
+    pub s_name: String,
+    pub s_mime: String,
+    pub s_base64: String,
 }
 
 /* ============================================================================================
@@ -288,6 +394,16 @@ pub enum web_command {
         s_peer_id: String,
         s_path: String,
         tx: tokio::sync::oneshot::Sender<web_doc_text_resp>,
+    },
+
+    file_fetch_get {
+        s_peer_id: String,
+        s_path: String,
+        tx: tokio::sync::oneshot::Sender<web_file_fetch_resp>,
+    },
+    file_fetch_result_get {
+        i_req_id: u64,
+        tx: tokio::sync::oneshot::Sender<web_file_fetch_resp>,
     },
 
     iam_login_local {
@@ -339,6 +455,11 @@ pub struct web_server_ctx {
  * ============================================================================================
  */
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct req_file_fetch_get {
+    pub s_peer_id: String,
+    pub s_path: String,
+}
 #[derive(Serialize, Deserialize, Debug)]
 pub struct req_p2p_connect {
     pub s_peer_id: String,
@@ -830,17 +951,60 @@ async fn route_api_doc_text_get(
 }
 
 /* ============================================================================================
+ * Route handlers: API
+ * ============================================================================================ */
+
+async fn route_api_file_fetch_get(
+    State(ctx): State<web_server_ctx>,
+    Json(req): Json<req_file_fetch_get>,
+) -> Response {
+    let s_peer_id = safe_trim(&req.s_peer_id, 256);
+    let s_path = safe_trim(&req.s_path, 1024);
+
+    if s_peer_id.len() < 4 || !is_reasonable_ascii(&s_peer_id) {
+        return json_err("invalid_peer_id", StatusCode::BAD_REQUEST);
+    }
+    if s_path.is_empty() {
+        return json_err("invalid_path", StatusCode::BAD_REQUEST);
+    }
+
+    match cmd_roundtrip(&ctx.tx_web_cmd, |tx| web_command::file_fetch_get {
+        s_peer_id: s_peer_id.clone(),
+        s_path: s_path.clone(),
+        tx,
+    })
+    .await
+    {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(_) => json_err("file_fetch_get_failed", StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn route_api_file_fetch_result(
+    State(ctx): State<web_server_ctx>,
+    AxumPath(i_req_id): AxumPath<u64>,
+) -> Response {
+    match cmd_roundtrip(&ctx.tx_web_cmd, |tx| web_command::file_fetch_result_get {
+        i_req_id,
+        tx,
+    })
+    .await
+    {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(_) => json_err("file_fetch_result_failed", StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/* ============================================================================================
  * Router build + server run
  * ============================================================================================
  */
 
 fn build_router(ctx: web_server_ctx) -> Router {
     Router::new()
-        /* Static */
         .route("/", get(api_static_index))
         .route("/app.js", get(api_static_app_js))
         .route("/app.css", get(api_static_app_css))
-        /* API */
         .route("/api/status", get(route_api_status))
         .route("/api/peers", get(route_api_peers))
         .route("/api/events", get(route_api_events))
@@ -849,7 +1013,8 @@ fn build_router(ctx: web_server_ctx) -> Router {
         .route("/api/search/combi/dispatch", post(route_api_search_combi_dispatch))
         .route("/api/search/combi/result/:i_search_id", get(route_api_search_combi_result))
         .route("/api/doc/text_get", post(route_api_doc_text_get))
-
+        .route("/api/file/fetch_get", post(route_api_file_fetch_get))
+        .route("/api/file/fetch_result/:i_req_id", get(route_api_file_fetch_result))
         .route("/api/iam/login", post(route_api_iam_login))
         .route("/api/iam/group_add", post(route_api_iam_group_add))
         .route("/api/iam/user_add", post(route_api_iam_user_add))
