@@ -59,6 +59,9 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use base64::Engine;
 
+mod webdav_gateway;
+use crate::webdav_gateway::{run_webdav_server, WebDavEntry, WebDavGateway};
+
 
 /* --- Tantivy ------------------------------------------------------------------------------ */
 use tantivy::{
@@ -1172,6 +1175,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     println!("web: listening on http://{}", cfg_get().s_web_bind);
+
+    let webdav_gateway = Arc::new(WebDavGateway::new(
+        iam.clone(),
+        idx_tan.clone(),
+        idx_vec.clone(),
+    ));
+
+    /* Beispiel Daten fuer Peer Sicht.
+     * Spaeter sollte dies aus echtem Peer Cache oder DirResponse gefuellt werden.
+     */
+    webdav_gateway.register_peer_entries(
+        "peer_demo_01",
+        vec![
+            WebDavEntry {
+                s_name: "angebot_2026.pdf".to_string(),
+                s_path: "/peers/peer_demo_01/docs/angebot_2026.pdf".to_string(),
+                b_dir: false,
+                i_size: 123456,
+                i_mtime_unix: now_ms() / 1000,
+            },
+            WebDavEntry {
+                s_name: "projektplan.txt".to_string(),
+                s_path: "/peers/peer_demo_01/docs/projektplan.txt".to_string(),
+                b_dir: false,
+                i_size: 2048,
+                i_mtime_unix: now_ms() / 1000,
+            },
+        ],
+    );
+
+    let s_webdav_bind: String = "127.0.0.1:1900".to_string();
+    {
+        let gateway_clone = webdav_gateway.clone();
+        let s_webdav_bind_clone = s_webdav_bind.clone();
+
+        tokio::spawn(async move {
+            match run_webdav_server(&s_webdav_bind_clone, gateway_clone).await {
+                Ok(_) => {
+                    println!("webdav: server stopped");
+                }
+                Err(e) => {
+                    eprintln!("webdav: start failed: {}", e);
+                }
+            }
+        });
+    }
+    println!("webdav: start requested on http://{}", s_webdav_bind);
 
     /* ====================================================================================== */
     /* Event Loop                                                                              */
