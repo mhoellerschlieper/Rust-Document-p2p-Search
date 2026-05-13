@@ -66,3 +66,4 @@ pub struct iam_delta_response {
     pub v_events: Vec<iam_event>,
     pub s_merkle_root_hex: String,
 }
+

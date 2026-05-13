@@ -83,13 +83,14 @@ use vector_idx::{load_or_init_index, persist_index};
 mod iam;
 mod iam_net;
 use crate::iam::{
-    iam_config, iam_store, right_admin, right_create, right_local, right_public, right_publish,
-    right_read, right_write, rights_mask,
+    iam_config, iam_store, path_record, right_admin, right_create, right_local, right_public,
+    right_publish, right_read, right_write, rights_mask,
 };
 use crate::iam_net::{iam_delta_push, iam_delta_request, iam_delta_response};
 use rpassword;
 
 pub mod embedding_backend;
+
 
 /* --- Webserver --------------------------------------------------------------------------- */
 mod web_server;
@@ -116,6 +117,12 @@ fn load_cfg_or_exit() -> app_config {
     })
 }
 
+fn install_quiet_panic_hook() {
+    let _ = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|panic_info| {
+        eprintln!("warn: pdf extraction panic intercepted: {}", panic_info);
+    }));
+}
 /* ===================================== Payload =========================================== */
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct CombiSearchHit {
@@ -680,6 +687,7 @@ fn print_menu() {
   iam_user_add <user> <pass> <group>                        : User anlegen und Gruppe setzen
   iam_user_add_to_group <user> <group>                      : User in Gruppe aufnehmen
   iam_path_add <path> <group_or_dash> <public0or1> <rights> : Pfadregel anlegen
+  iam_list_paths                                            : Lokale Pfade und Rechte anzeigen
 
   iam_begin_login <user>                                    : Challenge erzeugen (lokal)
   iam_finish_login <user> <challenge_id> <proof_hex_64>     : Login abschliessen (lokal)
@@ -1471,6 +1479,79 @@ async fn handle_web_command(
     }
 }
 
+/* ===================================== IAM Helper ========================================= */
+fn format_rights_mask_human(i_rights: rights_mask) -> String {
+    /* Defensive: stable readable output for CLI, ASCII only. */
+    let mut v_parts: Vec<String> = Vec::new();
+
+    if (i_rights & right_read) != 0 {
+        v_parts.push("read".to_string());
+    }
+    if (i_rights & right_write) != 0 {
+        v_parts.push("write".to_string());
+    }
+    if (i_rights & right_create) != 0 {
+        v_parts.push("create".to_string());
+    }
+    if (i_rights & right_publish) != 0 {
+        v_parts.push("publish".to_string());
+    }
+    if (i_rights & right_local) != 0 {
+        v_parts.push("local".to_string());
+    }
+    if (i_rights & right_public) != 0 {
+        v_parts.push("public".to_string());
+    }
+    if (i_rights & right_admin) != 0 {
+        v_parts.push("admin".to_string());
+    }
+
+    if v_parts.is_empty() {
+        return "none".to_string();
+    }
+
+    v_parts.join(",")
+}
+
+fn print_local_path_permissions(iam: &Arc<iam_store>) {
+    /* Historie:
+     * 09.05.2026  MS  - Initiale Ausgabe aller lokalen Pfadregeln mit Berechtigungen
+     */
+    match iam.list_paths() {
+        Ok(v_paths) => {
+            if v_paths.is_empty() {
+                println!("iam: no_local_path_rules");
+                return;
+            }
+
+            println!("iam: local_path_rules_begin");
+
+            for p in v_paths {
+                let s_group = p.s_group.clone().unwrap_or_else(|| "-".to_string());
+                let s_rights = format_rights_mask_human(p.i_rights);
+                let i_rights = p.i_rights as u64;
+                let s_public = if p.b_public { "1" } else { "0" };
+
+                println!(
+                    "iam: path={} group={} public={} rights_dec={} rights_hex=0x{:016x} rights={}",
+                    p.s_path,
+                    s_group,
+                    s_public,
+                    i_rights,
+                    i_rights,
+                    s_rights
+                );
+            }
+
+            println!("iam: local_path_rules_end");
+        }
+        Err(e) => {
+            println!("iam error: {:?}", e);
+        }
+    }
+}
+
+
 /* ========================================================================================== */
 /* Benutzer Eingabe                                                                            */
 /* ========================================================================================== */
@@ -1505,6 +1586,10 @@ async fn handle_user_input(
             } else {
                 println!("iam: not_logged_in");
             }
+        }
+
+        "iam_list_paths" => {
+            print_local_path_permissions(&iam);
         }
 
         "peers" => {

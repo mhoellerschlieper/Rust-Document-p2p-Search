@@ -32,9 +32,9 @@ libp2p = { version = "0.56", default-features = false, features = [
 
 tantivy = "0.19"
 hnsw = { version = "0.11.0", features = ["serde"] }
-
+pdf-text-extract = "0.2.0"
 pdf-extract = "0.10.0"
-lopdf = "0.39.0"
+lopdf = "0.40.0"
 calamine = { version = "0.32", default-features = false }
 zip = "0.6"
 

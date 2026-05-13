@@ -407,6 +407,24 @@ impl iam_store {
         Ok(s_path_id)
     }
 
+    pub fn list_paths(&self) -> iam_result<Vec<path_record>> {
+        /* Defensive:
+         * - keine Panics
+         * - stabile Sortierung fuer reproduzierbare Ausgabe
+         * - nur lokal gespeicherte Pfadregeln
+         */
+        let mut v_out: Vec<path_record> = Vec::new();
+
+        for item in self.tr_paths.iter() {
+            let (_k, v) = item.map_err(|_| iam_error::storage)?;
+            let pr: path_record = serde_json::from_slice(&v).map_err(|_| iam_error::storage)?;
+            v_out.push(pr);
+        }
+
+        v_out.sort_by(|a, b| a.s_path.cmp(&b.s_path));
+        Ok(v_out)
+    }
+
     pub fn begin_login(&self, s_user: &str) -> iam_result<login_challenge> {
         if !Self::validate_name(s_user) {
             return Err(iam_error::invalid_input);
