@@ -1,37 +1,34 @@
-/* ============================================================================================
+﻿/* ============================================================================================
 Module name : web_ui
 File        : app.js
 Author      : Marcus Schlieper
 ------------------------------------------------------------------------------------------------
 Description
-- Client side SPA logic for secure_p2p_ext dashboard UI.
-- Dashboard navigation, status, peers, events, p2p, search and iam actions.
-- Search result handling:
-  - click hit or text button loads extracted text into doc_text
-  - download button fetches file
-  - pdf is shown in document_preview
-  - non pdf is downloaded and text view is shown in doc_text
-- Defensive handling:
-  - safe input trimming
-  - timeout protected fetch wrappers
-  - optional DOM elements do not break init
-  - preview and text areas are switched mutually exclusive
-
+- SPA Logik fuer das neu gestaltete FileButler Frontend.
+- Verwendet ausschliesslich vorhandene Endpunkte aus der gelieferten Vorlage:
+  /api/status
+  /api/peers
+  /api/events
+  /api/p2p/connect
+  /api/p2p/send_text
+  /api/search/combi/dispatch
+  /api/search/combi/result/{id}
+  /api/doc/text_get
+  /api/file/fetch_get
+  /api/file/fetch_result/{id}
+  /api/iam/groups
+  /api/iam/login
+  /api/iam/group_add
+  /api/iam/user_add
+  /api/iam/path_add
+- Defensive Validierung, Such Polling, Datei Download und PDF Vorschau.
 History
-2026-01-11  Marcus Schlieper
-- Rewritten dashboard navigation and network combi search polling
-2026-01-11  Marcus Schlieper
-- Fix view navigation reads data-view attribute consistently
-2026-01-11  Marcus Schlieper
-- Update rights checkboxes compute s_rights mask via BigInt
-2026-01-11  Marcus Schlieper
-- Update user add group selection via /api/iam/groups
-2026-01-11  Marcus Schlieper
-- Fix robust checkbox wiring without hard dependency on preview elements
-2026-05-13  Marcus Schlieper
-- Integrated search result download and document preview handling
-- Non pdf files are downloaded and text is shown in doc_text
-- Pdf files are shown in document_preview and text area is hidden
+2026-05-14  Marcus Schlieper
+- Vollstaendige Neufassung passend zum modernen Produktdesign
+- Dashboard Schnellaktionen und synchronisierte Suchsteuerung ergaenzt
+Central function history
+2026-05-14  Marcus Schlieper
+- compute_rights_mask_from_named_boxes weiterhin kompatibel uebernommen
 ============================================================================================ */
 "use strict";
 
@@ -40,23 +37,19 @@ const api = {
     async json_get(s_url) {
         return await api._fetch_json(s_url, { method: "GET" });
     },
-
     async json_post(s_url, o_body) {
         return await api._fetch_json(s_url, {
             method: "POST",
             headers: { "Content-Type": "application/json; charset=utf-8" },
-            body: JSON.stringify(o_body || {}),
+            body: JSON.stringify(o_body || {})
         });
     },
-
     async _fetch_json(s_url, o_opts) {
         const ctrl = new AbortController();
         const i_timeout_ms = 8000;
         const t = setTimeout(() => ctrl.abort(), i_timeout_ms);
-
         try {
             const r = await fetch(s_url, { ...o_opts, signal: ctrl.signal });
-
             if (!r.ok) {
                 let s_body = "";
                 try {
@@ -67,17 +60,15 @@ const api = {
                 } catch (_e) {
                     s_body = "";
                 }
-
-                const s_err =
-                    "http_error_" + String(r.status) + (s_body ? ": " + s_body : "");
-                return { b_ok: false, s_error: s_err };
+                return {
+                    b_ok: false,
+                    s_error: "http_error_" + String(r.status) + (s_body ? ": " + s_body : "")
+                };
             }
-
-            const s_ct = (r.headers.get("content-type") || "").toLowerCase();
+            const s_ct = String(r.headers.get("content-type") || "").toLowerCase();
             if (s_ct.indexOf("application/json") < 0) {
                 return { b_ok: false, s_error: "unexpected_content_type" };
             }
-
             return await r.json();
         } catch (e) {
             const s_msg = e && e.message ? String(e.message) : "fetch_failed";
@@ -85,7 +76,7 @@ const api = {
         } finally {
             clearTimeout(t);
         }
-    },
+    }
 };
 
 /* -------------------------------- DOM helpers --------------------------------------------- */
@@ -159,7 +150,6 @@ function safe_file_name_from_path(s_path) {
 function set_active_view(s_view_id) {
     document.querySelectorAll(".view").forEach((v) => v.classList.add("hidden"));
     by_id(s_view_id).classList.remove("hidden");
-
     document.querySelectorAll(".nav_item").forEach((b) => b.classList.remove("active"));
     document.querySelectorAll(".nav_item").forEach((b) => {
         if (b.getAttribute("data-view") === s_view_id) {
@@ -171,13 +161,12 @@ function set_active_view(s_view_id) {
 /* -------------------------------- Status, peers, events ----------------------------------- */
 async function refresh_status() {
     const st = await api.json_get("/api/status");
-
     if (!st || st.s_node_peer_id === undefined) {
         set_text("status_badge", "offline");
         const el = opt_by_id("status_badge");
         if (el) {
-            el.classList.remove("badge_on");
-            el.classList.add("badge_off");
+            el.classList.remove("status_on");
+            el.classList.add("status_off");
         }
         return;
     }
@@ -187,23 +176,20 @@ async function refresh_status() {
     set_text("st_chat_peer", st.s_chat_peer || "-");
     set_text("st_chat_topic", st.s_chat_topic || "-");
 
-    set_text("st_peer_id_2", st.s_node_peer_id || "-");
     set_text("st_known_peers_2", String(st.i_known_peers || 0));
     set_text("st_chat_peer_2", st.s_chat_peer || "-");
-    set_text("st_chat_topic_2", st.s_chat_topic || "-");
 
     set_text("status_badge", "online");
     const el = opt_by_id("status_badge");
     if (el) {
-        el.classList.remove("badge_off");
-        el.classList.add("badge_on");
+        el.classList.remove("status_off");
+        el.classList.add("status_on");
     }
 }
 
 async function refresh_peers() {
     const tb = by_id("peers_table");
     tb.innerHTML = "";
-
     const v = await api.json_get("/api/peers");
     if (!Array.isArray(v)) {
         toast("peers_refresh_failed");
@@ -225,7 +211,7 @@ async function refresh_peers() {
 
         const td_act = document.createElement("td");
         const btn = document.createElement("button");
-        btn.className = "btn small";
+        btn.className = "btn btn_small btn_primary";
         btn.textContent = "connect";
         btn.addEventListener("click", async () => {
             await do_connect(s_peer_id);
@@ -255,32 +241,33 @@ async function do_connect(s_peer_id) {
         toast("invalid_peer_id");
         return;
     }
-
     const r = await api.json_post("/api/p2p/connect", { s_peer_id: s_id });
     if (!r || r.b_ok !== true) {
         toast("connect_failed: " + String((r && r.s_error) || "na"));
         return;
     }
-
     toast("connect_sent");
     await refresh_status();
 }
 
-async function do_send_text() {
-    const s_text = safe_trim(by_id("send_text").value, 10000);
+async function do_send_text_from_id(s_input_id) {
+    const el = by_id(s_input_id);
+    const s_text = safe_trim(el.value, 10000);
     if (s_text.length < 1) {
         toast("empty_text");
         return;
     }
-
-    const r = await api.json_post("/api/p2p/send_text", { s_text });
+    const r = await api.json_post("/api/p2p/send_text", { s_text: s_text });
     if (!r || r.b_ok !== true) {
         toast("send_failed: " + String((r && r.s_error) || "na"));
         return;
     }
-
-    by_id("send_text").value = "";
+    el.value = "";
     toast("sent");
+}
+
+async function do_send_text() {
+    await do_send_text_from_id("send_text");
 }
 
 /* -------------------------------- Document preview state ---------------------------------- */
@@ -331,35 +318,22 @@ function show_doc_text_hide_preview() {
     if (el_preview_wrap) {
         el_preview_wrap.classList.add("hidden");
     }
-
     if (el_preview) {
-        if (el_preview.tagName === "IFRAME" || el_preview.tagName === "IMG") {
-            el_preview.setAttribute("src", "");
-        } else {
-            el_preview.innerHTML = "";
-        }
+        el_preview.setAttribute("src", "");
     }
-
     revoke_preview_object_url();
 }
 
 function clear_doc_view() {
     set_text("doc_title", "-");
-
     const el_doc_text = opt_by_id("doc_text");
     if (el_doc_text) {
         el_doc_text.textContent = "";
     }
-
     const el_preview = opt_by_id("doc_file_preview");
     if (el_preview) {
-        if (el_preview.tagName === "IFRAME" || el_preview.tagName === "IMG") {
-            el_preview.setAttribute("src", "");
-        } else {
-            el_preview.innerHTML = "";
-        }
+        el_preview.setAttribute("src", "");
     }
-
     revoke_preview_object_url();
     show_doc_text_hide_preview();
 }
@@ -376,11 +350,9 @@ function base64_to_blob(s_base64, s_mime) {
     try {
         const s_bin = atob(String(s_base64 || ""));
         const a_bytes = new Uint8Array(s_bin.length);
-
         for (let i_i = 0; i_i < s_bin.length; i_i += 1) {
             a_bytes[i_i] = s_bin.charCodeAt(i_i);
         }
-
         return new Blob([a_bytes], { type: s_mime || "application/octet-stream" });
     } catch (_e) {
         return null;
@@ -389,16 +361,13 @@ function base64_to_blob(s_base64, s_mime) {
 
 function trigger_blob_download(o_blob, s_name) {
     const s_url = URL.createObjectURL(o_blob);
-
     const el_link = document.createElement("a");
     el_link.href = s_url;
     el_link.download = s_name || "download.bin";
     el_link.rel = "noopener";
-
     document.body.appendChild(el_link);
     el_link.click();
     document.body.removeChild(el_link);
-
     setTimeout(() => {
         try {
             URL.revokeObjectURL(s_url);
@@ -413,23 +382,9 @@ function show_pdf_preview_from_blob(o_blob) {
     if (!el_preview) {
         return false;
     }
-
     revoke_preview_object_url();
     g_preview_object_url = URL.createObjectURL(o_blob);
-
-    if (el_preview.tagName === "IFRAME" || el_preview.tagName === "IMG") {
-        el_preview.setAttribute("src", g_preview_object_url);
-    } else {
-        el_preview.innerHTML = "";
-        const el_iframe = document.createElement("iframe");
-        el_iframe.setAttribute("src", g_preview_object_url);
-        el_iframe.setAttribute("title", "document_preview");
-        el_iframe.style.width = "100%";
-        el_iframe.style.minHeight = "480px";
-        el_iframe.style.border = "0";
-        el_preview.appendChild(el_iframe);
-    }
-
+    el_preview.setAttribute("src", g_preview_object_url);
     hide_doc_text_show_preview();
     return true;
 }
@@ -437,7 +392,6 @@ function show_pdf_preview_from_blob(o_blob) {
 function show_text_in_doc_area(s_title, s_text) {
     set_text("doc_title", s_title);
     show_doc_text_hide_preview();
-
     const el_doc_text = opt_by_id("doc_text");
     if (el_doc_text) {
         el_doc_text.textContent = String(s_text || "");
@@ -445,12 +399,22 @@ function show_text_in_doc_area(s_title, s_text) {
 }
 
 /* -------------------------------- Network combi search ------------------------------------ */
+function sync_search_indicators() {
+    set_text("search_id_dashboard", g_last_search_id ? String(g_last_search_id) : "-");
+    set_text("search_id_dash_inline", g_last_search_id ? String(g_last_search_id) : "-");
+}
+
+function set_search_poll_state_all(s_state) {
+    set_text("search_poll_state", s_state);
+    set_text("search_poll_state_dashboard", s_state);
+}
+
 function stop_search_polling() {
     if (g_search_poll_timer) {
         clearInterval(g_search_poll_timer);
         g_search_poll_timer = null;
     }
-    set_text("search_poll_state", "idle");
+    set_search_poll_state_all("idle");
 }
 
 function render_search_results(v_hits, b_partial) {
@@ -458,13 +422,13 @@ function render_search_results(v_hits, b_partial) {
     box.innerHTML = "";
 
     const head = document.createElement("div");
-    head.className = "muted";
+    head.className = "mini_info";
     head.textContent = b_partial ? "partial_results" : "final_results";
     box.appendChild(head);
 
     if (!Array.isArray(v_hits) || v_hits.length === 0) {
         const empty = document.createElement("div");
-        empty.className = "muted";
+        empty.className = "info_box";
         empty.textContent = "no_hits";
         box.appendChild(empty);
         return;
@@ -481,8 +445,7 @@ function render_search_results(v_hits, b_partial) {
 
         const line1 = document.createElement("div");
         line1.className = "hit_title";
-        line1.textContent =
-            (Number.isFinite(d_score) ? d_score : 0).toFixed(4) + "  " + s_doc;
+        line1.textContent = (Number.isFinite(d_score) ? d_score : 0).toFixed(4) + "  " + s_doc;
 
         const line2 = document.createElement("div");
         line2.className = "hit_snippet";
@@ -496,7 +459,7 @@ function render_search_results(v_hits, b_partial) {
         actions.className = "hit_actions";
 
         const btn_text = document.createElement("button");
-        btn_text.className = "btn small";
+        btn_text.className = "btn btn_small btn_primary";
         btn_text.textContent = "text";
         btn_text.addEventListener("click", async (ev) => {
             if (ev && typeof ev.stopPropagation === "function") {
@@ -506,7 +469,7 @@ function render_search_results(v_hits, b_partial) {
         });
 
         const btn_download = document.createElement("button");
-        btn_download.className = "btn small";
+        btn_download.className = "btn btn_small btn_soft";
         btn_download.textContent = "download";
         btn_download.addEventListener("click", async (ev) => {
             if (ev && typeof ev.stopPropagation === "function") {
@@ -536,51 +499,72 @@ async function poll_search_result_once() {
         toast("no_search_id");
         return;
     }
-
-    set_text("search_poll_state", "polling");
-
-    const s_url =
-        "/api/search/combi/result/" + encodeURIComponent(String(g_last_search_id));
+    set_search_poll_state_all("polling");
+    const s_url = "/api/search/combi/result/" + encodeURIComponent(String(g_last_search_id));
     const rr = await api.json_get(s_url);
-
     if (!rr || rr.b_ok !== true) {
         render_search_results([], true);
         return;
     }
-
     const b_partial = rr.b_partial === true;
     render_search_results(rr.v_hits || [], b_partial);
-
     if (!b_partial) {
         stop_search_polling();
     }
 }
 
+function read_search_input_values() {
+    const s_query_main = opt_by_id("search_query") ? by_id("search_query").value : "";
+    const s_query_dash = opt_by_id("search_query_dashboard") ? by_id("search_query_dashboard").value : "";
+    const s_query = safe_trim(s_query_main.length > 0 ? s_query_main : s_query_dash, 4096);
+
+    const s_limit_main = opt_by_id("search_limit") ? by_id("search_limit").value : "";
+    const s_limit_dash = opt_by_id("search_limit_dashboard") ? by_id("search_limit_dashboard").value : "10";
+    const i_limit = parse_int_clamped(s_limit_main.length > 0 ? s_limit_main : s_limit_dash, 1, 50, 10);
+
+    return { s_query, i_limit };
+}
+
+function sync_search_inputs_after_dispatch() {
+    const el_main = opt_by_id("search_query");
+    const el_dash = opt_by_id("search_query_dashboard");
+    if (el_main && el_dash) {
+        if (safe_trim(el_main.value, 4096).length > 0 && safe_trim(el_dash.value, 4096).length === 0) {
+            el_dash.value = el_main.value;
+        } else if (safe_trim(el_dash.value, 4096).length > 0 && safe_trim(el_main.value, 4096).length === 0) {
+            el_main.value = el_dash.value;
+        }
+    }
+}
+
 async function do_search() {
     stop_search_polling();
-
     const s_mode = by_id("search_mode").value;
     if (s_mode !== "combi") {
         toast("invalid_mode");
         return;
     }
 
-    const s_query = safe_trim(by_id("search_query").value, 4096);
+    const o_vals = read_search_input_values();
+    const s_query = o_vals.s_query;
+    const i_limit = o_vals.i_limit;
+
     if (s_query.length < 1) {
         toast("empty_query");
         return;
     }
 
-    const i_limit = parse_int_clamped(by_id("search_limit").value, 1, 50, 10);
+    sync_search_inputs_after_dispatch();
 
+    g_last_search_id = null;
     set_text("search_id", "-");
+    sync_search_indicators();
     render_search_results([], true);
 
     const r = await api.json_post("/api/search/combi/dispatch", {
-        s_query,
-        i_limit,
+        s_query: s_query,
+        i_limit: i_limit
     });
-
     if (!r || r.b_ok !== true) {
         toast("dispatch_failed: " + String((r && r.s_error) || "na"));
         return;
@@ -594,19 +578,18 @@ async function do_search() {
 
     g_last_search_id = i_search_id;
     set_text("search_id", String(i_search_id));
-    set_text("search_poll_state", "polling");
+    sync_search_indicators();
+    set_search_poll_state_all("polling");
     toast("search_dispatched");
 
     let i_ticks = 0;
     const i_max_ticks = 14;
-
     g_search_poll_timer = setInterval(async () => {
         i_ticks += 1;
         await poll_search_result_once();
-
         if (i_ticks >= i_max_ticks) {
             stop_search_polling();
-            set_text("search_poll_state", "stopped");
+            set_search_poll_state_all("stopped");
         }
     }, 450);
 
@@ -617,7 +600,6 @@ async function do_search() {
 async function fetch_doc_text(s_peer_id, s_path) {
     const s_peer = safe_trim(s_peer_id, 256);
     const s_p = safe_trim(s_path, 1024);
-
     if (s_peer.length < 4 || s_p.length < 1) {
         toast("invalid_doc_request");
         return;
@@ -625,9 +607,8 @@ async function fetch_doc_text(s_peer_id, s_path) {
 
     const r = await api.json_post("/api/doc/text_get", {
         s_peer_id: s_peer,
-        s_path: s_p,
+        s_path: s_p
     });
-
     if (!r || r.b_ok !== true) {
         show_text_in_doc_area(s_p, "error: " + String((r && r.s_error) || "na"));
         return;
@@ -641,7 +622,6 @@ async function fetch_doc_text(s_peer_id, s_path) {
         show_text_in_doc_area(s_title, s_text);
         return;
     }
-
     show_text_in_doc_area(s_title, s_err ? s_err : "pending");
 }
 
@@ -649,14 +629,12 @@ async function fetch_doc_text(s_peer_id, s_path) {
 async function api_file_fetch_get(s_peer_id, s_path) {
     const s_peer = safe_trim(s_peer_id, 256);
     const s_p = safe_trim(s_path, 1024);
-
     if (s_peer.length < 4 || s_p.length < 1) {
         return { b_ok: false, s_error: "invalid_file_request" };
     }
-
     return await api.json_post("/api/file/fetch_get", {
         s_peer_id: s_peer,
-        s_path: s_p,
+        s_path: s_p
     });
 }
 
@@ -665,20 +643,14 @@ async function api_file_fetch_result(i_req_id) {
     if (!Number.isFinite(i_id) || i_id <= 0) {
         return { b_ok: false, s_error: "invalid_req_id" };
     }
-
-    return await api.json_get(
-        "/api/file/fetch_result/" + encodeURIComponent(String(i_id))
-    );
+    return await api.json_get("/api/file/fetch_result/" + encodeURIComponent(String(i_id)));
 }
 
 async function present_fetched_file_or_text(o_file, s_peer_id, s_path) {
     const s_mime = String((o_file && o_file.s_mime) || "").toLowerCase();
     const s_title = safe_trim(s_peer_id, 256) + "  " + safe_trim(s_path, 1024);
     const s_name_raw = String((o_file && o_file.s_name) || "");
-    const s_name =
-        s_name_raw.length > 0
-            ? safe_file_name_from_path(s_name_raw)
-            : safe_file_name_from_path(s_path);
+    const s_name = s_name_raw.length > 0 ? safe_file_name_from_path(s_name_raw) : safe_file_name_from_path(s_path);
 
     const o_blob = base64_to_blob(String((o_file && o_file.s_base64) || ""), s_mime);
     if (!o_blob) {
@@ -688,7 +660,6 @@ async function present_fetched_file_or_text(o_file, s_peer_id, s_path) {
 
     if (can_inline_show(s_mime)) {
         set_text("doc_title", s_title);
-
         const b_preview_ok = show_pdf_preview_from_blob(o_blob);
         if (!b_preview_ok) {
             trigger_blob_download(o_blob, s_name);
@@ -705,7 +676,6 @@ async function present_fetched_file_or_text(o_file, s_peer_id, s_path) {
 async function fetch_file_for_hit(s_peer_id, s_path) {
     const s_peer = safe_trim(s_peer_id, 256);
     const s_p = safe_trim(s_path, 1024);
-
     if (s_peer.length < 4 || s_p.length < 1) {
         toast("invalid_file_request");
         return;
@@ -730,34 +700,24 @@ async function fetch_file_for_hit(s_peer_id, s_path) {
 
     let i_try = 0;
     const i_max_try = 40;
-
     while (i_try < i_max_try) {
         i_try += 1;
         await new Promise((f_resolve) => setTimeout(f_resolve, 500));
-
         const o_poll = await api_file_fetch_result(i_req_id);
-
         if (o_poll && String(o_poll.s_error || "") === "pending") {
             continue;
         }
-
         if (!o_poll || o_poll.b_ok !== true) {
             toast("file_fetch_failed: " + String((o_poll && o_poll.s_error) || "na"));
             return;
         }
-
         await present_fetched_file_or_text(o_poll, s_peer, s_p);
         return;
     }
-
     toast("file_fetch_timeout");
 }
 
 /* -------------------------------- IAM rights bitmask -------------------------------------- */
-/* Central function history entry:
-2026-01-11 Marcus Schlieper
-- Fix robust checkbox mapping and optional preview update.
-*/
 const g_right_bits = {
     right_read: 1n << 0n,
     right_write: 1n << 1n,
@@ -765,7 +725,7 @@ const g_right_bits = {
     right_publish: 1n << 3n,
     right_local: 1n << 4n,
     right_public: 1n << 5n,
-    right_admin: 1n << 63n,
+    right_admin: 1n << 63n
 };
 
 function compute_rights_mask_from_named_boxes(o_map_name_to_checkbox_id) {
@@ -773,45 +733,37 @@ function compute_rights_mask_from_named_boxes(o_map_name_to_checkbox_id) {
         if (!o_map_name_to_checkbox_id || typeof o_map_name_to_checkbox_id !== "object") {
             return { b_ok: false, s_rights_dec: "0", s_error: "invalid_map" };
         }
-
         let bi_mask = 0n;
         let i_seen = 0;
-
         for (const s_right_name of Object.keys(o_map_name_to_checkbox_id)) {
             i_seen += 1;
-
             const s_checkbox_id = String(o_map_name_to_checkbox_id[s_right_name] || "");
             const el = opt_by_id(s_checkbox_id);
             if (!el) {
                 return {
                     b_ok: false,
                     s_rights_dec: "0",
-                    s_error: "missing_checkbox_" + s_checkbox_id,
+                    s_error: "missing_checkbox_" + s_checkbox_id
                 };
             }
-
             const bi_bit = g_right_bits[s_right_name];
             if (bi_bit === undefined) {
                 return {
                     b_ok: false,
                     s_rights_dec: "0",
-                    s_error: "unknown_right_" + s_right_name,
+                    s_error: "unknown_right_" + s_right_name
                 };
             }
-
             if (el.checked === true) {
                 bi_mask |= bi_bit;
             }
         }
-
         if (i_seen < 1) {
             return { b_ok: false, s_rights_dec: "0", s_error: "empty_map" };
         }
-
         if (bi_mask === 0n) {
             return { b_ok: false, s_rights_dec: "0", s_error: "no_right_selected" };
         }
-
         return { b_ok: true, s_rights_dec: bi_mask.toString(10), s_error: "" };
     } catch (e) {
         const s_msg = e && e.message ? String(e.message) : "mask_compute_failed";
@@ -826,7 +778,6 @@ function wire_rights_checkboxes(o_map_name_to_checkbox_id, s_preview_id_optional
             set_text(s_preview_id_optional, r.s_rights_dec);
         }
     };
-
     for (const s_right_name of Object.keys(o_map_name_to_checkbox_id)) {
         const s_checkbox_id = String(o_map_name_to_checkbox_id[s_right_name] || "");
         const el = opt_by_id(s_checkbox_id);
@@ -835,7 +786,6 @@ function wire_rights_checkboxes(o_map_name_to_checkbox_id, s_preview_id_optional
         }
         el.addEventListener("change", update);
     }
-
     update();
 }
 
@@ -845,7 +795,6 @@ async function refresh_iam_groups_select() {
     if (!el_select) {
         return;
     }
-
     el_select.innerHTML = "";
 
     const opt0 = document.createElement("option");
@@ -867,7 +816,6 @@ async function refresh_iam_groups_select() {
         if (s_group.length < 1) {
             continue;
         }
-
         const opt = document.createElement("option");
         opt.value = s_group;
         opt.textContent = s_group;
@@ -883,7 +831,6 @@ async function refresh_iam_groups_select() {
 async function do_iam_login() {
     const s_user = safe_trim(by_id("iam_login_user").value, 64);
     const s_password = String(by_id("iam_login_pass").value || "");
-
     if (s_user.length < 1) {
         toast("invalid_user");
         return;
@@ -893,13 +840,15 @@ async function do_iam_login() {
         return;
     }
 
-    const r = await api.json_post("/api/iam/login", { s_user, s_password });
+    const r = await api.json_post("/api/iam/login", { s_user: s_user, s_password: s_password });
     if (!r || r.b_ok !== true) {
         toast("login_failed: " + String((r && r.s_error) || "na"));
         return;
     }
 
     set_text("iam_session", r.s_session || "-");
+    set_text("iam_session_2", r.s_session || "-");
+    set_text("iam_session_dashboard", r.s_session || "-");
     by_id("iam_login_pass").value = "";
     toast("login_ok");
     await refresh_iam_groups_select();
@@ -907,7 +856,6 @@ async function do_iam_login() {
 
 async function do_iam_group_add() {
     const s_group = safe_trim(by_id("iam_group").value, 64);
-
     const o_map = {
         right_read: "iam_group_right_read",
         right_write: "iam_group_right_write",
@@ -915,7 +863,7 @@ async function do_iam_group_add() {
         right_publish: "iam_group_right_publish",
         right_local: "iam_group_right_local",
         right_public: "iam_group_right_public",
-        right_admin: "iam_group_right_admin",
+        right_admin: "iam_group_right_admin"
     };
 
     if (s_group.length < 1) {
@@ -930,10 +878,9 @@ async function do_iam_group_add() {
     }
 
     const r = await api.json_post("/api/iam/group_add", {
-        s_group,
-        s_rights: o_mask.s_rights_dec,
+        s_group: s_group,
+        s_rights: o_mask.s_rights_dec
     });
-
     if (!r || r.b_ok !== true) {
         toast("group_add_failed: " + String((r && r.s_error) || "na"));
         return;
@@ -947,14 +894,12 @@ async function do_iam_user_add() {
     const s_user = safe_trim(by_id("iam_user").value, 64);
     const s_password = String(by_id("iam_user_pass").value || "");
     const el_select = opt_by_id("iam_user_group_select");
-
     if (!el_select) {
         toast("missing_group_select");
         return;
     }
 
     const s_group = safe_trim(el_select.value, 64);
-
     if (s_user.length < 1 || s_group.length < 1 || s_password.length < 1) {
         toast("invalid_input");
         return;
@@ -965,11 +910,10 @@ async function do_iam_user_add() {
     }
 
     const r = await api.json_post("/api/iam/user_add", {
-        s_user,
-        s_password,
-        s_group,
+        s_user: s_user,
+        s_password: s_password,
+        s_group: s_group
     });
-
     if (!r || r.b_ok !== true) {
         toast("user_add_failed: " + String((r && r.s_error) || "na"));
         return;
@@ -983,7 +927,6 @@ async function do_iam_path_add() {
     const s_path = safe_trim(by_id("iam_path").value, 512);
     const s_group_or_dash = safe_trim(by_id("iam_path_group").value, 64);
     const b_public = by_id("iam_path_public").value === "true";
-
     const o_map = {
         right_read: "iam_path_right_read",
         right_write: "iam_path_right_write",
@@ -991,7 +934,7 @@ async function do_iam_path_add() {
         right_publish: "iam_path_right_publish",
         right_local: "iam_path_right_local",
         right_public: "iam_path_right_public",
-        right_admin: "iam_path_right_admin",
+        right_admin: "iam_path_right_admin"
     };
 
     if (s_path.length < 1 || s_group_or_dash.length < 1) {
@@ -1006,12 +949,11 @@ async function do_iam_path_add() {
     }
 
     const r = await api.json_post("/api/iam/path_add", {
-        s_path,
-        s_group_or_dash,
-        b_public,
-        s_rights: o_mask.s_rights_dec,
+        s_path: s_path,
+        s_group_or_dash: s_group_or_dash,
+        b_public: b_public,
+        s_rights: o_mask.s_rights_dec
     });
-
     if (!r || r.b_ok !== true) {
         toast("path_add_failed: " + String((r && r.s_error) || "na"));
         return;
@@ -1033,20 +975,35 @@ function init_nav() {
             }
         });
     });
+
+    document.querySelectorAll("[data-go-view]").forEach((b) => {
+        b.addEventListener("click", () => {
+            const s_view = b.getAttribute("data-go-view");
+            if (s_view) {
+                set_active_view(s_view);
+            }
+        });
+    });
+}
+
+function bind_optional_click(s_id, f_handler) {
+    const el = opt_by_id(s_id);
+    if (!el) {
+        return;
+    }
+    el.addEventListener("click", f_handler);
 }
 
 function init_actions() {
     by_id("btn_refresh_status").addEventListener("click", refresh_status);
-    by_id("btn_status_refresh").addEventListener("click", refresh_status);
-    by_id("btn_events_refresh_from_status").addEventListener("click", refresh_events);
-    by_id("btn_refresh_peers").addEventListener("click", refresh_peers);
-    by_id("btn_refresh_events").addEventListener("click", refresh_events);
 
-    by_id("btn_clear_events_box").addEventListener("click", () => {
+    bind_optional_click("btn_refresh_peers", refresh_peers);
+    bind_optional_click("btn_refresh_events", refresh_events);
+    bind_optional_click("btn_clear_events_box", () => {
         by_id("events_box").textContent = "";
     });
 
-    by_id("btn_copy_local_peer_id").addEventListener("click", async () => {
+    bind_optional_click("btn_copy_local_peer_id", async () => {
         try {
             const s = String(by_id("st_peer_id").textContent || "");
             if (s && navigator.clipboard && navigator.clipboard.writeText) {
@@ -1060,48 +1017,91 @@ function init_actions() {
         }
     });
 
-    by_id("btn_connect").addEventListener("click", async () => {
+    bind_optional_click("btn_connect", async () => {
         await do_connect(by_id("connect_peer_id").value);
     });
 
-    by_id("btn_send_text").addEventListener("click", do_send_text);
-    by_id("btn_send_text_clear").addEventListener("click", () => {
+    bind_optional_click("btn_send_text", do_send_text);
+    bind_optional_click("btn_send_text_clear", () => {
         by_id("send_text").value = "";
     });
 
-    by_id("btn_search").addEventListener("click", async (e) => {
+    bind_optional_click("btn_send_text_dashboard", async () => {
+        await do_send_text_from_id("send_text_dashboard");
+    });
+    bind_optional_click("btn_send_text_dashboard_clear", () => {
+        by_id("send_text_dashboard").value = "";
+    });
+
+    bind_optional_click("btn_search", async (e) => {
         if (e && typeof e.preventDefault === "function") {
             e.preventDefault();
         }
         await do_search();
     });
 
-    by_id("btn_search_clear").addEventListener("click", () => {
-        by_id("search_query").value = "";
+    bind_optional_click("btn_search_dashboard", async (e) => {
+        if (e && typeof e.preventDefault === "function") {
+            e.preventDefault();
+        }
+        await do_search();
+    });
+
+    bind_optional_click("btn_search_clear", () => {
+        if (opt_by_id("search_query")) {
+            by_id("search_query").value = "";
+        }
         set_text("search_id", "-");
+        g_last_search_id = null;
+        sync_search_indicators();
         render_search_results([], true);
         stop_search_polling();
         clear_doc_view();
     });
 
-    by_id("btn_search_poll_once").addEventListener("click", poll_search_result_once);
-    by_id("btn_search_stop_poll").addEventListener("click", stop_search_polling);
+    bind_optional_click("btn_search_clear_dashboard", () => {
+        if (opt_by_id("search_query_dashboard")) {
+            by_id("search_query_dashboard").value = "";
+        }
+        g_last_search_id = null;
+        set_text("search_id", "-");
+        sync_search_indicators();
+        render_search_results([], true);
+        stop_search_polling();
+        clear_doc_view();
+    });
 
-    by_id("btn_iam_login").addEventListener("click", do_iam_login);
-    by_id("btn_iam_group_add").addEventListener("click", do_iam_group_add);
-    by_id("btn_iam_user_add").addEventListener("click", do_iam_user_add);
-    by_id("btn_iam_path_add").addEventListener("click", do_iam_path_add);
+    bind_optional_click("btn_search_poll_once", poll_search_result_once);
+    bind_optional_click("btn_search_stop_poll", stop_search_polling);
 
-    const el_doc_clear = opt_by_id("btn_doc_clear");
-    if (el_doc_clear) {
-        el_doc_clear.addEventListener("click", () => {
-            clear_doc_view();
-        });
-    }
+    bind_optional_click("btn_iam_login", do_iam_login);
+    bind_optional_click("btn_iam_group_add", do_iam_group_add);
+    bind_optional_click("btn_iam_user_add", do_iam_user_add);
+    bind_optional_click("btn_iam_path_add", do_iam_path_add);
+
+    bind_optional_click("btn_doc_clear", () => {
+        clear_doc_view();
+    });
 
     const el_search_query = opt_by_id("search_query");
     if (el_search_query) {
         el_search_query.addEventListener("keydown", async (ev) => {
+            if (!ev) {
+                return;
+            }
+            if (ev.isComposing === true) {
+                return;
+            }
+            if (ev.key === "Enter") {
+                ev.preventDefault();
+                await do_search();
+            }
+        });
+    }
+
+    const el_search_query_dashboard = opt_by_id("search_query_dashboard");
+    if (el_search_query_dashboard) {
+        el_search_query_dashboard.addEventListener("keydown", async (ev) => {
             if (!ev) {
                 return;
             }
@@ -1124,6 +1124,16 @@ function init_actions() {
             await do_search();
         });
     }
+
+    const el_search_form_dashboard = opt_by_id("search_form_dashboard");
+    if (el_search_form_dashboard) {
+        el_search_form_dashboard.addEventListener("submit", async (ev) => {
+            if (ev && typeof ev.preventDefault === "function") {
+                ev.preventDefault();
+            }
+            await do_search();
+        });
+    }
 }
 
 function init_iam_rights_wiring() {
@@ -1134,9 +1144,8 @@ function init_iam_rights_wiring() {
         right_publish: "iam_group_right_publish",
         right_local: "iam_group_right_local",
         right_public: "iam_group_right_public",
-        right_admin: "iam_group_right_admin",
+        right_admin: "iam_group_right_admin"
     };
-
     const o_path_map = {
         right_read: "iam_path_right_read",
         right_write: "iam_path_right_write",
@@ -1144,9 +1153,8 @@ function init_iam_rights_wiring() {
         right_publish: "iam_path_right_publish",
         right_local: "iam_path_right_local",
         right_public: "iam_path_right_public",
-        right_admin: "iam_path_right_admin",
+        right_admin: "iam_path_right_admin"
     };
-
     wire_rights_checkboxes(o_group_map, "iam_group_rights_preview");
     wire_rights_checkboxes(o_path_map, "iam_path_rights_preview");
 }
@@ -1167,8 +1175,14 @@ async function main() {
         /* optional checkbox area may be absent */
     }
 
+    sync_search_indicators();
+    set_search_poll_state_all("idle");
+
     await refresh_iam_groups_select();
     await refresh_status();
+    await refresh_peers();
+    await refresh_events();
+
     setInterval(refresh_status, 5000);
 }
 

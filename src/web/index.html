@@ -1,676 +1,631 @@
-<!--==============================================================================================
+<!-- ============================================================================================
 Module name : web_ui
 File        : index.html
 Author      : Marcus Schlieper
-----------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------
 Description
-- Dashboard layout: left sidebar, top header, content views.
-- Search view fix: result_list is rendered under the search card, snippet preview is shown on the right.
-- Provides required DOM anchors for app.js: search_results, snippet_box, doc_title, doc_text.
+- Vollstaendig neu gestaltetes Frontend fuer FileButler by ExpChat.ai.
+- Professionelles Dashboard mit Sidebar, Topbar, KPI Karten, Search Workspace,
+  Peers, Chat, Events und IAM.
+- Nutzt nur die bereits vorhandenen Backend Endpunkte, die in der Vorlage
+  ersichtlich sind.
+- Icons werden lokal als SVG genutzt, damit keine externe Bibliothek noetig ist.
 History
-2026-01-11  Marcus Schlieper  - New layout blueprint: dashboard structure and cards
-2026-01-12  Marcus Schlieper  - Fix: add search_results container and snippet panel (search_results_layout)
-==============================================================================================-->
+2026-05-14  Marcus Schlieper
+- Vollstaendige Neufassung mit moderner Produktoberflaeche
+- Neue intelligente Bedienung mit Command Bar, Hero Bereich und Action Cards
+============================================================================================ -->
 <!DOCTYPE html>
 <html lang="de">
-  <head>
+<head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>ExpChat.ai - Dashboard</title>
+    <title>FileButler by ExpChat.ai</title>
     <link rel="stylesheet" href="/app.css" />
-  </head>
-
-  <body>
+</head>
+<body>
     <div class="app_shell">
-      <!-- Sidebar -->
-      <aside class="sidebar">
-        <div class="sidebar_head">
-          <div class="brand">
-            <div class="brand_title">ExpChat.ai</div>
-            <div class="brand_subtitle">secure_p2p_ext dashboard</div>
-          </div>
+        <aside class="sidebar">
+            <div class="sidebar_top">
+                <div class="brand_wrap">
+                    <div class="brand_logo">FB</div>
+                    <div>
+                        <div class="brand_title">FileButler</div>
+                        <div class="brand_subtitle">by ExpChat.ai</div>
+                    </div>
+                </div>
+
+                <nav class="nav" aria-label="Hauptnavigation">
+                    <button class="nav_item active" data-view="view_dashboard" type="button">
+                        <span class="nav_icon">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h8V3H3v10zm10 8h8V3h-8v18zM3 21h8v-6H3v6z" /></svg>
+                        </span>
+                        <span>Dashboard</span>
+                    </button>
+                    <button class="nav_item" data-view="view_peers" type="button">
+                        <span class="nav_icon">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 11c1.66 0 2.99-1.79 2.99-4S17.66 3 16 3s-3 1.79-3 4 1.34 4 3 4zM8 11c1.66 0 3-1.79 3-4S9.66 3 8 3 5 4.79 5 7s1.34 4 3 4zm0 2c-2.33 0-7 1.17-7 3.5V20h14v-3.5C15 14.17 10.33 13 8 13zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.96 1.97 3.45V20h7v-3.5c0-2.33-4.67-3.5-7-3.5z" /></svg>
+                        </span>
+                        <span>Peers</span>
+                    </button>
+                    <button class="nav_item" data-view="view_chat" type="button">
+                        <span class="nav_icon">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v11H7l-3 3V4zm2 2v7.17L6.17 13H18V6H6z" /></svg>
+                        </span>
+                        <span>Chat</span>
+                    </button>
+                    <button class="nav_item" data-view="view_search" type="button">
+                        <span class="nav_icon">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16a6.47 6.47 0 004.23-1.57l.27.28v.79L20 21.5 21.5 20 15.5 14zM9.5 14A4.5 4.5 0 119.5 5a4.5 4.5 0 010 9z" /></svg>
+                        </span>
+                        <span>Suche</span>
+                    </button>
+                    <button class="nav_item" data-view="view_events" type="button">
+                        <span class="nav_icon">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h4v8H3v-8zm7-10h4v18h-4V3zm7 6h4v12h-4V9z" /></svg>
+                        </span>
+                        <span>Events</span>
+                    </button>
+                    <button class="nav_item" data-view="view_iam" type="button">
+                        <span class="nav_icon">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 1l8 4v6c0 5.55-3.84 10.74-8 12-4.16-1.26-8-6.45-8-12V5l8-4zm0 2.18L6 6v5c0 4.39 2.8 8.58 6 9.82 3.2-1.24 6-5.43 6-9.82V6l-6-2.82z" /></svg>
+                        </span>
+                        <span>IAM</span>
+                    </button>
+                </nav>
+            </div>
+
+            <div class="sidebar_bottom">
+                <div class="company_card">
+                    <div class="company_title">ExpChat.ai</div>
+                    <div class="company_line">Marcus Schlieper</div>
+                    <div class="company_line">Epscheider Str21</div>
+                    <div class="company_line">58339 Breckerfeld</div>
+                    <div class="company_line">Tel: 49 2338 8748862</div>
+                    <div class="company_line">Mobil: 49 15115751864</div>
+                    <div class="company_line">E-Mail: mschlieper@ylook.de</div>
+                </div>
+                <div class="about_card">
+                    Der KI Chat Client fuer den Mittelstand aus Breckerfeld im Sauerland.
+                    RPA, KI Agents, KI Internet Research, KI Wissensmanagement.
+                    Wir bringen KI in den Mittelstand.
+                </div>
+            </div>
+        </aside>
+
+        <div class="main_area">
+            <header class="topbar">
+                <div class="topbar_left">
+                    <div class="status_chip status_off" id="status_badge">offline</div>
+                    <div>
+                        <div class="topbar_title">FileButler Workspace</div>
+                        <div class="topbar_subtitle">P2P Kommunikation, Dokumente, Suche und Rechteverwaltung</div>
+                    </div>
+                </div>
+
+                <div class="topbar_right">
+                    <div class="top_stat">
+                        <div class="top_stat_label">peer_id</div>
+                        <div class="top_stat_value mono" id="st_peer_id">-</div>
+                    </div>
+                    <div class="top_stat">
+                        <div class="top_stat_label">known_peers</div>
+                        <div class="top_stat_value" id="st_known_peers">0</div>
+                    </div>
+                    <div class="top_stat">
+                        <div class="top_stat_label">chat_peer</div>
+                        <div class="top_stat_value mono" id="st_chat_peer">-</div>
+                    </div>
+                    <div class="top_stat">
+                        <div class="top_stat_label">chat_topic</div>
+                        <div class="top_stat_value mono" id="st_chat_topic">-</div>
+                    </div>
+                    <button class="btn btn_primary" id="btn_refresh_status" type="button">
+                        <span class="btn_icon">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.65 6.35A7.95 7.95 0 0012 4V1L7 6l5 5V7a5 5 0 11-5 5H5a7 7 0 107.75-6.95 6.96 6.96 0 014.9 1.3z" /></svg>
+                        </span>
+                        <span>Aktualisieren</span>
+                    </button>
+                </div>
+            </header>
+
+            <main class="content">
+                <section class="view" id="view_dashboard">
+                    <div class="hero_card">
+                        <div class="hero_text">
+                            <div class="hero_badge">Intelligentes Frontend</div>
+                            <h1 class="hero_title">Professionelles Netzwerk Dashboard fuer moderne Dokumentarbeit</h1>
+                            <p class="hero_desc">
+                                Die Oberflaeche verbindet Peer Netzwerk, Suche, Chat, Events und IAM in einer
+                                klaren Produktansicht. Alle Aktionen basieren auf den vorhandenen Backend Endpunkten.
+                            </p>
+                            <div class="hero_actions">
+                                <button class="btn btn_primary" data-go-view="view_search" type="button">
+                                    <span class="btn_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16a6.47 6.47 0 004.23-1.57l.27.28v.79L20 21.5 21.5 20 15.5 14z" /></svg>
+                                    </span>
+                                    <span>Zur Suche</span>
+                                </button>
+                                <button class="btn btn_soft" data-go-view="view_peers" type="button">
+                                    <span class="btn_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 11c1.66 0 2.99-1.79 2.99-4S17.66 3 16 3s-3 1.79-3 4 1.34 4 3 4zM8 11c1.66 0 3-1.79 3-4S9.66 3 8 3 5 4.79 5 7s1.34 4 3 4zm0 2c-2.33 0-7 1.17-7 3.5V20h14v-3.5C15 14.17 10.33 13 8 13z" /></svg>
+                                    </span>
+                                    <span>Peers oeffnen</span>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="hero_visual">
+                            <div class="orb orb_a"></div>
+                            <div class="orb orb_b"></div>
+                            <div class="hero_panel">
+                                <div class="hero_panel_row">
+                                    <span>Suche</span>
+                                    <span class="hero_panel_value" id="search_poll_state_dashboard">idle</span>
+                                </div>
+                                <div class="hero_panel_row">
+                                    <span>Search ID</span>
+                                    <span class="hero_panel_value mono" id="search_id_dashboard">-</span>
+                                </div>
+                                <div class="hero_panel_row">
+                                    <span>Session</span>
+                                    <span class="hero_panel_value mono" id="iam_session_dashboard">-</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="stats_grid">
+                        <div class="stat_card">
+                            <div class="stat_icon">
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 11c1.66 0 2.99-1.79 2.99-4S17.66 3 16 3s-3 1.79-3 4 1.34 4 3 4zM8 11c1.66 0 3-1.79 3-4S9.66 3 8 3 5 4.79 5 7s1.34 4 3 4zm0 2c-2.33 0-7 1.17-7 3.5V20h14v-3.5C15 14.17 10.33 13 8 13z" /></svg>
+                            </div>
+                            <div class="stat_content">
+                                <div class="stat_label">Peers bekannt</div>
+                                <div class="stat_value" id="st_known_peers_2">0</div>
+                            </div>
+                        </div>
+
+                        <div class="stat_card">
+                            <div class="stat_icon">
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v11H7l-3 3V4z" /></svg>
+                            </div>
+                            <div class="stat_content">
+                                <div class="stat_label">Aktiver Chat Peer</div>
+                                <div class="stat_value mono" id="st_chat_peer_2">-</div>
+                            </div>
+                        </div>
+
+                        <div class="stat_card">
+                            <div class="stat_icon">
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h4v8H3v-8zm7-10h4v18h-4V3zm7 6h4v12h-4V9z" /></svg>
+                            </div>
+                            <div class="stat_content">
+                                <div class="stat_label">Event Feed</div>
+                                <div class="stat_value">diagnostic</div>
+                            </div>
+                        </div>
+
+                        <div class="stat_card">
+                            <div class="stat_icon">
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 1l8 4v6c0 5.55-3.84 10.74-8 12-4.16-1.26-8-6.45-8-12V5l8-4z" /></svg>
+                            </div>
+                            <div class="stat_content">
+                                <div class="stat_label">IAM Session</div>
+                                <div class="stat_value mono" id="iam_session_2">-</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="dashboard_grid">
+                        <section class="card card_glass">
+                            <div class="card_head">
+                                <div class="card_title_wrap">
+                                    <div class="section_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16a6.47 6.47 0 004.23-1.57l.27.28v.79L20 21.5 21.5 20 15.5 14z" /></svg>
+                                    </div>
+                                    <div>
+                                        <div class="card_title">Quick Search</div>
+                                        <div class="card_subtitle">Netzwerkweite Suche mit direkter Vorschau</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card_body">
+                                <form id="search_form_dashboard" class="stack gap_12" autocomplete="off">
+                                    <input class="input" id="search_query_dashboard" type="text" placeholder="Nach Wissen, Dokumenten oder Inhalten suchen" />
+                                    <div class="row_wrap">
+                                        <input class="input input_small" id="search_limit_dashboard" type="number" min="1" max="50" value="10" />
+                                        <button class="btn btn_primary" id="btn_search_dashboard" type="submit">
+                                            <span class="btn_icon">
+                                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16a6.47 6.47 0 004.23-1.57l.27.28v.79L20 21.5 21.5 20 15.5 14z" /></svg>
+                                            </span>
+                                            <span>Suchen</span>
+                                        </button>
+                                        <button class="btn btn_soft" id="btn_search_clear_dashboard" type="button">Leeren</button>
+                                    </div>
+                                </form>
+                                <div class="mini_info">
+                                    Search ID: <span class="mono" id="search_id_dash_inline">-</span>
+                                </div>
+                            </div>
+                        </section>
+
+                        <section class="card">
+                            <div class="card_head">
+                                <div class="card_title_wrap">
+                                    <div class="section_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v11H7l-3 3V4z" /></svg>
+                                    </div>
+                                    <div>
+                                        <div class="card_title">Quick Chat</div>
+                                        <div class="card_subtitle">Direkter Versand an den aktiven Peer</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card_body">
+                                <textarea class="textarea" id="send_text_dashboard" rows="4" placeholder="Kurznachricht an den aktiven Peer"></textarea>
+                            </div>
+                            <div class="card_foot">
+                                <button class="btn btn_primary" id="btn_send_text_dashboard" type="button">
+                                    <span class="btn_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 21l21-9L2 3v7l15 2-15 2v7z" /></svg>
+                                    </span>
+                                    <span>Senden</span>
+                                </button>
+                                <button class="btn btn_soft" id="btn_send_text_dashboard_clear" type="button">Leeren</button>
+                            </div>
+                        </section>
+                    </div>
+                </section>
+
+                <section class="view hidden" id="view_peers">
+                    <div class="page_head">
+                        <div>
+                            <div class="page_eyebrow">Peer Network</div>
+                            <h2 class="page_title">Bekannte Peers und Verbindung</h2>
+                        </div>
+                        <div class="row_wrap">
+                            <button class="btn btn_primary" id="btn_refresh_peers" type="button">
+                                <span class="btn_icon">
+                                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.65 6.35A7.95 7.95 0 0012 4V1L7 6l5 5V7a5 5 0 11-5 5H5a7 7 0 107.75-6.95 6.96 6.96 0 014.9 1.3z" /></svg>
+                                </span>
+                                <span>Peers laden</span>
+                            </button>
+                            <button class="btn btn_soft" id="btn_copy_local_peer_id" type="button">Peer ID kopieren</button>
+                        </div>
+                    </div>
+
+                    <div class="panel_grid">
+                        <section class="card">
+                            <div class="card_head">
+                                <div class="card_title_wrap">
+                                    <div class="section_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 11c1.66 0 2.99-1.79 2.99-4S17.66 3 16 3s-3 1.79-3 4 1.34 4 3 4zM8 11c1.66 0 3-1.79 3-4S9.66 3 8 3 5 4.79 5 7s1.34 4 3 4zm0 2c-2.33 0-7 1.17-7 3.5V20h14v-3.5C15 14.17 10.33 13 8 13z" /></svg>
+                                    </div>
+                                    <div>
+                                        <div class="card_title">Peer Liste</div>
+                                        <div class="card_subtitle">Online Status und Direktaktion</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card_body">
+                                <div class="table_wrap">
+                                    <table class="table">
+                                        <thead>
+                                            <tr>
+                                                <th>Peer ID</th>
+                                                <th>Online</th>
+                                                <th>Aktion</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="peers_table"></tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </section>
+
+                        <section class="card card_glass">
+                            <div class="card_head">
+                                <div class="card_title_wrap">
+                                    <div class="section_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 11h-6V5h-2v6H5v2h6v6h2v-6h6z" /></svg>
+                                    </div>
+                                    <div>
+                                        <div class="card_title">Manuell verbinden</div>
+                                        <div class="card_subtitle">Direkte Auswahl eines Ziel Peers</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card_body stack gap_12">
+                                <input class="input mono" id="connect_peer_id" type="text" placeholder="Peer ID eingeben" autocomplete="off" />
+                                <button class="btn btn_primary" id="btn_connect" type="button">
+                                    <span class="btn_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l4 4h-3v5h-2V6H8l4-4zm-7 9h2v7h10v-7h2v9H5v-9z" /></svg>
+                                    </span>
+                                    <span>Verbinden</span>
+                                </button>
+                                <div class="info_box">
+                                    Die Verbindung setzt den aktuellen Chat Peer und das Chat Topic im Node Zustand.
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+                </section>
+
+                <section class="view hidden" id="view_chat">
+                    <div class="page_head">
+                        <div>
+                            <div class="page_eyebrow">Direct Messaging</div>
+                            <h2 class="page_title">P2P Textversand</h2>
+                        </div>
+                    </div>
+
+                    <section class="card">
+                        <div class="card_head">
+                            <div class="card_title_wrap">
+                                <div class="section_icon">
+                                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v11H7l-3 3V4z" /></svg>
+                                </div>
+                                <div>
+                                    <div class="card_title">Nachricht verfassen</div>
+                                    <div class="card_subtitle">Sicherer Versand an den aktiven Chat Kanal</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card_body">
+                            <textarea class="textarea textarea_big" id="send_text" rows="8" placeholder="Nachricht eingeben"></textarea>
+                        </div>
+                        <div class="card_foot">
+                            <button class="btn btn_primary" id="btn_send_text" type="button">
+                                <span class="btn_icon">
+                                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 21l21-9L2 3v7l15 2-15 2v7z" /></svg>
+                                </span>
+                                <span>Senden</span>
+                            </button>
+                            <button class="btn btn_soft" id="btn_send_text_clear" type="button">Leeren</button>
+                        </div>
+                        <div class="card_note">
+                            Sending requires an active chat topic; connect to a peer first.
+                        </div>
+                    </section>
+                </section>
+
+                <section class="view hidden" id="view_search">
+                    <div class="page_head">
+                        <div>
+                            <div class="page_eyebrow">Knowledge Access</div>
+                            <h2 class="page_title">Netzwerk Kombi Suche</h2>
+                        </div>
+                        <div class="row_wrap">
+                            <button class="btn btn_soft" id="btn_search_poll_once" type="button">Poll Once</button>
+                            <button class="btn btn_soft" id="btn_search_stop_poll" type="button">Stop Poll</button>
+                        </div>
+                    </div>
+
+                    <section class="card card_glass">
+                        <div class="card_body">
+                            <div class="search_toolbar">
+                                <div class="field_group">
+                                    <label class="field_label" for="search_mode">Mode</label>
+                                    <select class="select" id="search_mode">
+                                        <option value="combi" selected>combi</option>
+                                    </select>
+                                </div>
+                                <div class="field_group">
+                                    <label class="field_label" for="search_limit">Limit</label>
+                                    <input class="input input_small" id="search_limit" type="number" min="1" max="50" value="10" />
+                                </div>
+                                <div class="field_group field_group_grow">
+                                    <label class="field_label" for="search_query">Query</label>
+                                    <input class="input" id="search_query" type="text" placeholder="Was soll gefunden werden?" autocomplete="off" />
+                                </div>
+                                <div class="search_actions">
+                                    <button class="btn btn_primary" id="btn_search" type="submit">
+                                        <span class="btn_icon">
+                                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16a6.47 6.47 0 004.23-1.57l.27.28v.79L20 21.5 21.5 20 15.5 14z" /></svg>
+                                        </span>
+                                        <span>Suchen</span>
+                                    </button>
+                                    <button class="btn btn_soft" id="btn_search_clear" type="button">Leeren</button>
+                                </div>
+                            </div>
+                            <form id="search_form" class="hidden"></form>
+                            <div class="status_line">
+                                <span>search_id: <strong class="mono" id="search_id">-</strong></span>
+                                <span>poll_state: <strong class="mono" id="search_poll_state">idle</strong></span>
+                            </div>
+                        </div>
+                    </section>
+
+                    <div class="search_layout">
+                        <section class="card">
+                            <div class="card_head">
+                                <div class="card_title_wrap">
+                                    <div class="section_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v2H5zm0 6h14v2H5zm0 6h10v2H5z" /></svg>
+                                    </div>
+                                    <div>
+                                        <div class="card_title">Ergebnisse</div>
+                                        <div class="card_subtitle">Treffer aus dem Netzwerk</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card_body">
+                                <div id="search_results"></div>
+                            </div>
+                        </section>
+
+                        <section class="card">
+                            <div class="card_head row_space">
+                                <div class="card_title_wrap">
+                                    <div class="section_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2h9l5 5v15H6V2zm8 1.5V8h4.5L14 3.5z" /></svg>
+                                    </div>
+                                    <div>
+                                        <div class="card_title">Dokumentansicht</div>
+                                        <div class="card_subtitle">Text oder Datei Vorschau</div>
+                                    </div>
+                                </div>
+                                <button class="btn btn_soft btn_small" id="btn_doc_clear" type="button">Clear</button>
+                            </div>
+                            <div class="card_body">
+                                <div class="doc_title mono" id="doc_title">-</div>
+                                <div id="doc_text_wrap">
+                                    <pre class="doc_pre" id="doc_text"></pre>
+                                </div>
+                                <div id="doc_preview_wrap" class="hidden">
+                                    <iframe id="doc_file_preview" title="document_preview"></iframe>
+                                </div>
+                                <div class="info_box">
+                                    PDF wird direkt angezeigt. Andere Dateien werden heruntergeladen, waehrend Text separat geladen wird.
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+                </section>
+
+                <section class="view hidden" id="view_events">
+                    <div class="page_head">
+                        <div>
+                            <div class="page_eyebrow">Diagnostics</div>
+                            <h2 class="page_title">Event Ring</h2>
+                        </div>
+                        <div class="row_wrap">
+                            <button class="btn btn_primary" id="btn_refresh_events" type="button">
+                                <span class="btn_icon">
+                                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.65 6.35A7.95 7.95 0 0012 4V1L7 6l5 5V7a5 5 0 11-5 5H5a7 7 0 107.75-6.95 6.96 6.96 0 014.9 1.3z" /></svg>
+                                </span>
+                                <span>Refresh</span>
+                            </button>
+                            <button class="btn btn_soft" id="btn_clear_events_box" type="button">Clear</button>
+                        </div>
+                    </div>
+
+                    <section class="card">
+                        <div class="card_body">
+                            <pre class="events" id="events_box"></pre>
+                            <div class="info_box">
+                                The event ring is a diagnostic channel; it is not a strict result channel.
+                            </div>
+                        </div>
+                    </section>
+                </section>
+
+                <section class="view hidden" id="view_iam">
+                    <div class="page_head">
+                        <div>
+                            <div class="page_eyebrow">Identity and Access</div>
+                            <h2 class="page_title">IAM Verwaltung</h2>
+                        </div>
+                    </div>
+
+                    <div class="iam_grid">
+                        <section class="card">
+                            <div class="card_head">
+                                <div class="card_title_wrap">
+                                    <div class="section_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12c2.76 0 5-2.69 5-6s-2.24-6-5-6-5 2.69-5 6 2.24 6 5 6zm0 2c-4.42 0-8 2.24-8 5v3h16v-3c0-2.76-3.58-5-8-5z" /></svg>
+                                    </div>
+                                    <div>
+                                        <div class="card_title">Login</div>
+                                        <div class="card_subtitle">Lokale Sitzung fuer IAM Aktionen</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card_body stack gap_12">
+                                <input class="input" id="iam_login_user" type="text" placeholder="User" autocomplete="username" />
+                                <input class="input" id="iam_login_pass" type="password" placeholder="Password" autocomplete="current-password" />
+                                <button class="btn btn_primary" id="btn_iam_login" type="button">Login</button>
+                                <div class="mini_info">session: <span class="mono" id="iam_session">-</span></div>
+                            </div>
+                        </section>
+
+                        <section class="card card_glass">
+                            <div class="card_head">
+                                <div class="card_title_wrap">
+                                    <div class="section_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 11h-6V5h-2v6H5v2h6v6h2v-6h6z" /></svg>
+                                    </div>
+                                    <div>
+                                        <div class="card_title">Group Add</div>
+                                        <div class="card_subtitle">Gruppe und Rechte definieren</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card_body stack gap_12">
+                                <input class="input" id="iam_group" type="text" placeholder="Group" autocomplete="off" />
+                                <div class="rights_grid">
+                                    <label><input type="checkbox" id="iam_group_right_read" /> read</label>
+                                    <label><input type="checkbox" id="iam_group_right_write" /> write</label>
+                                    <label><input type="checkbox" id="iam_group_right_create" /> create</label>
+                                    <label><input type="checkbox" id="iam_group_right_publish" /> publish</label>
+                                    <label><input type="checkbox" id="iam_group_right_local" /> local</label>
+                                    <label><input type="checkbox" id="iam_group_right_public" /> public</label>
+                                    <label><input type="checkbox" id="iam_group_right_admin" /> admin</label>
+                                </div>
+                                <div class="mini_info">rights_mask_dec: <span class="mono" id="iam_group_rights_preview">0</span></div>
+                                <button class="btn btn_primary" id="btn_iam_group_add" type="button">Add Group</button>
+                            </div>
+                        </section>
+
+                        <section class="card">
+                            <div class="card_head">
+                                <div class="card_title_wrap">
+                                    <div class="section_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm-8 0c2.21 0 4-1.79 4-4S9.21 4 7 4 3 5.79 3 8s1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h12v-2c0-2.66-5.33-4-8-4zm8 0c-.29 0-.62.02-.97.05C15.24 14.79 16 15.83 16 17v3h8v-2c0-2.66-5.33-4-8-4z" /></svg>
+                                    </div>
+                                    <div>
+                                        <div class="card_title">User Add</div>
+                                        <div class="card_subtitle">User einer Gruppe zuordnen</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card_body stack gap_12">
+                                <input class="input" id="iam_user" type="text" placeholder="User" autocomplete="off" />
+                                <input class="input" id="iam_user_pass" type="password" placeholder="Password" autocomplete="new-password" />
+                                <select class="select" id="iam_user_group_select"></select>
+                                <button class="btn btn_primary" id="btn_iam_user_add" type="button">Add User</button>
+                            </div>
+                        </section>
+
+                        <section class="card">
+                            <div class="card_head">
+                                <div class="card_title_wrap">
+                                    <div class="section_icon">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4H4v16h16V8h-8zM8 2h8l6 6v14H2V2h6z" /></svg>
+                                    </div>
+                                    <div>
+                                        <div class="card_title">Path Add</div>
+                                        <div class="card_subtitle">Pfad, Gruppe und Rechte setzen</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card_body stack gap_12">
+                                <input class="input" id="iam_path" type="text" placeholder="Path" autocomplete="off" />
+                                <input class="input" id="iam_path_group" type="text" placeholder="Group or -" autocomplete="off" />
+                                <select class="select" id="iam_path_public">
+                                    <option value="true">public=true</option>
+                                    <option value="false">public=false</option>
+                                </select>
+                                <div class="rights_grid">
+                                    <label><input type="checkbox" id="iam_path_right_read" /> read</label>
+                                    <label><input type="checkbox" id="iam_path_right_write" /> write</label>
+                                    <label><input type="checkbox" id="iam_path_right_create" /> create</label>
+                                    <label><input type="checkbox" id="iam_path_right_publish" /> publish</label>
+                                    <label><input type="checkbox" id="iam_path_right_local" /> local</label>
+                                    <label><input type="checkbox" id="iam_path_right_public" /> public</label>
+                                    <label><input type="checkbox" id="iam_path_right_admin" /> admin</label>
+                                </div>
+                                <div class="mini_info">rights_mask_dec: <span class="mono" id="iam_path_rights_preview">0</span></div>
+                                <button class="btn btn_primary" id="btn_iam_path_add" type="button">Add Path</button>
+                            </div>
+                        </section>
+                    </div>
+                </section>
+            </main>
+
+            <div id="toast" class="toast hidden"></div>
         </div>
-
-        <nav class="nav">
-          <button class="nav_item active" data-view="view_status" type="button">
-            status
-          </button>
-          <button class="nav_item" data-view="view_peers" type="button">
-            peers
-          </button>
-          <button class="nav_item" data-view="view_events" type="button">
-            events
-          </button>
-          <button class="nav_item" data-view="view_p2p" type="button">
-            p2p
-          </button>
-          <button class="nav_item" data-view="view_search" type="button">
-            search
-          </button>
-          <button class="nav_item" data-view="view_iam" type="button">
-            iam
-          </button>
-        </nav>
-
-        <div class="sidebar_footer">
-          <div class="info_block">
-            <div class="info_title">company</div>
-            <div class="info_line">ExpChat.ai</div>
-            <div class="info_line">Epscheider Str21</div>
-            <div class="info_line">58339 Breckerfeld</div>
-            <div class="info_line">Sauerland</div>
-          </div>
-
-          <div class="info_block">
-            <div class="info_title">contact</div>
-            <div class="info_line">email: mschlieper@ylook.de</div>
-            <div class="info_line">phone: +49 2338 8748862</div>
-            <div class="info_line">mobile: +49 15115751864</div>
-          </div>
-
-          <div class="info_block">
-            <div class="info_title">about</div>
-            <div class="info_line">
-              Der KI Chat Client fuer den Mittelstand aus Breckerfeld im
-              Sauerland. RPA, KI Agents, KI Internet Research, KI
-              Wissensmanagement. Wir bringen KI in den Mittelstand.
-            </div>
-          </div>
-        </div>
-      </aside>
-
-      <!-- Main -->
-      <div class="main_area">
-        <!-- Header -->
-        <header class="topbar">
-          <div class="topbar_left">
-            <div class="badge badge_off" id="status_badge">offline</div>
-            <div class="topbar_title">ExpChat.ai - Control Panel</div>
-          </div>
-
-          <div class="topbar_kv">
-            <div class="kv">
-              <div class="k">node_peer_id</div>
-              <div class="v mono" id="st_peer_id">-</div>
-            </div>
-            <div class="kv">
-              <div class="k">known_peers</div>
-              <div class="v" id="st_known_peers">0</div>
-            </div>
-            <div class="kv">
-              <div class="k">chat_peer</div>
-              <div class="v mono" id="st_chat_peer">-</div>
-            </div>
-            <div class="kv">
-              <div class="k">chat_topic</div>
-              <div class="v mono" id="st_chat_topic">-</div>
-            </div>
-          </div>
-
-          <div class="topbar_actions">
-            <button class="btn small" id="btn_refresh_status" type="button">
-              refresh
-            </button>
-          </div>
-        </header>
-
-        <!-- Content -->
-        <main class="content">
-          <section class="view" id="view_status">
-            <div class="view_head">
-              <div class="view_title">status</div>
-            </div>
-
-            <div class="grid">
-              <div class="card">
-                <div class="card_head">
-                  <div class="card_title">node overview</div>
-                </div>
-                <div class="card_body">
-                  <div class="kv_grid">
-                    <div class="kv">
-                      <div class="k">peer_id</div>
-                      <div class="v mono" id="st_peer_id_2">-</div>
-                    </div>
-                    <div class="kv">
-                      <div class="k">known_peers</div>
-                      <div class="v" id="st_known_peers_2">0</div>
-                    </div>
-                    <div class="kv">
-                      <div class="k">chat_peer</div>
-                      <div class="v mono" id="st_chat_peer_2">-</div>
-                    </div>
-                    <div class="kv">
-                      <div class="k">chat_topic</div>
-                      <div class="v mono" id="st_chat_topic_2">-</div>
-                    </div>
-                  </div>
-                </div>
-                <div class="card_foot">
-                  <button class="btn" id="btn_status_refresh" type="button">
-                    refresh_status
-                  </button>
-                  <button
-                    class="btn secondary"
-                    id="btn_events_refresh_from_status"
-                    type="button"
-                  >
-                    refresh_events
-                  </button>
-                </div>
-              </div>
-
-              <div class="card">
-                <div class="card_head">
-                  <div class="card_title">description</div>
-                </div>
-                <div class="card_body">
-                  <div class="p">
-                    Der KI Chat Client fuer den Mittelstand aus Breckerfeld im
-                    Sauerland. RPA, KI Agents, KI Internet Research, KI
-                    Wissensmanagement. Wir bringen KI in den Mittelstand.
-                  </div>
-                </div>
-              </div>
-            </div>
-          </section>
-
-          <section class="view hidden" id="view_peers">
-            <div class="view_head">
-              <div class="view_title">peers</div>
-            </div>
-
-            <div class="grid">
-              <div class="card">
-                <div class="card_head row_space">
-                  <div class="card_title">known peers</div>
-                  <div class="row">
-                    <button
-                      class="btn small"
-                      id="btn_refresh_peers"
-                      type="button"
-                    >
-                      refresh_peers
-                    </button>
-                    <button
-                      class="btn small secondary"
-                      id="btn_copy_local_peer_id"
-                      type="button"
-                    >
-                      copy_local_peer_id
-                    </button>
-                  </div>
-                </div>
-                <div class="card_body">
-                  <div class="table_wrap">
-                    <table class="table">
-                      <thead>
-                        <tr>
-                          <th>peer_id</th>
-                          <th>online</th>
-                          <th>action</th>
-                        </tr>
-                      </thead>
-                      <tbody id="peers_table"></tbody>
-                    </table>
-                  </div>
-                </div>
-              </div>
-
-              <div class="card">
-                <div class="card_head">
-                  <div class="card_title">manual connect</div>
-                </div>
-                <div class="card_body">
-                  <div class="row">
-                    <input
-                      class="input mono"
-                      id="connect_peer_id"
-                      type="text"
-                      placeholder="peer_id"
-                      autocomplete="off"
-                    />
-                    <button class="btn" id="btn_connect" type="button">
-                      connect
-                    </button>
-                  </div>
-                  <div class="hint">
-                    The connect operation sets the current chat peer and chat
-                    topic in the node state.
-                  </div>
-                </div>
-              </div>
-            </div>
-          </section>
-
-          <section class="view hidden" id="view_events">
-            <div class="view_head">
-              <div class="view_title">events</div>
-            </div>
-
-            <div class="grid">
-              <div class="card">
-                <div class="card_head row_space">
-                  <div class="card_title">event ring (diagnostics)</div>
-                  <div class="row">
-                    <button
-                      class="btn small"
-                      id="btn_refresh_events"
-                      type="button"
-                    >
-                      refresh_events
-                    </button>
-                    <button
-                      class="btn small secondary"
-                      id="btn_clear_events_box"
-                      type="button"
-                    >
-                      clear_view
-                    </button>
-                  </div>
-                </div>
-                <div class="card_body">
-                  <pre class="events" id="events_box"></pre>
-                  <div class="hint">
-                    The event ring is a diagnostic channel; it is not a strict
-                    result channel.
-                  </div>
-                </div>
-              </div>
-            </div>
-          </section>
-
-          <section class="view hidden" id="view_p2p">
-            <div class="view_head">
-              <div class="view_title">p2p</div>
-            </div>
-
-            <div class="grid">
-              <div class="card">
-                <div class="card_head">
-                  <div class="card_title">send text</div>
-                </div>
-                <div class="card_body">
-                  <textarea
-                    class="textarea"
-                    id="send_text"
-                    rows="4"
-                    placeholder="message"
-                  ></textarea>
-                </div>
-                <div class="card_foot">
-                  <button class="btn" id="btn_send_text" type="button">
-                    send
-                  </button>
-                  <button
-                    class="btn secondary"
-                    id="btn_send_text_clear"
-                    type="button"
-                  >
-                    clear
-                  </button>
-                </div>
-                <div class="card_note">
-                  Sending requires an active chat topic; connect to a peer
-                  first.
-                </div>
-              </div>
-            </div>
-          </section>
-
-          <section class="view hidden" id="view_search">
-            <div class="view_head">
-              <div class="view_title">search</div>
-            </div>
-
-            <div class="grid">
-              <div class="card">
-                <div class="card_head">
-                  <div class="card_title">network combi search</div>
-                </div>
-
-                <div class="card_body">
-                  <div class="kv_grid">
-                    <div class="kv">
-                      <div class="k">mode</div>
-                      <div class="v">
-                        <select class="select" id="search_mode">
-                          <option value="combi" selected>
-                            combi (network)
-                          </option>
-                        </select>
-                      </div>
-                    </div>
-
-                    <div class="kv">
-                      <div class="k">limit</div>
-                      <div class="v">
-                        <input
-                          class="input"
-                          id="search_limit"
-                          type="number"
-                          min="1"
-                          max="50"
-                          value="10"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  <form id="search_form" class="row" autocomplete="off">
-                    <input
-                      class="input"
-                      id="search_query"
-                      type="text"
-                      placeholder="query"
-                      autocomplete="off"
-                      inputmode="text"
-                    />
-                    <button class="btn" id="btn_search" type="submit">
-                      search
-                    </button>
-                    <button
-                      class="btn secondary"
-                      id="btn_search_clear"
-                      type="button"
-                    >
-                      clear
-                    </button>
-                  </form>
-
-                  <div class="kv_grid">
-                    <div class="kv">
-                      <div class="k">search_id</div>
-                      <div class="v mono" id="search_id">-</div>
-                    </div>
-                    <div class="kv">
-                      <div class="k">poll_state</div>
-                      <div class="v mono" id="search_poll_state">idle</div>
-                    </div>
-                  </div>
-
-                  <!-- FIX: result list under search + right side snippet preview -->
-                  <div class="search_results_layout" style="margin-top: 12px">
-                      <div class="search_results_left">
-                          <div class="card" style="margin: 0">
-                              <div class="card_head row_space">
-                                  <div class="card_title">result_list</div>
-                                  <div class="row">
-                                      <button class="btn small secondary"
-                                              id="btn_search_poll_once"
-                                              type="button">
-                                          poll_once
-                                      </button>
-                                      <button class="btn small secondary"
-                                              id="btn_search_stop_poll"
-                                              type="button">
-                                          stop_poll
-                                      </button>
-                                  </div>
-                              </div>
-                              <div class="card_body">
-                                  <!-- Required by app.js -->
-                                  <div id="search_results"></div>
-                                  <div class="hint">
-                                      Click a hit to fetch full document text.
-                                  </div>
-                              </div>
-                          </div>
-                      </div>
-
-                      
-                      <div class="search_results_right">
-                          <div class="card">
-                              <div class="card_head row_space">
-                                  <div class="card_title">document</div>
-                                  <div class="row">
-                                      <div class="mono" id="doc_title">-</div>
-                                      <button class="btn small secondary" id="btn_doc_clear" type="button">
-                                          clear
-                                      </button>
-                                  </div>
-                              </div>
-                              <div class="card_body">
-                                  <div id="doc_text_wrap">
-                                      <pre class="events" id="doc_text"></pre>
-                                      <div class="hint">
-                                          Click a search hit to load and display the extracted document text from
-                                          local or remote peer.
-                                      </div>
-                                  </div>
-
-                                  <div id="doc_preview_wrap" class="hidden">
-                                      <div class="card" style="margin-top: 12px">
-                                          <div class="card_head row_space">
-                                              <div class="card_title">document_preview</div>
-                                              <div class="muted">pdf_inline_view</div>
-                                          </div>
-                                          <div class="card_body">
-                                              <iframe id="doc_file_preview"
-                                                      title="document_preview"
-                                                      style="width: 100%; min-height: 480px; border: 1px solid #ccc; background: #fff;"></iframe>
-                                              <div class="hint">
-                                                  If a document cannot be shown here, it is downloaded automatically.
-                                              </div>
-                                          </div>
-                                      </div>
-                                  </div>
-                              </div>
-                          </div>
-                      </div>
-
-
-                  </div>
-                </div>
-              </div>
-            </div>
-          </section>
-
-          <section class="view hidden" id="view_iam">
-            <div class="view_head">
-              <div class="view_title">iam</div>
-            </div>
-
-            <div class="grid">
-              <div class="card">
-                <div class="card_head">
-                  <div class="card_title">login (local)</div>
-                </div>
-                <div class="card_body">
-                  <div class="row">
-                    <input
-                      class="input"
-                      id="iam_login_user"
-                      type="text"
-                      placeholder="user"
-                      autocomplete="username"
-                    />
-                    <input
-                      class="input"
-                      id="iam_login_pass"
-                      type="password"
-                      placeholder="password"
-                      autocomplete="current-password"
-                    />
-                    <button class="btn" id="btn_iam_login" type="button">
-                      login
-                    </button>
-                  </div>
-                  <div class="kv">
-                    <div class="k">session</div>
-                    <div class="v mono" id="iam_session">-</div>
-                  </div>
-                  <div class="hint">
-                    The session is stored only in the node process; the UI shows
-                    it for diagnostics.
-                  </div>
-                </div>
-              </div>
-
-              <div class="card">
-                <div class="card_head">
-                  <div class="card_title">group add</div>
-                </div>
-                <div class="card_body">
-                  <div class="row">
-                    <input
-                      class="input"
-                      id="iam_group"
-                      type="text"
-                      placeholder="group"
-                      autocomplete="off"
-                    />
-                  </div>
-
-                  <div class="kv_grid" style="margin-top: 10px">
-                    <label class="row"
-                      ><input type="checkbox" id="iam_group_right_read" />
-                      read</label
-                    >
-                    <label class="row"
-                      ><input type="checkbox" id="iam_group_right_write" />
-                      write</label
-                    >
-                    <label class="row"
-                      ><input type="checkbox" id="iam_group_right_create" />
-                      create</label
-                    >
-                    <label class="row"
-                      ><input type="checkbox" id="iam_group_right_publish" />
-                      publish</label
-                    >
-                    <label class="row"
-                      ><input type="checkbox" id="iam_group_right_local" />
-                      local</label
-                    >
-                    <label class="row"
-                      ><input type="checkbox" id="iam_group_right_public" />
-                      public</label
-                    >
-                    <label class="row"
-                      ><input type="checkbox" id="iam_group_right_admin" />
-                      admin</label
-                    >
-                  </div>
-
-                  <div class="kv" style="margin-top: 10px">
-                    <div class="k">rights_mask_dec</div>
-                    <div class="v mono" id="iam_group_rights_preview">0</div>
-                  </div>
-
-                  <div class="row" style="margin-top: 10px">
-                    <button class="btn" id="btn_iam_group_add" type="button">
-                      add
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              <div class="card">
-                <div class="card_head">
-                  <div class="card_title">user add</div>
-                </div>
-                <div class="card_body">
-                  <div class="row">
-                    <input
-                      class="input"
-                      id="iam_user"
-                      type="text"
-                      placeholder="user"
-                      autocomplete="off"
-                    />
-                    <input
-                      class="input"
-                      id="iam_user_pass"
-                      type="password"
-                      placeholder="password"
-                      autocomplete="new-password"
-                    />
-                    <select class="select" id="iam_user_group_select"></select>
-                    <button class="btn" id="btn_iam_user_add" type="button">
-                      add
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              <div class="card">
-                <div class="card_head">
-                  <div class="card_title">path add</div>
-                </div>
-                <div class="card_body">
-                  <div class="row">
-                    <input
-                      class="input"
-                      id="iam_path"
-                      type="text"
-                      placeholder="path"
-                      autocomplete="off"
-                    />
-                    <input
-                      class="input"
-                      id="iam_path_group"
-                      type="text"
-                      placeholder="group or -"
-                      autocomplete="off"
-                    />
-                  </div>
-
-                  <div class="row" style="margin-top: 10px">
-                    <select class="select" id="iam_path_public">
-                      <option value="true">public=true</option>
-                      <option value="false">public=false</option>
-                    </select>
-                    <button class="btn" id="btn_iam_path_add" type="button">
-                      add
-                    </button>
-                  </div>
-
-                  <div class="kv_grid" style="margin-top: 10px">
-                    <label class="row"
-                      ><input type="checkbox" id="iam_path_right_read" />
-                      read</label
-                    >
-                    <label class="row"
-                      ><input type="checkbox" id="iam_path_right_write" />
-                      write</label
-                    >
-                    <label class="row"
-                      ><input type="checkbox" id="iam_path_right_create" />
-                      create</label
-                    >
-                    <label class="row"
-                      ><input type="checkbox" id="iam_path_right_publish" />
-                      publish</label
-                    >
-                    <label class="row"
-                      ><input type="checkbox" id="iam_path_right_local" />
-                      local</label
-                    >
-                    <label class="row"
-                      ><input type="checkbox" id="iam_path_right_public" />
-                      public</label
-                    >
-                    <label class="row"
-                      ><input type="checkbox" id="iam_path_right_admin" />
-                      admin</label
-                    >
-                  </div>
-
-                  <div class="kv" style="margin-top: 10px">
-                    <div class="k">rights_mask_dec</div>
-                    <div class="v mono" id="iam_path_rights_preview">0</div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </section>
-        </main>
-
-        <div id="toast" class="toast hidden"></div>
-      </div>
     </div>
-
     <script src="/app.js"></script>
-  </body>
+</body>
 </html>

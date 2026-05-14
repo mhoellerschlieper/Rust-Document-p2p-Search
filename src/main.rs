@@ -23,6 +23,8 @@
 #![allow(clippy::needless_return)]
 #![allow(warnings)]
 
+pub mod webdav_gateway;
+
 /* ===================================== Imports =========================================== */
 use aes_gcm_siv::{
     aead::{Aead, KeyInit, OsRng},
@@ -58,8 +60,6 @@ use tokio::{
 use tracing_subscriber::{fmt, EnvFilter};
 
 use base64::Engine;
-
-mod webdav_gateway;
 use crate::webdav_gateway::{run_webdav_server, WebDavEntry, WebDavGateway};
 
 /* --- Tantivy ------------------------------------------------------------------------------ */

@@ -593,7 +593,7 @@ impl WebDavGateway {
             let mut v_out: Vec<WebDavEntry> = Vec::with_capacity(v_src.len());
 
             for e in v_src {
-                if !self.check_read_access(o_session, &e.s_name)? { // <== ACHTUNG zurzeit keine Prüfung der Zugriffs berechtigung
+                if !self.check_read_access(o_session, &e.s_name)? { 
                     println!(
                         "webdav dbg: list_entries local access_denied file={}",
                         e.s_name
