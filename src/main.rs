@@ -62,7 +62,6 @@ use base64::Engine;
 mod webdav_gateway;
 use crate::webdav_gateway::{run_webdav_server, WebDavEntry, WebDavGateway};
 
-
 /* --- Tantivy ------------------------------------------------------------------------------ */
 use tantivy::{
     collector::TopDocs,
@@ -1030,7 +1029,178 @@ async fn init_indices() -> (Arc<TantivyIndex>, Arc<VectorIndex>) {
 
     return (idx_tan, idx_vec);
 }
+/* ========================================================================================== */
+/* WebDAV - Hilfsroutinen                                                                     */
+/* ========================================================================================== */
+fn webdav_update_last_search(
+    webdav_gateway: &Arc<WebDavGateway>,
+    s_query: &str,
+) {
+    /* Defensive:
+     * - Leere Suche wird ignoriert
+     * - Keine Panics
+     */
+    let s_q = s_query.trim();
+    if s_q.is_empty() {
+        return;
+    }
 
+    webdav_gateway.update_last_search(s_q);
+}
+
+/**********************************************************************************************
+ *  Funktion  : collect_webdav_entries_from_dir
+ *  Autor     : Marcus Schlieper
+ *---------------------------------------------------------------------------------------------
+ *  Beschreibung
+ *  - Liest echte Dateien aus einem Verzeichnis.
+ *  - Es werden nur Dateien, keine Unterverzeichnisse, aufgenommen.
+ *  - Die Funktion baut sichere und stabile WebDavEntry Werte.
+ *
+ *  Historie
+ *  14.05.2026  MS  - Initiale Version
+ *  14.05.2026  MS  - Fehlerbehandlung und Dateifilter dokumentiert
+ **********************************************************************************************/
+fn collect_webdav_entries_from_dir(
+    s_peer_id: &str,
+    p_dir: &Path,
+) -> Vec<WebDavEntry> {
+    let mut v_entries: Vec<WebDavEntry> = Vec::new();
+
+    let rd = match fs::read_dir(p_dir) {
+        Ok(x) => x,
+        Err(_) => {
+            return v_entries;
+        }
+    };
+
+    for entry_res in rd {
+        let entry = match entry_res {
+            Ok(x) => x,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        let md = match entry.metadata() {
+            Ok(x) => x,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        if !md.is_file() {
+            continue;
+        }
+
+        let s_name = entry.file_name().to_string_lossy().into_owned();
+        if s_name.trim().is_empty() {
+            continue;
+        }
+
+        let i_mtime_unix = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        v_entries.push(WebDavEntry {
+            s_name: s_name.clone(),
+            s_path: format!(
+                "/peers/{}/docs/{}",
+                s_peer_id,
+                s_name
+            ),
+            b_dir: false,
+            i_size: md.len(),
+            i_mtime_unix,
+        });
+    }
+
+    v_entries
+}
+
+fn collect_webdav_entries_from_dir_recursive(
+    s_peer_id: &str,
+    p_dir: &Path,
+) -> Vec<WebDavEntry> {
+    let mut v_entries: Vec<WebDavEntry> = Vec::new();
+
+    fn walk_dir(
+        s_peer_id: &str,
+        p_root: &Path,
+        p_current: &Path,
+        v_entries: &mut Vec<WebDavEntry>,
+    ) {
+        let rd = match fs::read_dir(p_current) {
+            Ok(x) => x,
+            Err(_) => {
+                return;
+            }
+        };
+
+        for entry_res in rd {
+            let entry = match entry_res {
+                Ok(x) => x,
+                Err(_) => {
+                    continue;
+                }
+            };
+
+            let p = entry.path();
+            let md = match entry.metadata() {
+                Ok(x) => x,
+                Err(_) => {
+                    continue;
+                }
+            };
+
+            if md.is_dir() {
+                walk_dir(s_peer_id, p_root, &p, v_entries);
+                continue;
+            }
+
+            if !md.is_file() {
+                continue;
+            }
+
+            let p_rel = match p.strip_prefix(p_root) {
+                Ok(x) => x,
+                Err(_) => {
+                    continue;
+                }
+            };
+
+            let s_name = p_rel.to_string_lossy().replace("\\", "/");
+            if s_name.trim().is_empty() {
+                continue;
+            }
+
+            let i_mtime_unix = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            v_entries.push(WebDavEntry {
+                s_name: s_name.clone(),
+                s_path: format!(
+                    "/peers/{}/docs/{}",
+                    s_peer_id,
+                    s_name
+                ),
+                b_dir: false,
+                i_size: md.len(),
+                i_mtime_unix,
+            });
+        }
+    }
+
+    walk_dir(s_peer_id, p_dir, p_dir, &mut v_entries);
+    v_entries
+}
 /* ========================================================================================== */
 /* Main                                                                                       */
 /* ========================================================================================== */
@@ -1181,30 +1351,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         idx_tan.clone(),
         idx_vec.clone(),
     ));
+    /* Local peer id fuer Anzeige unter /peers und zur Zuordnung local -> eigener peer */
+    webdav_gateway.set_local_peer_id(&swarm.local_peer_id().to_string());
 
-    /* Beispiel Daten fuer Peer Sicht.
-     * Spaeter sollte dies aus echtem Peer Cache oder DirResponse gefuellt werden.
+     /*
+     * Echte Dateien aus dem konfigurierten Dokumentenverzeichnis lesen.
+     * Diese Dateien werden dem lokalen Peer zugeordnet.
      */
-    webdav_gateway.register_peer_entries(
-        "peer_demo_01",
-        vec![
-            WebDavEntry {
-                s_name: "angebot_2026.pdf".to_string(),
-                s_path: "/peers/peer_demo_01/docs/angebot_2026.pdf".to_string(),
-                b_dir: false,
-                i_size: 123456,
-                i_mtime_unix: now_ms() / 1000,
-            },
-            WebDavEntry {
-                s_name: "projektplan.txt".to_string(),
-                s_path: "/peers/peer_demo_01/docs/projektplan.txt".to_string(),
-                b_dir: false,
-                i_size: 2048,
-                i_mtime_unix: now_ms() / 1000,
-            },
-        ],
+    let p_local_doc_dir = PathBuf::from(cfg_get().s_doc_dir.clone());
+    let s_local_peer_id: String = swarm.local_peer_id().to_string();
+    webdav_gateway.set_local_peer_id(&s_local_peer_id);
+
+    let p_local_doc_dir = PathBuf::from(cfg_get().s_doc_dir.clone());
+    let v_local_entries = collect_webdav_entries_from_dir(
+        &s_local_peer_id,
+        p_local_doc_dir.as_path(),
     );
 
+    webdav_gateway.register_peer_entries(
+        &s_local_peer_id,
+        v_local_entries,
+    );
+
+    
     let s_webdav_bind: String = "127.0.0.1:1900".to_string();
     {
         let gateway_clone = webdav_gateway.clone();
@@ -1257,6 +1426,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     iam.clone(),
                     &mut o_iam_cli,
                     st_web.clone(),
+                    webdav_gateway.clone(),
                 ).await;
             }
 
@@ -1275,6 +1445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &mut i_search_ctr,
                     iam.clone(),
                     &mut o_iam_cli,
+                    webdav_gateway.clone(),
                 ).await;
             }
 
@@ -1384,6 +1555,7 @@ async fn handle_web_command(
     iam: Arc<iam_store>,
     o_iam_cli: &mut Option<IamCliState>,
     st_web: Arc<Mutex<web_shared_state>>,
+    webdav_gateway: Arc<WebDavGateway>,
 ) {
     /* Historie: 12.01.2026 MS - zentrale Schaltstelle fuer Web API Kommandos (inkl. doc text) */
     match cmd {
@@ -1580,6 +1752,7 @@ async fn handle_web_command(
         }
 
         web_command::search_network_combi_dispatch { s_query, i_limit, tx } => {
+            webdav_update_last_search(&webdav_gateway, &s_query);
             *i_search_ctr = i_search_ctr.saturating_add(1);
             let i_id = *i_search_ctr;
 
@@ -1921,6 +2094,186 @@ fn print_local_path_permissions(iam: &Arc<iam_store>) {
     }
 }
 
+fn build_local_doc_listing_recursive(p_root: &Path, p_current: &Path, s_out: &mut String) -> std::io::Result<()> {
+    /* Historie:
+     * 14.05.2026  MS  - Initiale rekursive Auflistung fuer lokalen dir Befehl
+     *
+     * Sicherheit:
+     * - Nur regulare Dateien werden gelistet
+     * - Fehler bei einzelnen Eintraegen werden defensiv behandelt
+     * - Ausgabe bleibt ASCII freundlich
+     */
+    let rd = fs::read_dir(p_current)?;
+
+    for entry_res in rd {
+        let entry = match entry_res {
+            Ok(x) => x,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        let p = entry.path();
+        let md = match entry.metadata() {
+            Ok(x) => x,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        if md.is_dir() {
+            let _ = build_local_doc_listing_recursive(p_root, &p, s_out);
+            continue;
+        }
+
+        if !md.is_file() {
+            continue;
+        }
+
+        let p_rel = match p.strip_prefix(p_root) {
+            Ok(x) => x,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        let s_rel = p_rel.to_string_lossy().replace("\\", "/");
+        s_out.push_str(&format!("{:>10}  {}\n", md.len(), s_rel));
+    }
+
+    Ok(())
+}
+
+/**********************************************************************************************
+ *  Modulname : secure_p2p_ext
+ *  Datei     : main.rs
+ *  Autor     : Marcus Schlieper
+ *---------------------------------------------------------------------------------------------
+ *  Beschreibung
+ *  - Oeffentliche Hilfsfunktionen fuer die lokale Dokumentliste.
+ *  - Diese Funktionen werden von CLI und WebDAV gemeinsam genutzt.
+ *
+ *  Historie
+ *  14.05.2026  MS  - Initiale gemeinsame lokale Dokumentlisten Funktionen
+ **********************************************************************************************/
+
+/* ========================================================================================== */
+/* Gemeinsame lokale Dokumentliste fuer CLI und WebDAV                                        */
+/* ========================================================================================== */
+
+pub fn collect_local_doc_entries_recursive(
+    p_root: &Path,
+    p_current: &Path,
+    v_out: &mut Vec<WebDavEntry>,
+) -> std::io::Result<()> {
+    /*
+     * Historie:
+     * 14.05.2026  MS  - Initiale gemeinsame rekursive Dateiliste
+     *
+     * Sicherheit:
+     * - Nur regulaere Dateien werden aufgenommen
+     * - Fehler bei einzelnen Eintraegen werden defensiv behandelt
+     * - Relative Pfade werden stabil aus dem root Pfad gebildet
+     */
+    let rd = fs::read_dir(p_current)?;
+
+    for entry_res in rd {
+        let entry = match entry_res {
+            Ok(x) => x,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        let p = entry.path();
+        let md = match entry.metadata() {
+            Ok(x) => x,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        if md.is_dir() {
+            let _ = collect_local_doc_entries_recursive(p_root, &p, v_out);
+            continue;
+        }
+
+        if !md.is_file() {
+            continue;
+        }
+
+        let p_rel = match p.strip_prefix(p_root) {
+            Ok(x) => x,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        let s_name = p_rel.to_string_lossy().replace("\\", "/");
+
+        let i_mtime_unix = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        v_out.push(WebDavEntry {
+            s_name: s_name.clone(),
+            s_path: s_name,
+            b_dir: false,
+            i_size: md.len(),
+            i_mtime_unix,
+        });
+    }
+
+    Ok(())
+}
+
+pub fn collect_local_doc_entries() -> std::io::Result<Vec<WebDavEntry>> {
+    /*
+     * Historie:
+     * 14.05.2026  MS  - Initiale gemeinsame Sammelfunktion fuer lokale Dokumente
+     *
+     * Beschreibung:
+     * - Liest alle lokalen Dokumente aus cfg_get().s_doc_dir rekursiv
+     * - Liefert dieselbe Basis fuer CLI dir und WebDAV local
+     */
+    let p_root = PathBuf::from(cfg_get().s_doc_dir.clone());
+    let mut v_out: Vec<WebDavEntry> = Vec::new();
+
+    if !p_root.exists() || !p_root.is_dir() {
+        return Ok(v_out);
+    }
+
+    let _ = collect_local_doc_entries_recursive(&p_root, &p_root, &mut v_out);
+    Ok(v_out)
+}
+
+pub fn build_local_doc_listing() -> Result<String, Box<dyn Error>> {
+    /*
+     * Historie:
+     * 14.05.2026  MS  - Umstellung auf gemeinsame Dokumentquelle
+     *
+     * Beschreibung:
+     * - Baut die CLI Ausgabe aus collect_local_doc_entries
+     * - Damit nutzen CLI dir und WebDAV dieselbe Datenbasis
+     */
+    let v_entries = collect_local_doc_entries()?;
+    let mut s_out = String::new();
+
+    if v_entries.is_empty() {
+        s_out.push_str("no_local_documents\n");
+        return Ok(s_out);
+    }
+
+    for e in v_entries {
+        s_out.push_str(&format!("{:>10}  {}\n", e.i_size, e.s_name));
+    }
+
+    Ok(s_out)
+}
+
 
 /* ========================================================================================== */
 /* Benutzer Eingabe                                                                            */
@@ -1940,6 +2293,7 @@ async fn handle_user_input(
     i_search_ctr: &mut u64,
     iam: Arc<iam_store>,
     o_iam_cli: &mut Option<IamCliState>,
+    webdav_gateway: Arc<WebDavGateway>,
 ) {
     let s_cmd = s_input.trim();
     if s_cmd.is_empty() {
@@ -2200,12 +2554,25 @@ async fn handle_user_input(
         }
 
         "dir" => {
+            /* Zuerst immer lokale Dokumente anzeigen */
+            match build_local_doc_listing() {
+                Ok(s_listing) => {
+                    println!("-- Lokale Dokumente --");
+                    println!("{}", s_listing);
+                    println!("-- Ende lokale Dokumente --");
+                }
+                Err(e) => {
+                    println!("Lokale Dokumente konnten nicht gelesen werden: {}", e);
+                }
+            }
+
+            /* Danach wie gehabt optional die entfernte Liste beim aktiven Peer anfragen */
             if let Some(topic) = o_chat_topic {
                 let local_id = swarm.local_peer_id().clone();
                 send_encrypted(&local_id, swarm, topic, &PayloadType::DirRequest);
-                println!("Verzeichnis angefragt ...");
+                println!("Verzeichnis des Partners angefragt ...");
             } else {
-                println!("Kein Chat Partner.");
+                println!("Kein Chat Partner aktiv. Es wurden nur lokale Dokumente angezeigt.");
             }
         }
 
@@ -2353,6 +2720,25 @@ async fn handle_user_input(
             *i_search_ctr += 1;
             let i_id = *i_search_ctr;
             let local_id = swarm.local_peer_id().clone();
+            send_encrypted(&local_id, swarm, global_topic, &PayloadType::CombiSearchRequest { i_id,  s_query: s_query.clone()});
+            println!("Hybrid Suche (ID {i_id}) gesendet.");
+
+            /* WebDAV: letzte Hybrid Suche merken */
+            webdav_update_last_search(&webdav_gateway, &s_query);
+
+            let v_res = combi_search_with_snippets(&idx_tan, &idx_vec, &s_query, 5);
+            if v_res.is_empty() {
+                println!("(lokal) keine Hybrid Treffer");
+            } else {
+                println!("(lokal)");
+                for h in &v_res {
+                    println!("  {:>7.4}  {}", h.d_score, h.s_doc);
+                }
+            }
+
+            *i_search_ctr += 1;
+            let i_id = *i_search_ctr;
+            let local_id = swarm.local_peer_id().clone();
             send_encrypted(&local_id, swarm, global_topic, &PayloadType::CombiSearchRequest { i_id, s_query });
             println!("Hybrid Suche (ID {i_id}) gesendet.");
         }
@@ -2409,7 +2795,8 @@ async fn handle_incoming(
         PayloadType::Text(t) => println!("({src}) {t}"),
 
         PayloadType::DirRequest => {
-            if let Ok(s_listing) = build_dir_listing() {
+            /* Remote dir soll ebenfalls die lokalen Dokumente des angefragten Peers liefern */
+            if let Ok(s_listing) = build_local_doc_listing() {
                 let topic = build_chat_topic(&swarm.local_peer_id(), src);
                 let local_id = swarm.local_peer_id().clone();
                 send_encrypted(&local_id, swarm, &topic, &PayloadType::DirResponse(s_listing));
