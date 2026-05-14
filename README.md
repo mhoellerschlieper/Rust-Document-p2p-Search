@@ -1,6 +1,9 @@
 ## Overview
 Rust-Document-p2p-Search particularly addresses scenarios in which knowledge management, secure team communication, and data-proximate research across heterogeneous document collections are required, without necessarily having to operate a central server as a single point of failure (Schlieper, 2025).
 
+<img width="1024" height="1536" alt="FileButler_5_en" src="https://github.com/user-attachments/assets/ed3e2fc3-18f0-499b-b051-3606f57699fd" />
+
+
 ## Core Features
 ### Secure P2P Communication
 - Peer discovery via mDNS and messaging via libp2p gossipsub.
