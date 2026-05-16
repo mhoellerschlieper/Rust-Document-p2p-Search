@@ -79,11 +79,9 @@ use zip::read::ZipArchive;
 
 /* --- Eigene Importe vector_idx ------------------------------------------------------------ */
 mod vector_idx;
-use crate::vector_idx::cosine;
 use crate::vector_idx::VecSearchHit;
 use crate::vector_idx::VectorIndex;
 use vector_idx::{load_or_init_index, persist_index};
-
 /* --- Eigene Importe IAM ------------------------------------------------------------------- */
 mod iam;
 mod iam_net;
@@ -686,12 +684,23 @@ fn combi_search_with_snippets(
     s_query: &str,
     i_limit: usize,
 ) -> Vec<CombiSearchHit> {
-    /* Historie: 12.01.2026 MS - Web: return combi hits with snippets */
-    let mut v_bm = idx_tan.search(s_query, 200);
+    /*
+     * MUVERA API liefert keine vec_of Funktion mehr.
+     * Daher erfolgt die Hybridsuche als Fusion zweier Trefferlisten:
+     * - BM25 Liste aus Tantivy
+     * - MUVERA Liste aus vector_idx
+     */
+    let v_bm = idx_tan.search(s_query, 200);
+    let v_vec = idx_vec.query_with_snippets(s_query, 200);
+
+    if v_bm.is_empty() && v_vec.is_empty() {
+        return Vec::new();
+    }
+
     if v_bm.is_empty() {
-        let v_vec_only = idx_vec.query_with_snippets(s_query, i_limit);
-        return v_vec_only
+        return v_vec
             .into_iter()
+            .take(i_limit)
             .map(|h| CombiSearchHit {
                 s_doc: h.s_doc,
                 d_score: h.d_score,
@@ -700,31 +709,10 @@ fn combi_search_with_snippets(
             .collect();
     }
 
-    let v_q_vec = idx_vec.encode_query(s_query);
-    let d_bm_max = v_bm.first().map(|h| h.d_score).unwrap_or(1.0);
-
-    let mut v_combined: Vec<(String, f32)> = Vec::new();
-
-    for SearchHit { s_doc, d_score } in v_bm.drain(..) {
-        if let Some(v_doc_vec) = idx_vec.vec_of(&s_doc) {
-            let d_bm_n = d_score / d_bm_max.max(1.0);
-            let d_vec_n = cosine(&v_q_vec, &v_doc_vec).max(0.0);
-            let d_final: f32 = BM25_WEIGHT * d_bm_n + VEC_WEIGHT * d_vec_n;
-            v_combined.push((s_doc, d_final));
-        }
-    }
-
-    /* Degradation: if no vec matches exist, fallback to BM25 only */
-    if v_combined.is_empty() {
-        let mut v_fallback = idx_tan.search(s_query, i_limit);
-        v_fallback.sort_by(|a, b| {
-            b.d_score
-                .partial_cmp(&a.d_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        return v_fallback
+    if v_vec.is_empty() {
+        return v_bm
             .into_iter()
+            .take(i_limit)
             .map(|h| {
                 let s_txt = extract_doc_text(Path::new(&h.s_doc)).unwrap_or_else(|_| String::new());
                 let s_snip = build_snippet_for_query_simple(&s_txt, s_query);
@@ -737,22 +725,56 @@ fn combi_search_with_snippets(
             .collect();
     }
 
-    v_combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    v_combined.truncate(i_limit);
+    let d_bm_max = v_bm.first().map(|h| h.d_score).unwrap_or(1.0).max(1.0);
+    let d_vec_max = v_vec.first().map(|h| h.d_score).unwrap_or(1.0).max(1.0);
 
-    let mut v_out: Vec<CombiSearchHit> = Vec::with_capacity(v_combined.len());
-    for (s_doc, d_score) in v_combined.into_iter() {
-        let s_txt = extract_doc_text(Path::new(&s_doc)).unwrap_or_else(|_| String::new());
-        let s_snip = build_snippet_for_query_simple(&s_txt, s_query);
+    let mut h_scores: HashMap<String, (f32, String)> = HashMap::new();
 
-        v_out.push(CombiSearchHit {
-            s_doc,
-            d_score,
-            s_snippet: safe_truncate_chars(&s_snip, I_SNIPPET_MAX_LEN),
-        });
+    for h in v_bm {
+        let d_bm_n = h.d_score / d_bm_max;
+        let o_entry = h_scores
+            .entry(h.s_doc.clone())
+            .or_insert((0.0, String::new()));
+        o_entry.0 += BM25_WEIGHT * d_bm_n;
     }
 
-    v_out
+    for h in v_vec {
+        let d_vec_n = h.d_score / d_vec_max;
+        let o_entry = h_scores
+            .entry(h.s_doc.clone())
+            .or_insert((0.0, h.s_snippet.clone()));
+        o_entry.0 += VEC_WEIGHT * d_vec_n;
+
+        if o_entry.1.is_empty() && !h.s_snippet.is_empty() {
+            o_entry.1 = h.s_snippet;
+        }
+    }
+
+    let mut v_combined: Vec<CombiSearchHit> = h_scores
+        .into_iter()
+        .map(|(s_doc, (d_score, s_snippet))| {
+            let s_final_snippet = if s_snippet.is_empty() {
+                let s_txt = extract_doc_text(Path::new(&s_doc)).unwrap_or_else(|_| String::new());
+                build_snippet_for_query_simple(&s_txt, s_query)
+            } else {
+                s_snippet
+            };
+
+            CombiSearchHit {
+                s_doc,
+                d_score,
+                s_snippet: safe_truncate_chars(&s_final_snippet, I_SNIPPET_MAX_LEN),
+            }
+        })
+        .collect();
+
+    v_combined.sort_by(|a, b| {
+        b.d_score
+            .partial_cmp(&a.d_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    v_combined.truncate(i_limit);
+    v_combined
 }
 
 /* ===================================== Extraktion ======================================== */
@@ -885,7 +907,7 @@ fn print_menu() {
   get  <file>                     : Datei herunterladen (remote request)
   put  <pfad>                     : Datei hochladen
   search <query>                  : Schlagwortsuche im P2P Netz
-  vec_search <query>              : Vektor Suche im P2P Netz
+  vec_search <query>              : MUVERA Suche im P2P Netz
   combi_search <query>            : Hybrid Suche (BM25 + Vektor)
   ========================================================================================================
   iam_status                                                : IAM Status anzeigen
@@ -988,15 +1010,12 @@ fn prompt_password_no_echo(s_prompt: &str) -> Result<String, String> {
 /* Diagnose Helper                                                                             */
 /* ========================================================================================== */
 fn diag_print_index_paths(p_vec_root: &Path) {
-    /* Defensive: print effective paths that should be read/written by vector index persistence. */
-    let mut p_ann = std::path::PathBuf::from(p_vec_root);
-    p_ann.push("ann_graph.bin");
-
+    /*
+     * MUVERA nutzt keine ann_graph.bin mehr.
+     * Es wird nur das Root Verzeichnis ausgegeben.
+     */
     let s_root = p_vec_root.to_string_lossy().into_owned();
-    let s_file = p_ann.to_string_lossy().into_owned();
-
     println!("diag: vec_root={}", s_root);
-    println!("diag: vec_ann_graph_file={}", s_file);
 }
 
 /* ========================================================================================== */
@@ -1024,7 +1043,7 @@ async fn init_indices() -> (Arc<TantivyIndex>, Arc<VectorIndex>) {
 
     let idx_tan = Arc::new(TantivyIndex::new(p_doc_dir_norm.as_path()));
 
-    println!("diag: idx_vec_entries_init_done");
+    println!("diag: idx_vec_init_done");
     println!("diag: idx_tan_init_done");
 
     return (idx_tan, idx_vec);
@@ -1226,6 +1245,9 @@ fn is_peer_online_in_web_state(
 /* ========================================================================================== */
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /* -------------------- Config ---------------------------------------------------------- */
+    let _cfg_loaded = load_cfg_or_exit();
+
     /* -------------------- Logging --------------------------------------------------------- */
     let filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive("info".parse()?)
@@ -1248,6 +1270,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s_web_bind: String = cfg_get().s_web_bind.clone();
     let _i_max_transmit_size: usize = cfg_get().i_max_transmit_size;
     let i_persist_interval_sec: u64 = cfg_get().i_persist_interval_sec as u64;
+    let b_use_web_server: bool = cfg_get().b_use_web_server;
+    let b_use_webdav: bool = cfg_get().b_use_webdav;
+    let s_webdav_bind: String = cfg_get().s_webdav_bind.clone();
 
     /* -------------------- Crypto Context -------------------------------------------------- */
     let a_aes_key = *b"01234567012345670123456701234567";
@@ -1305,7 +1330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
 
-    let mut v_peers: Vec<libp2p::PeerId> = Vec::new();
+let mut v_peers: Vec<libp2p::PeerId> = Vec::new();
     let mut h_peer_index: std::collections::HashMap<libp2p::PeerId, usize> = std::collections::HashMap::new();
     let mut o_chat_peer: Option<libp2p::PeerId> = None;
     let mut o_chat_topic: Option<libp2p::gossipsub::IdentTopic> = None;
@@ -1356,15 +1381,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (tx_web_cmd, mut rx_web_cmd) = tokio::sync::mpsc::channel::<web_command>(64);
-    {
+
+    if b_use_web_server {
         let st_web_clone = st_web.clone();
         let tx_web_cmd_clone = tx_web_cmd.clone();
+        let s_web_bind_clone = s_web_bind.clone();
 
         tokio::spawn(async move {
-            let _ = run_web_server(&cfg_get().s_web_bind, tx_web_cmd_clone, st_web_clone).await;
+            let _ = run_web_server(&s_web_bind_clone, tx_web_cmd_clone, st_web_clone).await;
         });
+
+        println!("web: listening on http://{}", s_web_bind);
+    } else {
+        println!("web: disabled by config");
     }
-    println!("web: listening on http://{}", cfg_get().s_web_bind);
 
     let webdav_gateway = Arc::new(WebDavGateway::new(
         iam.clone(),
@@ -1394,8 +1424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         v_local_entries_refresh,
     );
 
-    let s_webdav_bind: String = "127.0.0.1:1900".to_string();
-    {
+    if b_use_webdav {
         let gateway_clone = webdav_gateway.clone();
         let s_webdav_bind_clone = s_webdav_bind.clone();
 
@@ -1409,8 +1438,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+
+        println!("webdav: start requested on http://{}", s_webdav_bind);
+    } else {
+        println!("webdav: disabled by config");
     }
-    println!("webdav: start requested on http://{}", s_webdav_bind);
 
     /* ====================================================================================== */
     /* Event Loop                                                                              */
@@ -1418,8 +1450,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             _ = idx_timer.tick() => {
-                idx_vec.sync(Path::new(&cfg_get().s_doc_dir.clone()));
-                idx_tan.sync(Path::new(&cfg_get().s_doc_dir.clone()));
+                idx_vec.sync(Path::new(&s_doc_dir));
+                idx_tan.sync(Path::new(&s_doc_dir));
                 let mut g = st_web.lock().unwrap();
                 g.push_event("idx: sync done".to_string());
             }
@@ -1472,7 +1504,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some((pid, i_idx)) = rx_ack.recv() => {
                 if let Some(q) = h_chunk_queue.get_mut(&pid) {
                     while let Some(f) = q.front() {
-                        if f.i_index <= i_idx { q.pop_front(); } else { break }
+                        if f.i_index <= i_idx {
+                            q.pop_front();
+                        } else {
+                            break;
+                        }
                     }
                 }
             }

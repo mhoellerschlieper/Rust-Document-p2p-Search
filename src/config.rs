@@ -5,21 +5,27 @@
  *---------------------------------------------------------------------------------------------
  *  Beschreibung
  *  - Zentrale Konfiguration fuer secure_p2p_ext.
- *  - Laedt Einstellungen aus Umgebungsvariablen (defensive Defaults) und validiert diese.
- *  - Verhindert unsichere Defaults durch Boundaries (Ports, Limits, Intervalle).
+ *  - Laedt Einstellungen aus Konfigurationsdatei und Umgebungsvariablen.
+ *  - Unterstuetzt Feature Flags fuer WebDAV und WebServer sowie weitere Parameter.
+ *  - Validiert Eingaben defensiv und stellt stabile Pfadfunktionen bereit.
  *
  *  Historie
  *  11.01.2026  Marcus Schlieper  - Initiale Version: AppConfig + Env Parsing + Validierung
+ *  16.05.2026  Marcus Schlieper  - Merge: JSON Konfigurationsdatei integriert
+ *  16.05.2026  Marcus Schlieper  - Erweiterung um b_use_webdav, b_use_web_server, s_webdav_bind
  **********************************************************************************************/
 
 #![allow(dead_code)]
 #![allow(warnings)]
+
 use crate::fs;
 use crate::Path;
 use crate::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::OnceLock;
+
 static CFG: OnceLock<app_config> = OnceLock::new();
 
 pub fn cfg_get() -> &'static app_config {
@@ -47,7 +53,9 @@ pub const S_FILE_ANN_GRAPH: &str = "ann_graph.bin";
 
 /* ===================================== Konstanten ======================================== */
 
+const S_ENV_CONFIG_FILE: &str = "EXPCHAT_CONFIG";
 const S_ENV_WEB_BIND: &str = "EXPCHAT_WEB_BIND";
+const S_ENV_WEBDAV_BIND: &str = "EXPCHAT_WEBDAV_BIND";
 const S_ENV_DOC_DIR: &str = "EXPCHAT_DOC_DIR";
 const S_ENV_IDX_DIR: &str = "EXPCHAT_IDX_DIR";
 const S_ENV_GLOBAL_TOPIC: &str = "EXPCHAT_GLOBAL_TOPIC";
@@ -57,8 +65,12 @@ const S_ENV_PERSIST_INTERVAL_SEC: &str = "EXPCHAT_PERSIST_INTERVAL_SEC";
 const S_ENV_MAX_TRANSMIT_SIZE: &str = "EXPCHAT_MAX_TRANSMIT_SIZE";
 const S_ENV_CHUNK_SIZE: &str = "EXPCHAT_CHUNK_SIZE";
 const S_ENV_IAM_REMOTE_SCOPE_PUBLIC: &str = "EXPCHAT_IAM_REMOTE_SCOPE_PUBLIC";
+const S_ENV_USE_WEBDAV: &str = "EXPCHAT_USE_WEBDAV";
+const S_ENV_USE_WEBSERVER: &str = "EXPCHAT_USE_WEBSERVER";
 
+const S_DEFAULT_CONFIG_FILE: &str = "config/app_config.json";
 const S_DEFAULT_WEB_BIND: &str = "127.0.0.1:8080";
+const S_DEFAULT_WEBDAV_BIND: &str = "127.0.0.1:1900";
 const S_DEFAULT_DOC_DIR: &str = "Documents";
 const S_DEFAULT_IDX_DIR: &str = "./data/tantivy_idx";
 const S_DEFAULT_GLOBAL_TOPIC: &str = "expchat-main";
@@ -75,9 +87,10 @@ const I_MAX_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 
 /* ===================================== Datenstruktur ===================================== */
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct app_config {
     pub s_web_bind: String,
+    pub s_webdav_bind: String,
     pub s_doc_dir: String,
     pub s_idx_dir: String,
 
@@ -91,6 +104,8 @@ pub struct app_config {
     pub i_chunk_size: usize,
 
     pub b_iam_remote_scope_public: bool,
+    pub b_use_webdav: bool,
+    pub b_use_web_server: bool,
 }
 
 /* Helper: join ./data + rel */
@@ -134,7 +149,10 @@ pub fn path_ann_graph_file() -> PathBuf {
     p.push(S_FILE_ANN_GRAPH);
     p
 }
+
 pub fn ensure_data_layout() -> Result<(), String> {
+    let cfg = cfg_get();
+
     let v_dirs = vec![
         path_data_root_dir(),
         path_tantivy_idx_dir(),
@@ -144,6 +162,7 @@ pub fn ensure_data_layout() -> Result<(), String> {
         path_processed_docs_dir(),
         path_iam_db_dir(),
         join_under_data_root(S_DIR_ANN),
+        PathBuf::from(&cfg.s_doc_dir),
     ];
 
     for p in v_dirs {
@@ -159,12 +178,14 @@ pub fn ensure_parent_dir(p_file: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+
 /* ===================================== Implementierung ==================================== */
 
 impl Default for app_config {
     fn default() -> Self {
         Self {
             s_web_bind: S_DEFAULT_WEB_BIND.to_string(),
+            s_webdav_bind: S_DEFAULT_WEBDAV_BIND.to_string(),
             s_doc_dir: S_DEFAULT_DOC_DIR.to_string(),
             s_idx_dir: S_DEFAULT_IDX_DIR.to_string(),
             s_global_topic: S_DEFAULT_GLOBAL_TOPIC.to_string(),
@@ -174,18 +195,30 @@ impl Default for app_config {
             i_max_transmit_size: 1_048_576,
             i_chunk_size: 65_536,
             b_iam_remote_scope_public: true,
+            b_use_webdav: true,
+            b_use_web_server: true,
         }
     }
 }
 
 impl app_config {
     pub fn load_from_env() -> Result<Self, String> {
-        let mut cfg = app_config::default();
+        let mut cfg = match Self::load_from_file() {
+            Ok(o_cfg) => o_cfg,
+            Err(_) => app_config::default(),
+        };
 
         if let Ok(s) = env::var(S_ENV_WEB_BIND) {
             let s_t = s.trim();
             if !s_t.is_empty() && s_t.len() <= 128 {
                 cfg.s_web_bind = s_t.to_string();
+            }
+        }
+
+        if let Ok(s) = env::var(S_ENV_WEBDAV_BIND) {
+            let s_t = s.trim();
+            if !s_t.is_empty() && s_t.len() <= 128 {
+                cfg.s_webdav_bind = s_t.to_string();
             }
         }
 
@@ -242,8 +275,20 @@ impl app_config {
         }
 
         if let Ok(s) = env::var(S_ENV_IAM_REMOTE_SCOPE_PUBLIC) {
-            if let Some(b) = parse_bool_01(&s) {
+            if let Some(b) = parse_bool_ext(&s) {
                 cfg.b_iam_remote_scope_public = b;
+            }
+        }
+
+        if let Ok(s) = env::var(S_ENV_USE_WEBDAV) {
+            if let Some(b) = parse_bool_ext(&s) {
+                cfg.b_use_webdav = b;
+            }
+        }
+
+        if let Ok(s) = env::var(S_ENV_USE_WEBSERVER) {
+            if let Some(b) = parse_bool_ext(&s) {
+                cfg.b_use_web_server = b;
             }
         }
 
@@ -251,9 +296,26 @@ impl app_config {
         Ok(cfg)
     }
 
+    fn load_from_file() -> Result<Self, String> {
+        let s_cfg_file = env::var(S_ENV_CONFIG_FILE).unwrap_or_else(|_| S_DEFAULT_CONFIG_FILE.to_string());
+        let p_cfg_file = PathBuf::from(&s_cfg_file);
+
+        if !p_cfg_file.exists() {
+            return Err("config_file_not_found".to_string());
+        }
+
+        let s_json = fs::read_to_string(&p_cfg_file).map_err(|_| "config_file_read_failed".to_string())?;
+        let cfg: app_config = serde_json::from_str(&s_json).map_err(|_| "config_file_parse_failed".to_string())?;
+
+        Ok(cfg)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.s_web_bind.trim().is_empty() || self.s_web_bind.len() > 128 {
             return Err("invalid_web_bind".to_string());
+        }
+        if self.s_webdav_bind.trim().is_empty() || self.s_webdav_bind.len() > 128 {
+            return Err("invalid_webdav_bind".to_string());
         }
         if self.s_doc_dir.trim().is_empty() || self.s_doc_dir.len() > 512 {
             return Err("invalid_doc_dir".to_string());
@@ -301,6 +363,15 @@ fn parse_bool_01(s_in: &str) -> Option<bool> {
     match s_in.trim() {
         "0" => Some(false),
         "1" => Some(true),
+        _ => None,
+    }
+}
+
+fn parse_bool_ext(s_in: &str) -> Option<bool> {
+    let s = s_in.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "0" | "false" | "no" | "off" => Some(false),
+        "1" | "true" | "yes" | "on" => Some(true),
         _ => None,
     }
 }
