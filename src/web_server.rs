@@ -114,6 +114,18 @@ pub struct web_doc_text_resp {
     pub s_text: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct web_docs_entry {
+    pub s_name: String,
+    pub s_path: String,
+    pub s_peer_id: String,
+    pub b_local: bool,
+    pub b_online: bool,
+    pub i_size: u64,
+    pub i_mtime_unix: u64,
+    pub s_status: String,
+    pub s_availability: String,
+}
 /* --- NEW request DTO --------------------------------------------------------------------- */
 #[derive(Serialize, Deserialize, Debug)]
 pub struct req_doc_text_get {
@@ -371,6 +383,10 @@ pub enum web_command {
         tx: tokio::sync::oneshot::Sender<Vec<String>>,
     },
 
+    docs_explorer_get {
+        tx: tokio::sync::oneshot::Sender<Vec<web_docs_entry>>,
+    },
+
     p2p_connect_by_peer_id {
         s_peer_id: String,
         tx: tokio::sync::oneshot::Sender<web_ok_resp>,
@@ -436,6 +452,13 @@ pub enum web_command {
     iam_groups_get {
         tx: tokio::sync::oneshot::Sender<Vec<web_iam_group_view>>,
     },
+}
+
+async fn route_api_docs_explorer(State(ctx): State<web_server_ctx>) -> Response {
+    match cmd_roundtrip(&ctx.tx_web_cmd, |tx| web_command::docs_explorer_get { tx }).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(_) => json_err("docs_explorer_failed", StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 /* ============================================================================================
  * Router state (axum state must be consistent)
@@ -1008,6 +1031,7 @@ fn build_router(ctx: web_server_ctx) -> Router {
         .route("/api/status", get(route_api_status))
         .route("/api/peers", get(route_api_peers))
         .route("/api/events", get(route_api_events))
+        .route("/api/docs/explorer", get(route_api_docs_explorer))
         .route("/api/p2p/connect", post(route_api_p2p_connect))
         .route("/api/p2p/send_text", post(route_api_p2p_send_text))
         .route("/api/search/combi/dispatch", post(route_api_search_combi_dispatch))
@@ -1022,6 +1046,7 @@ fn build_router(ctx: web_server_ctx) -> Router {
         .route("/api/iam/groups", get(route_api_iam_groups))
         .with_state(ctx)
 }
+
 
 pub async fn run_web_server(
     s_bind: &str,

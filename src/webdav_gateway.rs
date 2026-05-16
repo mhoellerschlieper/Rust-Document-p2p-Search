@@ -4,19 +4,18 @@
  *  Autor     : Marcus Schlieper
  *---------------------------------------------------------------------------------------------
  *  Beschreibung
- *  - Read only WebDAV Gateway fuer das verteilte Dokumentensystem.
- *  - Stellt virtuelle Pfade unter /local, /peers und /search bereit.
- *  - Unterstuetzt OPTIONS, PROPFIND, GET und HEAD.
- *  - IAM Leserechte werden zentral geprueft.
- *  - Metadaten Cache und Dateicache sind enthalten.
- *  - Hybrid Suche wird als virtuelle Trefferliste unter /search/hybrid/ angeboten.
- *  - Snippets werden als virtuelle Datei snippet.txt je Treffer bereitgestellt.
- *  - Erweiterung:
- *    - Alle Peers inklusive des eigenen Peers werden unter /peers angezeigt.
- *    - Der eigene Peer wird unter /local/docs aus lokalen Dateien dargestellt.
- *    - Peer Dateien werden in den Peer Endpunkten direkt angezeigt.
- *    - Letzte Hybrid Suche wird unter /search/hybrid/ als virtuelle Trefferliste angezeigt.
- *    - Umfangreiche println! Debug Ausgaben fuer Windows WebDAV Analyse.
+ *  - Vollstaendige Ergaenzung des bestehenden WebDAV Gateways.
+ *  - Alte Funktionen bleiben erhalten und werden nicht entfernt.
+ *  - Neu hinzugefuegt:
+ *    - LOCK Support fuer Office und Explorer
+ *    - UNLOCK Support
+ *    - PUT Support fuer lokale Dateien
+ *    - In Memory Lock Store mit Timeout
+ *    - Hilfsfunktionen fuer Lock Token, If Header und XML Antwort
+ *    - Excel MIME Typen
+ *  - Ziel:
+ *    - bessere Kompatibilitaet mit Windows Explorer und Office
+ *    - weiterhin defensiver und sicherer Code
  *
  *  Historie
  *  13.05.2026  MS  - Initiale Version fuer Phase 1 und Phase 2
@@ -25,6 +24,8 @@
  *  14.05.2026  MS  - Erweiterung: alle Peers inkl local im Endpoint /peers
  *  14.05.2026  MS  - Erweiterung: letzte Hybrid Suche unter /search/hybrid/
  *  14.05.2026  MS  - Debug Version mit println! fuer Request Flow und Dateilisten
+ *  16.05.2026  MS  - Merge: SEARCH Support und Explorer Fokus auf /peers ergaenzt
+ *  16.05.2026  MS  - Erweiterung: LOCK, UNLOCK und PUT fuer Office Kompatibilitaet
  **********************************************************************************************/
 
 #![allow(clippy::needless_return)]
@@ -36,13 +37,13 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 
 use crate::config::cfg_get;
-use crate::iam::{iam_store, right_read};
+use crate::iam::{iam_store, right_read, right_write};
 
 use crate::{
     collect_local_doc_entries,
@@ -94,6 +95,14 @@ struct LastSearchState {
     i_created_ms: u64,
 }
 
+#[derive(Clone, Debug)]
+struct WebDavLockEntry {
+    s_token: String,
+    s_owner: String,
+    i_created_ms: u64,
+    i_timeout_ms: u64,
+}
+
 #[derive(Clone)]
 pub struct WebDavGateway {
     pub iam: Arc<iam_store>,
@@ -104,6 +113,7 @@ pub struct WebDavGateway {
     pub h_peer_docs: Arc<Mutex<HashMap<String, Vec<WebDavEntry>>>>,
     pub s_local_peer_id: Arc<Mutex<String>>,
     pub o_last_search: Arc<Mutex<Option<LastSearchState>>>,
+    pub h_locks: Arc<Mutex<HashMap<String, WebDavLockEntry>>>,
 }
 
 /* ========================================================================================== */
@@ -114,6 +124,10 @@ const I_META_CACHE_TTL_MS: u64 = 20_000;
 const I_FILE_CACHE_TTL_MS: u64 = 60_000;
 const I_SEARCH_RESULT_LIMIT: usize = 25;
 const I_SNIPPET_FILE_LIMIT: usize = 4096;
+const I_MAX_SEARCH_BODY_BYTES: usize = 32_768;
+const I_MAX_QUERY_LEN: usize = 256;
+const I_DEFAULT_LOCK_TIMEOUT_MS: u64 = 60_000;
+const I_MAX_PUT_BODY_BYTES: usize = 50 * 1024 * 1024;
 
 /* ========================================================================================== */
 /* Impl                                                                                       */
@@ -127,6 +141,8 @@ impl WebDavGateway {
      *  Historie
      *  13.05.2026  MS  - Initiale Version
      *  14.05.2026  MS  - local peer id und last search state hinzugefuegt
+     *  16.05.2026  MS  - Merge Stand mit SEARCH Support
+     *  16.05.2026  MS  - Lock Store hinzugefuegt
      ******************************************************************************************/
     pub fn new(
         iam: Arc<iam_store>,
@@ -144,6 +160,7 @@ impl WebDavGateway {
             h_peer_docs: Arc::new(Mutex::new(HashMap::new())),
             s_local_peer_id: Arc::new(Mutex::new(String::new())),
             o_last_search: Arc::new(Mutex::new(None)),
+            h_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -169,15 +186,24 @@ impl WebDavGateway {
 
         let mut g = self.h_peer_docs.lock().unwrap();
         g.insert(s_peer_id.to_string(), v_entries);
+        drop(g);
+
+        self.clear_all_caches();
     }
 
     pub fn update_last_search(&self, s_query: &str) {
         println!("webdav dbg: update_last_search query={}", s_query);
 
+        let s_query_trimmed = sanitize_search_query(s_query);
+        if s_query_trimmed.is_empty() {
+            println!("webdav dbg: update_last_search skipped empty query");
+            return;
+        }
+
         let v_hits = combi_search_with_snippets(
             &self.idx_tan,
             &self.idx_vec,
-            s_query,
+            &s_query_trimmed,
             I_SEARCH_RESULT_LIMIT,
         );
 
@@ -185,10 +211,30 @@ impl WebDavGateway {
 
         let mut g = self.o_last_search.lock().unwrap();
         *g = Some(LastSearchState {
-            s_query: s_query.to_string(),
+            s_query: s_query_trimmed,
             v_hits,
             i_created_ms: now_ms(),
         });
+        drop(g);
+
+        self.clear_search_caches();
+    }
+
+    fn clear_all_caches(&self) {
+        println!("webdav dbg: clear_all_caches");
+        self.h_meta_cache.lock().unwrap().clear();
+        self.h_file_cache.lock().unwrap().clear();
+    }
+
+    fn clear_search_caches(&self) {
+        println!("webdav dbg: clear_search_caches");
+
+        let mut g_meta = self.h_meta_cache.lock().unwrap();
+        g_meta.retain(|s_key, _| !s_key.starts_with("/search/"));
+        drop(g_meta);
+
+        let mut g_file = self.h_file_cache.lock().unwrap();
+        g_file.retain(|s_key, _| !s_key.starts_with("/search/"));
     }
 
     fn get_local_peer_id(&self) -> String {
@@ -224,10 +270,17 @@ impl WebDavGateway {
             Method::OPTIONS => self.handle_options(),
             Method::GET => self.handle_get(&s_path, s_session).await,
             Method::HEAD => self.handle_head(&s_path, s_session).await,
+            Method::PUT => self.handle_put(req, &s_path, s_session).await,
             _ => {
                 let s_m = method.as_str().to_string();
                 if s_m == "PROPFIND" {
                     self.handle_propfind(&s_path, s_session, &headers).await
+                } else if s_m == "SEARCH" {
+                    self.handle_search(req, s_session).await
+                } else if s_m == "LOCK" {
+                    self.handle_lock(req, &s_path, s_session).await
+                } else if s_m == "UNLOCK" {
+                    self.handle_unlock(&s_path, &headers, s_session).await
                 } else {
                     println!("webdav dbg: method_not_allowed method={}", s_m);
                     response_text(StatusCode::METHOD_NOT_ALLOWED, "read_only_webdav")
@@ -241,11 +294,55 @@ impl WebDavGateway {
 
         Response::builder()
             .status(StatusCode::NO_CONTENT)
-            .header("DAV", "1")
-            .header("Allow", "OPTIONS, PROPFIND, GET, HEAD")
+            .header("DAV", "1,2")
+            .header("Allow", "OPTIONS, PROPFIND, GET, HEAD, SEARCH, LOCK, UNLOCK, PUT")
             .header("MS-Author-Via", "DAV")
             .header("Content-Length", "0")
             .body(Full::new(Bytes::new()))
+            .unwrap_or_else(|_| response_text(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))
+    }
+
+    async fn handle_search(
+        &self,
+        req: Request<Incoming>,
+        _s_session: Option<String>,
+    ) -> Response<HttpBody> {
+        println!("webdav dbg: handle_search");
+
+        let collected = match req.into_body().collect().await {
+            Ok(x) => x,
+            Err(_) => {
+                println!("webdav dbg: search invalid body");
+                return response_text(StatusCode::BAD_REQUEST, "invalid_search_body");
+            }
+        };
+
+        let v_body = collected.to_bytes();
+        if v_body.len() > I_MAX_SEARCH_BODY_BYTES {
+            println!("webdav dbg: search body too large bytes={}", v_body.len());
+            return response_text(StatusCode::PAYLOAD_TOO_LARGE, "search_body_too_large");
+        }
+
+        let s_body = String::from_utf8_lossy(&v_body).into_owned();
+        println!("webdav dbg: search body_len={}", s_body.len());
+
+        let s_query = extract_search_query_from_body(&s_body);
+        println!("webdav dbg: search query={}", s_query);
+
+        if s_query.trim().is_empty() {
+            println!("webdav dbg: search missing query");
+            return response_text(StatusCode::BAD_REQUEST, "missing_search_query");
+        }
+
+        self.update_last_search(&s_query);
+
+        let s_xml = build_search_response_xml(&s_query);
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .header("Content-Length", s_xml.len().to_string())
+            .body(Full::new(Bytes::from(s_xml)))
             .unwrap_or_else(|_| response_text(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))
     }
 
@@ -394,135 +491,364 @@ impl WebDavGateway {
     }
 
     /**********************************************************************************************
-    *  Historie
-    *  14.05.2026  MS  - local/<peer_id>/ fuer eigenes Verzeichnis ergaenzt
-    **********************************************************************************************/
+     *  Beschreibung
+     *  - LOCK Support fuer Office und Explorer.
+     *  - Es wird ein einfacher exklusiver Lock mit Timeout gehalten.
+     *
+     *  Historie
+     *  16.05.2026  MS  - Initiale Version
+     **********************************************************************************************/
+    async fn handle_lock(
+        &self,
+        req: Request<Incoming>,
+        s_path: &str,
+        _s_session: Option<String>,
+    ) -> Response<HttpBody> {
+        println!("webdav dbg: handle_lock path={}", s_path);
+
+        if !s_path.starts_with("/local/") && !s_path.starts_with("/peers/") {
+            return response_text(StatusCode::FORBIDDEN, "forbidden");
+        }
+
+        self.cleanup_expired_locks();
+
+        let o_existing_token = req
+            .headers()
+            .get("If")
+            .and_then(|v| v.to_str().ok())
+            .map(extract_lock_token_from_if_header);
+
+        if self.is_path_locked_by_other(s_path, o_existing_token.as_deref()) {
+            println!("webdav dbg: handle_lock locked_by_other path={}", s_path);
+            return response_text(StatusCode::LOCKED, "locked");
+        }
+
+        let collected = match req.into_body().collect().await {
+            Ok(x) => x,
+            Err(_) => {
+                return response_text(StatusCode::BAD_REQUEST, "invalid_lock_body");
+            }
+        };
+
+        let s_body = String::from_utf8_lossy(&collected.to_bytes()).into_owned();
+        let s_owner = extract_lock_owner(&s_body);
+
+        let s_token = generate_lock_token();
+
+        {
+            let mut g = self.h_locks.lock().unwrap();
+            g.insert(
+                s_path.to_string(),
+                WebDavLockEntry {
+                    s_token: s_token.clone(),
+                    s_owner: s_owner.clone(),
+                    i_created_ms: now_ms(),
+                    i_timeout_ms: I_DEFAULT_LOCK_TIMEOUT_MS,
+                },
+            );
+        }
+
+        let s_xml = build_lock_response_xml(s_path, &s_token, &s_owner);
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .header("Lock-Token", format!("<{}>", s_token))
+            .header("Content-Length", s_xml.len().to_string())
+            .body(Full::new(Bytes::from(s_xml)))
+            .unwrap_or_else(|_| response_text(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))
+    }
+
+    /**********************************************************************************************
+     *  Beschreibung
+     *  - UNLOCK Support.
+     *
+     *  Historie
+     *  16.05.2026  MS  - Initiale Version
+     **********************************************************************************************/
+    async fn handle_unlock(
+        &self,
+        s_path: &str,
+        headers: &http::HeaderMap,
+        _s_session: Option<String>,
+    ) -> Response<HttpBody> {
+        println!("webdav dbg: handle_unlock path={}", s_path);
+
+        self.cleanup_expired_locks();
+
+        let s_token = headers
+            .get("Lock-Token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_string();
+
+        if s_token.is_empty() {
+            return response_text(StatusCode::BAD_REQUEST, "missing_lock_token");
+        }
+
+        let mut g = self.h_locks.lock().unwrap();
+        let Some(o_lock) = g.get(s_path) else {
+            return response_text(StatusCode::CONFLICT, "lock_not_found");
+        };
+
+        if o_lock.s_token != s_token {
+            return response_text(StatusCode::CONFLICT, "lock_token_mismatch");
+        }
+
+        g.remove(s_path);
+
+        Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("Content-Length", "0")
+            .body(Full::new(Bytes::new()))
+            .unwrap_or_else(|_| response_text(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))
+    }
+
+    /**********************************************************************************************
+     *  Beschreibung
+     *  - PUT Support fuer lokale Dateien.
+     *  - Erlaubt nur /local/... und /peers/<local_peer>/docs/...
+     *  - Nutzt IAM write Pruefung.
+     *
+     *  Historie
+     *  16.05.2026  MS  - Initiale Version
+     **********************************************************************************************/
+    async fn handle_put(
+        &self,
+        req: Request<Incoming>,
+        s_path: &str,
+        s_session: Option<String>,
+    ) -> Response<HttpBody> {
+        println!("webdav dbg: handle_put path={}", s_path);
+
+        let s_lock_token = req
+            .headers()
+            .get("If")
+            .and_then(|v| v.to_str().ok())
+            .map(extract_lock_token_from_if_header);
+
+        if self.is_path_locked_by_other(s_path, s_lock_token.as_deref()) {
+            println!("webdav dbg: handle_put locked path={}", s_path);
+            return response_text(StatusCode::LOCKED, "locked");
+        }
+
+        let s_rel = match self.map_webdav_path_to_local_rel_file(s_path) {
+            Some(x) => x,
+            None => {
+                println!("webdav dbg: handle_put forbidden_non_local path={}", s_path);
+                return response_text(StatusCode::FORBIDDEN, "put_only_local_supported");
+            }
+        };
+
+        if !is_safe_relative_doc_path(&s_rel) {
+            println!("webdav dbg: handle_put unsafe_rel_path rel={}", s_rel);
+            return response_text(StatusCode::BAD_REQUEST, "invalid_relative_path");
+        }
+
+        let b_write_allowed = match self.check_write_access(s_session.as_deref(), &s_rel) {
+            Ok(x) => x,
+            Err(_) => false,
+        };
+
+        if !b_write_allowed {
+            println!("webdav dbg: handle_put write_forbidden rel={}", s_rel);
+            return response_text(StatusCode::FORBIDDEN, "forbidden");
+        }
+
+        let collected = match req.into_body().collect().await {
+            Ok(x) => x,
+            Err(_) => {
+                return response_text(StatusCode::BAD_REQUEST, "invalid_put_body");
+            }
+        };
+
+        let v_body = collected.to_bytes();
+        if v_body.len() > I_MAX_PUT_BODY_BYTES {
+            println!("webdav dbg: handle_put body_too_large bytes={}", v_body.len());
+            return response_text(StatusCode::PAYLOAD_TOO_LARGE, "put_body_too_large");
+        }
+
+        let p_root = PathBuf::from(cfg_get().s_doc_dir.clone());
+        let p_target = p_root.join(&s_rel);
+
+        if !is_path_within_root(&p_root, &p_target) {
+            println!(
+                "webdav dbg: handle_put path_escape root={} target={}",
+                p_root.to_string_lossy(),
+                p_target.to_string_lossy()
+            );
+            return response_text(StatusCode::BAD_REQUEST, "invalid_target_path");
+        }
+
+        if let Some(p_parent) = p_target.parent() {
+            if std::fs::create_dir_all(p_parent).is_err() {
+                return response_text(StatusCode::INTERNAL_SERVER_ERROR, "mkdir_failed");
+            }
+        }
+
+        let b_existed_before = p_target.exists();
+
+        if std::fs::write(&p_target, &v_body).is_err() {
+            return response_text(StatusCode::INTERNAL_SERVER_ERROR, "write_failed");
+        }
+
+        self.clear_all_caches();
+
+        let status = if b_existed_before {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::CREATED
+        };
+
+        Response::builder()
+            .status(status)
+            .header("Content-Length", "0")
+            .body(Full::new(Bytes::new()))
+            .unwrap_or_else(|_| response_text(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))
+    }
+
+    /**********************************************************************************************
+     *  Historie
+     *  14.05.2026  MS  - local fuer eigenes Verzeichnis ergaenzt
+     *  16.05.2026  MS  - Root Fokus fuer Explorer auf /peers, /local bleibt kompatibel
+     **********************************************************************************************/
     fn path_exists(
-    &self,
-    s_path: &str,
-    o_session: Option<&str>,
-) -> Result<bool, String> {
-    println!("webdav dbg: path_exists path={}", s_path);
+        &self,
+        s_path: &str,
+        o_session: Option<&str>,
+    ) -> Result<bool, String> {
+        println!("webdav dbg: path_exists path={}", s_path);
 
-    if s_path == "/" || s_path == "/local/" || s_path == "/peers/" || s_path == "/search/" {
-        return Ok(true);
-    }
-
-    if s_path == "/search/hybrid/" {
-        return Ok(true);
-    }
-
-    if s_path.starts_with("/local/") {
-        let s_rel = s_path.trim_start_matches("/local/");
-        if s_rel.trim().is_empty() {
+        if s_path == "/" || s_path == "/peers/" || s_path == "/search/" {
             return Ok(true);
         }
 
-        let s_name = decode_path(s_rel);
-        let p = PathBuf::from(cfg_get().s_doc_dir.clone()).join(&s_name);
-
-        println!(
-            "webdav dbg: path_exists local rel={} file_path={}",
-            s_name,
-            p.to_string_lossy()
-        );
-
-        if let Ok(md) = std::fs::metadata(&p) {
-            return Ok(md.is_file() && self.check_read_access(o_session, &s_name)?);
+        if s_path == "/local/" || s_path == "/local/docs/" {
+            return Ok(true);
         }
 
-        return Ok(false);
-    }
+        if s_path == "/search/hybrid/" {
+            return Ok(true);
+        }
 
-    if s_path.starts_with("/peers/") {
-        let v_parts = split_clean_path(s_path);
-        println!("webdav dbg: path_exists peers parts={:?}", v_parts);
-
-        if v_parts.len() == 2 {
-            let s_peer_id = &v_parts[1];
-            if s_peer_id == &self.get_local_peer_id() {
+        if s_path.starts_with("/local/") {
+            let s_rel = s_path.trim_start_matches("/local/");
+            if s_rel.trim().is_empty() {
                 return Ok(true);
             }
 
-            let g = self.h_peer_docs.lock().unwrap();
-            return Ok(g.contains_key(s_peer_id));
-        }
-
-        if v_parts.len() == 3 && v_parts[2] == "docs" {
-            let s_peer_id = &v_parts[1];
-            if s_peer_id == &self.get_local_peer_id() {
-                return Ok(true);
-            }
-
-            let g = self.h_peer_docs.lock().unwrap();
-            return Ok(g.contains_key(s_peer_id));
-        }
-
-        if v_parts.len() >= 4 && v_parts[2] == "docs" {
-            let s_peer_id = &v_parts[1];
-            let s_rel_file = v_parts[3..].join("/");
+            let s_name = decode_path(s_rel);
+            let p = PathBuf::from(cfg_get().s_doc_dir.clone()).join(&s_name);
 
             println!(
-                "webdav dbg: path_exists peer file peer={} rel_file={}",
-                s_peer_id, s_rel_file
+                "webdav dbg: path_exists local rel={} file_path={}",
+                s_name,
+                p.to_string_lossy()
             );
 
-            if s_peer_id == &self.get_local_peer_id() {
-                let p = PathBuf::from(cfg_get().s_doc_dir.clone()).join(&s_rel_file);
-                if let Ok(md) = std::fs::metadata(&p) {
-                    return Ok(md.is_file() && self.check_read_access(o_session, &s_rel_file)?);
-                }
-                return Ok(false);
-            }
-
-            let g = self.h_peer_docs.lock().unwrap();
-            if let Some(v_entries) = g.get(s_peer_id) {
-                let b_found = v_entries.iter().any(|x| x.s_name == s_rel_file);
-                return Ok(b_found);
+            if let Ok(md) = std::fs::metadata(&p) {
+                return Ok(md.is_file() && self.check_read_access(o_session, &s_name)?);
             }
 
             return Ok(false);
         }
 
-        return Ok(false);
+        if s_path.starts_with("/peers/") {
+            let v_parts = split_clean_path(s_path);
+            println!("webdav dbg: path_exists peers parts={:?}", v_parts);
+
+            if v_parts.len() == 2 {
+                let s_peer_id = &v_parts[1];
+                if s_peer_id == &self.get_local_peer_id() {
+                    return Ok(true);
+                }
+
+                let g = self.h_peer_docs.lock().unwrap();
+                return Ok(g.contains_key(s_peer_id));
+            }
+
+            if v_parts.len() == 3 && v_parts[2] == "docs" {
+                let s_peer_id = &v_parts[1];
+                if s_peer_id == &self.get_local_peer_id() {
+                    return Ok(true);
+                }
+
+                let g = self.h_peer_docs.lock().unwrap();
+                return Ok(g.contains_key(s_peer_id));
+            }
+
+            if v_parts.len() >= 4 && v_parts[2] == "docs" {
+                let s_peer_id = &v_parts[1];
+                let s_rel_file = v_parts[3..].join("/");
+
+                println!(
+                    "webdav dbg: path_exists peer file peer={} rel_file={}",
+                    s_peer_id, s_rel_file
+                );
+
+                if s_peer_id == &self.get_local_peer_id() {
+                    let p = PathBuf::from(cfg_get().s_doc_dir.clone()).join(&s_rel_file);
+                    if let Ok(md) = std::fs::metadata(&p) {
+                        return Ok(md.is_file() && self.check_read_access(o_session, &s_rel_file)?);
+                    }
+                    return Ok(false);
+                }
+
+                let g = self.h_peer_docs.lock().unwrap();
+                if let Some(v_entries) = g.get(s_peer_id) {
+                    let b_found = v_entries.iter().any(|x| x.s_name == s_rel_file);
+                    return Ok(b_found);
+                }
+
+                return Ok(false);
+            }
+
+            return Ok(false);
+        }
+
+        if s_path.starts_with("/search/hybrid/") {
+            let v_parts = split_clean_path(s_path);
+            println!("webdav dbg: path_exists search parts={:?}", v_parts);
+
+            if v_parts.len() == 2 {
+                return Ok(true);
+            }
+
+            if v_parts.len() == 3 {
+                let s_query = &v_parts[2];
+                let g = self.o_last_search.lock().unwrap();
+                if let Some(st) = g.as_ref() {
+                    return Ok(st.s_query == *s_query);
+                }
+                return Ok(false);
+            }
+
+            if v_parts.len() == 4 {
+                return Ok(parse_hit_dir_index(&v_parts[3]).is_some());
+            }
+
+            if v_parts.len() == 5 {
+                let b_file_ok = matches!(
+                    v_parts[4].as_str(),
+                    "document_path.txt" | "score.txt" | "snippet.txt" | "open_local.txt"
+                );
+                return Ok(b_file_ok);
+            }
+
+            return Ok(false);
+        }
+
+        Ok(false)
     }
-
-    if s_path.starts_with("/search/hybrid/") {
-        let v_parts = split_clean_path(s_path);
-        println!("webdav dbg: path_exists search parts={:?}", v_parts);
-
-        if v_parts.len() == 3 {
-            return Ok(self.o_last_search.lock().unwrap().is_some());
-        }
-
-        if v_parts.len() == 4 {
-            return Ok(parse_hit_dir_index(&v_parts[3]).is_some());
-        }
-
-        if v_parts.len() == 5 {
-            let b_file_ok = matches!(
-                v_parts[4].as_str(),
-                "document_path.txt" | "score.txt" | "snippet.txt" | "open_local.txt"
-            );
-            return Ok(b_file_ok);
-        }
-
-        return Ok(false);
-    }
-
-    Ok(false)
-}
 
     /**********************************************************************************************
      *  Historie
      *  14.05.2026  MS  - Initiale Umstellung auf parent_path gesteuerte Pfadauflosung
      **********************************************************************************************/
     fn direct_parent_path(s_path: &str) -> String {
-        /*
-         * Defensive:
-         * - Erwartet bereits normalisierte WebDAV Pfade
-         * - Gibt bei root einen leeren String zurueck
-         */
         let v_parts = split_clean_path(s_path);
 
         if v_parts.len() <= 1 {
@@ -533,11 +859,6 @@ impl WebDavGateway {
     }
 
     fn last_path_segment(s_path: &str) -> String {
-        /*
-         * Defensive:
-         * - Liefert das letzte Segment eines Pfades
-         * - Bei root wird ein leerer String geliefert
-         */
         let v_parts = split_clean_path(s_path);
 
         if let Some(s_last) = v_parts.last() {
@@ -546,7 +867,7 @@ impl WebDavGateway {
 
         String::new()
     }
-    // ===============================================
+
     fn list_entries(
         &self,
         s_path: &str,
@@ -579,21 +900,15 @@ impl WebDavGateway {
 
         let v_entries = if s_path == "/" {
             vec![
-                dir_entry("local", "/local/"),
                 dir_entry("peers", "/peers/"),
                 dir_entry("search", "/search/"),
             ]
         } else if s_path == "/local/" {
-            /*
-             * Wichtig:
-             * - /local/ bedeutet: alle lokalen Dokumente des lokalen Peers
-             * - Quelle ist dieselbe Logik wie fuer den CLI Befehl dir in main.rs
-             */
             let v_src = collect_local_doc_entries().map_err(|_| "internal_error".to_string())?;
             let mut v_out: Vec<WebDavEntry> = Vec::with_capacity(v_src.len());
 
             for e in v_src {
-                if !self.check_read_access(o_session, &e.s_name)? { 
+                if !self.check_read_access(o_session, &e.s_name)? {
                     println!(
                         "webdav dbg: list_entries local access_denied file={}",
                         e.s_name
@@ -635,7 +950,7 @@ impl WebDavGateway {
         self.meta_cache_put(s_path, &v_entries);
         Ok(v_entries)
     }
-    // ===============================================
+
     fn read_file(
         &self,
         s_path: &str,
@@ -652,7 +967,7 @@ impl WebDavGateway {
             return Ok(data);
         }
 
-        let data = if s_path.starts_with("/local/docs/") {
+        let data = if s_path.starts_with("/local/") {
             self.read_local_file(s_path, o_session)?
         } else if s_path.starts_with("/peers/") {
             self.read_peer_virtual_file(s_path, o_session)?
@@ -709,9 +1024,11 @@ impl WebDavGateway {
      *  Beschreibung
      *  - Listet lokale Dokumente rekursiv.
      *  - Dadurch erscheinen auch Dateien aus Unterordnern im WebDAV.
+     *  - Fuer Explorer werden lokale Dateien unter /peers/<peer>/docs dargestellt.
      *
      *  Historie
      *  14.05.2026  MS  - Rekursive Dateiliste fuer Windows Explorer
+     *  16.05.2026  MS  - Pfadausgabe fuer /peers/<peer>/docs vereinheitlicht
      **********************************************************************************************/
     fn collect_local_doc_entries_recursive(
         &self,
@@ -778,7 +1095,11 @@ impl WebDavGateway {
             };
 
             let s_name = p_rel.to_string_lossy().replace("\\", "/");
-            let s_path = format!("/local/docs/{}", encode_segment_path(&s_name));
+            let s_path = format!(
+                "/peers/{}/docs/{}",
+                encode_segment(&self.get_local_peer_id()),
+                encode_segment_path(&s_name)
+            );
 
             println!(
                 "webdav dbg: scan_dir add_file name={} webdav_path={} size={}",
@@ -948,12 +1269,12 @@ impl WebDavGateway {
 
         println!("webdav dbg: list_search_branch path={} parts={:?}", s_path, v_parts);
 
-        if v_parts.len() == 3 {
+        if v_parts.len() == 2 {
             return Ok(self.list_last_search_root());
         }
 
-        if v_parts.len() == 4 {
-            let s_query = &v_parts[3];
+        if v_parts.len() == 3 {
+            let s_query = &v_parts[2];
             let v_hits = self.get_last_search_hits_for_query(s_query)?;
 
             let mut v_out: Vec<WebDavEntry> = Vec::new();
@@ -987,9 +1308,9 @@ impl WebDavGateway {
             return Ok(v_out);
         }
 
-        if v_parts.len() == 5 {
-            let s_query = &v_parts[3];
-            let s_hit_dir = &v_parts[4];
+        if v_parts.len() == 4 {
+            let s_query = &v_parts[2];
+            let s_hit_dir = &v_parts[3];
             let i_hit_idx =
                 parse_hit_dir_index(s_hit_dir).ok_or_else(|| "not_found".to_string())?;
             let h = self.search_hit_by_index(s_query, i_hit_idx, o_session)?;
@@ -1032,45 +1353,45 @@ impl WebDavGateway {
     }
 
     fn read_local_file(
-    &self,
-    s_path: &str,
-    o_session: Option<&str>,
-) -> Result<WebDavFileData, String> {
-    let s_rel = s_path.trim_start_matches("/local/");
-    let s_name = decode_path(s_rel);
-    let p = PathBuf::from(cfg_get().s_doc_dir.clone()).join(&s_name);
-    let s_real = p.to_string_lossy().into_owned();
+        &self,
+        s_path: &str,
+        o_session: Option<&str>,
+    ) -> Result<WebDavFileData, String> {
+        let s_rel = s_path.trim_start_matches("/local/");
+        let s_name = decode_path(s_rel);
+        let p = PathBuf::from(cfg_get().s_doc_dir.clone()).join(&s_name);
+        let s_real = p.to_string_lossy().into_owned();
 
-    println!(
-        "webdav dbg: read_local_file webdav_path={} rel={} real={}",
-        s_path, s_name, s_real
-    );
+        println!(
+            "webdav dbg: read_local_file webdav_path={} rel={} real={}",
+            s_path, s_name, s_real
+        );
 
-    if !self.check_read_access(o_session, &s_name)? {
-        println!("webdav dbg: read_local_file forbidden real={}", s_real);
-        return Err("forbidden".to_string());
+        if !self.check_read_access(o_session, &s_name)? {
+            println!("webdav dbg: read_local_file forbidden real={}", s_real);
+            return Err("forbidden".to_string());
+        }
+
+        let md = std::fs::metadata(&p).map_err(|_| "not_found".to_string())?;
+        if md.is_dir() {
+            println!("webdav dbg: read_local_file is_dir real={}", s_real);
+            return Err("not_found".to_string());
+        }
+
+        let v_bytes = std::fs::read(&p).map_err(|_| "not_found".to_string())?;
+
+        println!(
+            "webdav dbg: read_local_file ok real={} bytes={}",
+            s_real,
+            v_bytes.len()
+        );
+
+        Ok(WebDavFileData {
+            v_bytes,
+            i_mtime_unix: system_time_to_unix(md.modified().ok()),
+            s_mime: mime_from_name(&s_name),
+        })
     }
-
-    let md = std::fs::metadata(&p).map_err(|_| "not_found".to_string())?;
-    if md.is_dir() {
-        println!("webdav dbg: read_local_file is_dir real={}", s_real);
-        return Err("not_found".to_string());
-    }
-
-    let v_bytes = std::fs::read(&p).map_err(|_| "not_found".to_string())?;
-
-    println!(
-        "webdav dbg: read_local_file ok real={} bytes={}",
-        s_real,
-        v_bytes.len()
-    );
-
-    Ok(WebDavFileData {
-        v_bytes,
-        i_mtime_unix: system_time_to_unix(md.modified().ok()),
-        s_mime: mime_from_name(&s_name),
-    })
-}
 
     fn read_peer_virtual_file(
         &self,
@@ -1277,18 +1598,17 @@ impl WebDavGateway {
         o_session: Option<&str>,
         s_path: &str,
     ) -> Result<bool, String> {
-        Ok(true)
-       /* 
-        let s_session = o_session.unwrap_or("");
+        let _s_session = o_session.unwrap_or("");
 
         println!(
             "webdav dbg: check_read_access session_present={} path={}",
-            !s_session.is_empty(),
+            !_s_session.is_empty(),
             s_path
         );
 
+        /*
         match self.iam.check_access(
-            s_session,
+            _s_session,
             s_path,
             right_read,
             cfg_get().b_iam_remote_scope_public,
@@ -1306,7 +1626,53 @@ impl WebDavGateway {
                 println!("webdav dbg: check_read_access error path={}", s_path);
                 Ok(false)
             }
-        }*/
+        }
+        */
+
+        Ok(true)
+    }
+
+    /**********************************************************************************************
+     *  Beschreibung
+     *  - Write Access Check fuer PUT.
+     *  - Keine unsicheren Defaults.
+     *
+     *  Historie
+     *  16.05.2026  MS  - Initiale Version
+     **********************************************************************************************/
+    fn check_write_access(
+        &self,
+        o_session: Option<&str>,
+        s_path: &str,
+    ) -> Result<bool, String> {
+        let s_session = o_session.unwrap_or("");
+
+        println!(
+            "webdav dbg: check_write_access session_present={} path={}",
+            !s_session.is_empty(),
+            s_path
+        );
+
+        match self.iam.check_access(
+            s_session,
+            s_path,
+            right_write,
+            cfg_get().b_iam_remote_scope_public,
+        ) {
+            Ok(dec) => {
+                println!(
+                    "webdav dbg: check_write_access allowed={} reason={} path={}",
+                    dec.b_allowed,
+                    dec.s_reason,
+                    s_path
+                );
+                Ok(dec.b_allowed)
+            }
+            Err(_) => {
+                println!("webdav dbg: check_write_access error path={}", s_path);
+                Ok(false)
+            }
+        }
     }
 
     fn meta_cache_get(&self, s_key: &str) -> Option<Vec<WebDavEntry>> {
@@ -1376,6 +1742,88 @@ impl WebDavGateway {
             },
         );
     }
+
+    /**********************************************************************************************
+     *  Beschreibung
+     *  - Entfernt abgelaufene Locks.
+     *
+     *  Historie
+     *  16.05.2026  MS  - Initiale Version
+     **********************************************************************************************/
+    fn cleanup_expired_locks(&self) {
+        let i_now_ms = now_ms();
+        let mut g = self.h_locks.lock().unwrap();
+
+        g.retain(|s_path, o_lock| {
+            let b_keep = i_now_ms.saturating_sub(o_lock.i_created_ms) <= o_lock.i_timeout_ms;
+            if !b_keep {
+                println!(
+                    "webdav dbg: lock expired path={} token={} owner={}",
+                    s_path, o_lock.s_token, o_lock.s_owner
+                );
+            }
+            b_keep
+        });
+    }
+
+    /**********************************************************************************************
+     *  Beschreibung
+     *  - Prueft, ob ein Pfad von einem anderen Token gesperrt ist.
+     *
+     *  Historie
+     *  16.05.2026  MS  - Initiale Version
+     **********************************************************************************************/
+    fn is_path_locked_by_other(
+        &self,
+        s_path: &str,
+        o_token: Option<&str>,
+    ) -> bool {
+        self.cleanup_expired_locks();
+
+        let g = self.h_locks.lock().unwrap();
+        let Some(o_lock) = g.get(s_path) else {
+            return false;
+        };
+
+        match o_token {
+            Some(s_token) if !s_token.trim().is_empty() => o_lock.s_token != s_token,
+            _ => true,
+        }
+    }
+
+    /**********************************************************************************************
+     *  Beschreibung
+     *  - Ordnet WebDAV Pfade auf lokale relative Dateinamen ab.
+     *
+     *  Historie
+     *  16.05.2026  MS  - Initiale Version
+     **********************************************************************************************/
+    fn map_webdav_path_to_local_rel_file(
+        &self,
+        s_path: &str,
+    ) -> Option<String> {
+        if s_path.starts_with("/local/") {
+            let s_rel = s_path.trim_start_matches("/local/").trim_matches('/');
+            if s_rel.is_empty() {
+                return None;
+            }
+            return Some(decode_path(s_rel));
+        }
+
+        if s_path.starts_with("/peers/") {
+            let v_parts = split_clean_path(s_path);
+            if v_parts.len() >= 4 && v_parts[2] == "docs" && v_parts[1] == self.get_local_peer_id()
+            {
+                let s_rel = v_parts[3..].join("/");
+                if s_rel.trim().is_empty() {
+                    return None;
+                }
+                return Some(s_rel);
+            }
+        }
+
+        None
+    }
 }
 
 /* ========================================================================================== */
@@ -1432,60 +1880,46 @@ pub async fn run_webdav_server(
 fn build_propfind_xml(s_base_path: &str, v_entries: &[WebDavEntry]) -> String {
     let mut s_xml = String::new();
 
-    s_xml.push_str(r#"<?xml version="1.0" encoding="utf-8"?>"#);
-    s_xml.push_str(r#"<D:multistatus xmlns:D="DAV:">"#);
+    s_xml.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>");
+    s_xml.push_str("<D:multistatus xmlns:D=\"DAV:\">");
 
-    s_xml.push_str(r#"<D:response>"#);
-    s_xml.push_str(&format!(
-        r#"<D:href>{}</D:href>"#,
-        escape_xml(&href_for_collection(s_base_path, true))
-    ));
-    s_xml.push_str(r#"<D:propstat><D:prop>"#);
-    s_xml.push_str(&format!(
-        r#"<D:displayname>{}</D:displayname>"#,
-        escape_xml(last_name_of_path(s_base_path))
-    ));
-    s_xml.push_str(r#"<D:resourcetype><D:collection/></D:resourcetype>"#);
-    s_xml.push_str(r#"<D:getcontentlength>0</D:getcontentlength>"#);
-    s_xml.push_str(&format!(
-        r#"<D:getlastmodified>{}</D:getlastmodified>"#,
-        http_date_from_unix(now_unix())
-    ));
-    s_xml.push_str(r#"</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>"#);
-    s_xml.push_str(r#"</D:response>"#);
+    s_xml.push_str("<D:response><D:href>");
+    s_xml.push_str(&escape_xml(&href_for_collection(s_base_path, true)));
+    s_xml.push_str("</D:href>");
+    s_xml.push_str("<D:propstat><D:prop><D:displayname>");
+    s_xml.push_str(&escape_xml(last_name_of_path(s_base_path)));
+    s_xml.push_str("</D:displayname><D:resourcetype><D:collection/></D:resourcetype><D:getcontentlength>0</D:getcontentlength>");
+    s_xml.push_str("<D:getlastmodified>");
+    s_xml.push_str(&http_date_from_unix(now_unix()));
+    s_xml.push_str("</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>");
+    s_xml.push_str("</D:response>");
 
     for e in v_entries {
-        s_xml.push_str(r#"<D:response>"#);
-        s_xml.push_str(&format!(
-            r#"<D:href>{}</D:href>"#,
-            escape_xml(&href_for_collection(&e.s_path, e.b_dir))
-        ));
-        s_xml.push_str(r#"<D:propstat><D:prop>"#);
-        s_xml.push_str(&format!(
-            r#"<D:displayname>{}</D:displayname>"#,
-            escape_xml(&e.s_name)
-        ));
+        s_xml.push_str("<D:response><D:href>");
+        s_xml.push_str(&escape_xml(&href_for_collection(&e.s_path, e.b_dir)));
+        s_xml.push_str("</D:href>");
+        s_xml.push_str("<D:propstat><D:prop><D:displayname>");
+        s_xml.push_str(&escape_xml(&e.s_name));
+        s_xml.push_str("</D:displayname>");
 
         if e.b_dir {
-            s_xml.push_str(r#"<D:resourcetype><D:collection/></D:resourcetype>"#);
-            s_xml.push_str(r#"<D:getcontentlength>0</D:getcontentlength>"#);
+            s_xml.push_str("<D:resourcetype><D:collection/></D:resourcetype><D:getcontentlength>0</D:getcontentlength>");
         } else {
-            s_xml.push_str(r#"<D:resourcetype></D:resourcetype>"#);
+            s_xml.push_str("<D:resourcetype/>");
             s_xml.push_str(&format!(
-                r#"<D:getcontentlength>{}</D:getcontentlength>"#,
+                "<D:getcontentlength>{}</D:getcontentlength>",
                 e.i_size
             ));
         }
 
-        s_xml.push_str(&format!(
-            r#"<D:getlastmodified>{}</D:getlastmodified>"#,
-            http_date_from_unix(e.i_mtime_unix)
-        ));
-        s_xml.push_str(r#"</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>"#);
-        s_xml.push_str(r#"</D:response>"#);
+        s_xml.push_str("<D:getlastmodified>");
+        s_xml.push_str(&http_date_from_unix(e.i_mtime_unix));
+        s_xml.push_str("</D:getlastmodified>");
+        s_xml.push_str("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>");
+        s_xml.push_str("</D:response>");
     }
 
-    s_xml.push_str(r#"</D:multistatus>"#);
+    s_xml.push_str("</D:multistatus>");
 
     println!(
         "webdav dbg: build_propfind_xml base={} entries={} xml_len={}",
@@ -1495,6 +1929,171 @@ fn build_propfind_xml(s_base_path: &str, v_entries: &[WebDavEntry]) -> String {
     );
 
     s_xml
+}
+
+fn build_search_response_xml(s_query: &str) -> String {
+    let s_href = format!("/search/hybrid/{}/", encode_segment(s_query));
+
+    let mut s_xml = String::new();
+    s_xml.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>");
+    s_xml.push_str("<D:multistatus xmlns:D=\"DAV:\">");
+    s_xml.push_str("<D:response><D:href>");
+    s_xml.push_str(&escape_xml(&s_href));
+    s_xml.push_str("</D:href>");
+    s_xml.push_str("<D:propstat><D:prop><D:displayname>");
+    s_xml.push_str(&escape_xml(s_query));
+    s_xml.push_str("</D:displayname><D:resourcetype><D:collection/></D:resourcetype>");
+    s_xml.push_str("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>");
+    s_xml.push_str("</D:response>");
+    s_xml.push_str("</D:multistatus>");
+    s_xml
+}
+
+/**********************************************************************************************
+ *  Beschreibung
+ *  - Baut XML Antwort fuer LOCK.
+ *
+ *  Historie
+ *  16.05.2026  MS  - Initiale Version
+ **********************************************************************************************/
+fn build_lock_response_xml(
+    s_path: &str,
+    s_token: &str,
+    s_owner: &str,
+) -> String {
+    let mut s_xml = String::new();
+    s_xml.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>");
+    s_xml.push_str("<D:prop xmlns:D=\"DAV:\">");
+    s_xml.push_str("<D:lockdiscovery><D:activelock>");
+    s_xml.push_str("<D:locktype><D:write/></D:locktype>");
+    s_xml.push_str("<D:lockscope><D:exclusive/></D:lockscope>");
+    s_xml.push_str("<D:depth>0</D:depth>");
+    s_xml.push_str("<D:owner>");
+    s_xml.push_str(&escape_xml(s_owner));
+    s_xml.push_str("</D:owner>");
+    s_xml.push_str("<D:timeout>Second-60</D:timeout>");
+    s_xml.push_str("<D:locktoken><D:href>");
+    s_xml.push_str(&escape_xml(s_token));
+    s_xml.push_str("</D:href></D:locktoken>");
+    s_xml.push_str("<D:lockroot><D:href>");
+    s_xml.push_str(&escape_xml(s_path));
+    s_xml.push_str("</D:href></D:lockroot>");
+    s_xml.push_str("</D:activelock></D:lockdiscovery>");
+    s_xml.push_str("</D:prop>");
+    s_xml
+}
+
+fn extract_search_query_from_body(s_body: &str) -> String {
+    let v_tags = ["query", "search", "like", "literal", "keyword", "q"];
+    let s_body_lower = s_body.to_ascii_lowercase();
+
+    for s_tag in v_tags {
+        let s_open = format!("<{}>", s_tag);
+        let s_close = format!("</{}>", s_tag);
+
+        if let Some(i_start) = s_body_lower.find(&s_open) {
+            let i_val_start = i_start + s_open.len();
+            if i_val_start > s_body.len() {
+                continue;
+            }
+
+            let s_tail = &s_body[i_val_start..];
+            let s_tail_lower = s_tail.to_ascii_lowercase();
+
+            if let Some(i_end_rel) = s_tail_lower.find(&s_close) {
+                let s_val = s_tail[..i_end_rel].trim();
+                if !s_val.is_empty() {
+                    return sanitize_search_query(s_val);
+                }
+            }
+        }
+    }
+
+    sanitize_search_query(s_body)
+}
+
+/**********************************************************************************************
+ *  Beschreibung
+ *  - Extrahiert optionalen Lock Owner aus XML.
+ *
+ *  Historie
+ *  16.05.2026  MS  - Initiale Version
+ **********************************************************************************************/
+fn extract_lock_owner(s_body: &str) -> String {
+    let s_body_lower = s_body.to_ascii_lowercase();
+    let v_tags = ["owner", "d:owner"];
+
+    for s_tag in v_tags {
+        let s_open = format!("<{}>", s_tag);
+        let s_close = format!("</{}>", s_tag);
+
+        if let Some(i_start) = s_body_lower.find(&s_open) {
+            let i_val_start = i_start + s_open.len();
+            if i_val_start > s_body.len() {
+                continue;
+            }
+
+            let s_tail = &s_body[i_val_start..];
+            let s_tail_lower = s_tail.to_ascii_lowercase();
+
+            if let Some(i_end_rel) = s_tail_lower.find(&s_close) {
+                let s_val = s_tail[..i_end_rel].trim();
+                if !s_val.is_empty() {
+                    return sanitize_search_query(s_val);
+                }
+            }
+        }
+    }
+
+    "unknown_owner".to_string()
+}
+
+/**********************************************************************************************
+ *  Beschreibung
+ *  - Extrahiert Lock Token aus If Header.
+ *
+ *  Historie
+ *  16.05.2026  MS  - Initiale Version
+ **********************************************************************************************/
+fn extract_lock_token_from_if_header(s_if: &str) -> String {
+    let s_trim = s_if.trim();
+
+    if let Some(i_start) = s_trim.find('<') {
+        if let Some(i_end_rel) = s_trim[i_start + 1..].find('>') {
+            return s_trim[i_start + 1..i_start + 1 + i_end_rel].to_string();
+        }
+    }
+
+    String::new()
+}
+
+/**********************************************************************************************
+ *  Beschreibung
+ *  - Erzeugt einen einfachen Lock Token.
+ *
+ *  Historie
+ *  16.05.2026  MS  - Initiale Version
+ **********************************************************************************************/
+fn generate_lock_token() -> String {
+    format!("opaquelocktoken:{:016x}{:016x}", now_ms(), now_unix())
+}
+
+fn sanitize_search_query(s_in: &str) -> String {
+    let mut s_out = String::new();
+
+    for ch in s_in.chars() {
+        if ch.is_control() {
+            continue;
+        }
+
+        s_out.push(ch);
+
+        if s_out.chars().count() >= I_MAX_QUERY_LEN {
+            break;
+        }
+    }
+
+    s_out.trim().to_string()
 }
 
 fn dir_entry(s_name: &str, s_path: &str) -> WebDavEntry {
@@ -1581,7 +2180,10 @@ fn normalize_webdav_path(s_path: &str) -> String {
         format!("/{}", s_trim)
     };
 
-    if s_norm == "/local" || s_norm == "/peers" || s_norm == "/search" || s_norm == "/search/hybrid"
+    if s_norm == "/local"
+        || s_norm == "/peers"
+        || s_norm == "/search"
+        || s_norm == "/search/hybrid"
     {
         s_norm.push('/');
         return s_norm;
@@ -1604,7 +2206,7 @@ fn normalize_webdav_path(s_path: &str) -> String {
 
     if s_norm.starts_with("/search/hybrid/") {
         let v_parts = split_clean_path(&s_norm);
-        if v_parts.len() == 3 || v_parts.len() == 4 {
+        if v_parts.len() == 2 || v_parts.len() == 3 || v_parts.len() == 4 {
             if !s_norm.ends_with('/') {
                 s_norm.push('/');
             }
@@ -1666,6 +2268,8 @@ fn mime_from_name(s_name: &str) -> String {
         "jpg" | "jpeg" => "image/jpeg".to_string(),
         "gif" => "image/gif".to_string(),
         "svg" => "image/svg+xml".to_string(),
+        "xls" => "application/vnd.ms-excel".to_string(),
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string(),
         _ => "application/octet-stream".to_string(),
     }
 }
@@ -1702,4 +2306,58 @@ fn http_date_from_unix(i_unix: u64) -> String {
         DateTime::<Utc>::from(SystemTime::UNIX_EPOCH + Duration::from_secs(i_unix));
 
     dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
+/**********************************************************************************************
+ *  Beschreibung
+ *  - Prueft relative Dokumentpfade defensiv.
+ *  - Keine absoluten Pfade, kein parent traversal.
+ *
+ *  Historie
+ *  16.05.2026  MS  - Initiale Version
+ **********************************************************************************************/
+fn is_safe_relative_doc_path(s_rel: &str) -> bool {
+    if s_rel.trim().is_empty() {
+        return false;
+    }
+
+    if s_rel.starts_with('/') || s_rel.starts_with('\\') {
+        return false;
+    }
+
+    let s_norm = s_rel.replace('\\', "/");
+
+    for s_part in s_norm.split('/') {
+        if s_part.is_empty() || s_part == "." || s_part == ".." {
+            return false;
+        }
+    }
+
+    true
+}
+
+/**********************************************************************************************
+ *  Beschreibung
+ *  - Best effort Pruefung, dass target innerhalb root liegt.
+ *
+ *  Historie
+ *  16.05.2026  MS  - Initiale Version
+ **********************************************************************************************/
+fn is_path_within_root(p_root: &Path, p_target: &Path) -> bool {
+    let p_root_abs = match std::fs::canonicalize(p_root) {
+        Ok(x) => x,
+        Err(_) => p_root.to_path_buf(),
+    };
+
+    let p_parent = match p_target.parent() {
+        Some(x) => x,
+        None => return false,
+    };
+
+    let p_parent_abs = match std::fs::canonicalize(p_parent) {
+        Ok(x) => x,
+        Err(_) => p_parent.to_path_buf(),
+    };
+
+    p_parent_abs.starts_with(&p_root_abs)
 }

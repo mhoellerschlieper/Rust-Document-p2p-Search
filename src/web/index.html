@@ -1,747 +1,730 @@
-<!-- ============================================================================================
+<!-- =========================================================================================
 Module name : web_ui
 File        : index.html
 Author      : Marcus Schlieper
-------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------
 Description
-- Spectacular premium dashboard UI for ExpChat.ai FileButler.
-- Fully rewritten frontend with icon driven navigation and modern glassmorphism design.
-- Uses backend endpoints through app.js only.
+- Updated frontend markup for ExpChat.ai FileButler.
+- Adds colorful icons for menu and action buttons.
+- Adds docs file explorer table for all peers including local peer.
 History
-2026-05-14  Marcus Schlieper
-- Full redesign with premium layout, icon system, animated gradients and immersive panels
-============================================================================================ -->
+2026-05-16  Marcus Schlieper
+- Added colorful icon system for menu buttons and main action buttons
+2026-05-16  Marcus Schlieper
+- Added docs explorer section with table and refresh action
+========================================================================================= -->
 <!DOCTYPE html>
 <html lang="de">
 <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>ExpChat.ai FileButler</title>
-    <meta name="color-scheme" content="dark light" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap"
-          rel="stylesheet" />
-    <link rel="stylesheet"
-          href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
-          integrity="sha512-SnH5WK+bZxgPHs44uWIX+LLJAJ9/2PkPKZ5QiAj6Ta86w+fsb2TkR4j8YihA7NxdxP2Vd2V0bQz8mWc2X4R0OQ=="
-          crossorigin="anonymous"
-          referrerpolicy="no-referrer" />
-    <link rel="stylesheet" href="/app.css" />
+    <meta charset="utf-8">
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>FileButler</title>
+    <link rel="stylesheet" href="/app.css">
 </head>
 <body>
-    <div class="bg_fx bg_fx_a"></div>
-    <div class="bg_fx bg_fx_b"></div>
-    <div class="bg_grid"></div>
+    <div class="bg_mesh"></div>
+    <div class="bg_orb bg_orb_a"></div>
+    <div class="bg_orb bg_orb_b"></div>
 
     <div class="app_shell">
         <aside class="sidebar glass">
-            <div class="sidebar_top">
-                <div class="brand_wrap">
+            <div>
+                <div class="brand">
                     <div class="brand_logo">
-                        <i class="fa-solid fa-wand-magic-sparkles"></i>
+                        <svg class="icon_logo" viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M4 7h16"></path>
+                            <path d="M4 12h16"></path>
+                            <path d="M4 17h10"></path>
+                        </svg>
                     </div>
                     <div>
                         <div class="brand_title">FileButler</div>
-                        <div class="brand_subtitle">by ExpChat.ai</div>
+                        <div class="brand_subtitle">p2p workspace</div>
                     </div>
                 </div>
 
-                <div class="nav_group_label">navigation</div>
+                <div class="nav_label">Menu</div>
                 <nav class="nav">
-                    <button class="nav_item active" data-view="view_overview" type="button">
-                        <i class="fa-solid fa-house nav_icon"></i>
+                    <button class="nav_item active" data_view="view_overview" type="button">
+                        <span class="nav_icon nav_icon_overview">
+                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M3 11l9-7 9 7"></path><path d="M5 10v10h14V10"></path></svg>
+                        </span>
                         <span>Overview</span>
                     </button>
-                    <button class="nav_item" data-view="view_peers" type="button">
-                        <i class="fa-solid fa-diagram-project nav_icon"></i>
+
+                    <button class="nav_item" data_view="view_peers" type="button">
+                        <span class="nav_icon nav_icon_peers">
+                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M22 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
+                        </span>
                         <span>Peers</span>
                     </button>
-                    <button class="nav_item" data-view="view_chat" type="button">
-                        <i class="fa-solid fa-comments nav_icon"></i>
+
+                    <button class="nav_item" data_view="view_chat" type="button">
+                        <span class="nav_icon nav_icon_chat">
+                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                        </span>
                         <span>Chat</span>
                     </button>
-                    <button class="nav_item" data-view="view_search" type="button">
-                        <i class="fa-solid fa-magnifying-glass nav_icon"></i>
+
+                    <button class="nav_item" data_view="view_search" type="button">
+                        <span class="nav_icon nav_icon_search">
+                            <svg class="icon_svg" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+                        </span>
                         <span>Search</span>
                     </button>
-                    <button class="nav_item" data-view="view_library" type="button">
-                        <i class="fa-solid fa-file-waveform nav_icon"></i>
-                        <span>Documents</span>
+
+                    <button class="nav_item" data_view="view_docs" type="button">
+                        <span class="nav_icon nav_icon_docs">
+                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6"></path></svg>
+                        </span>
+                        <span>Docs</span>
                     </button>
-                    <button class="nav_item" data-view="view_events" type="button">
-                        <i class="fa-solid fa-bolt nav_icon"></i>
+
+                    <button class="nav_item" data_view="view_events" type="button">
+                        <span class="nav_icon nav_icon_events">
+                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M3 12h4l3 8 4-16 3 8h4"></path></svg>
+                        </span>
                         <span>Events</span>
                     </button>
-                    <button class="nav_item" data-view="view_iam" type="button">
-                        <i class="fa-solid fa-shield-halved nav_icon"></i>
+
+                    <button class="nav_item" data_view="view_iam" type="button">
+                        <span class="nav_icon nav_icon_iam">
+                            <svg class="icon_svg" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="10" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+                        </span>
                         <span>IAM</span>
                     </button>
                 </nav>
             </div>
 
-            <div class="sidebar_bottom">
-                <div class="company_card soft_panel">
-                    <div class="company_title">ExpChat.ai</div>
-                    <div class="company_line">Epscheider Str21</div>
-                    <div class="company_line">58339 Breckerfeld</div>
-                    <div class="company_line">Tel: 49 2338 8748862</div>
-                    <div class="company_line">Mobil: 49 15115751864</div>
-                    <div class="company_line">mschlieper@ylook.de</div>
-                </div>
-                <div class="company_about">
-                    Der KI Chat Client fuer den Mittelstand aus Breckerfeld im Sauerland.
-                    RPA, KI Agents, KI Internet Research, KI Wissensmanagement.
-                    Wir bringen KI in den Mittelstand.
-                </div>
+            <div class="soft_panel">
+                <div class="company_title">ExpChat.ai</div>
+                <div class="company_line">Breckerfeld</div>
+                <div class="company_line">49 2338 8748862</div>
+                <div class="company_line">mschlieper@ylook.de</div>
             </div>
         </aside>
 
-        <div class="main_area">
+        <main class="main_area">
             <header class="topbar glass">
                 <div class="topbar_left">
                     <div class="hero_chip">
-                        <i class="fa-solid fa-sparkles"></i>
-                        <span>Premium Control Surface</span>
+                        <span class="chip_icon">
+                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"></path></svg>
+                        </span>
+                        <span>live p2p</span>
                     </div>
                     <div>
-                        <div class="topbar_title">ExpChat.ai FileButler</div>
-                        <div class="topbar_subtitle">P2P, search, documents and IAM in one experience</div>
+                        <div class="topbar_title">FileButler</div>
+                        <div class="topbar_subtitle">search, share, secure</div>
                     </div>
                 </div>
 
                 <div class="topbar_right">
-                    <div class="status_cluster">
-                        <div class="status_badge badge_off" id="status_badge">offline</div>
-                        <button class="icon_btn" id="btn_refresh_status" type="button" title="refresh status">
-                            <i class="fa-solid fa-rotate-right"></i>
-                        </button>
-                    </div>
+                    <div id="status_badge" class="status_badge badge_off">offline</div>
+                    <button id="btn_refresh_status" class="icon_btn" type="button" title="Refresh">
+                        <svg class="icon_svg" viewBox="0 0 24 24"><path d="M21 2v6h-6"></path><path d="M3 12a9 9 0 0 1 15.55-6.36L21 8"></path><path d="M3 22v-6h6"></path><path d="M21 12a9 9 0 0 1-15.55 6.36L3 16"></path></svg>
+                    </button>
                 </div>
             </header>
 
-            <main class="content">
-                <section class="hero_panel glass">
-                    <div class="hero_panel_left">
-                        <div class="eyebrow">AI knowledge and network orchestration</div>
-                        <h1 class="hero_title">
-                            Eine Oberflaeche fuer Peers, Wissen, Dokumente und sichere Kollaboration
-                        </h1>
-                        <p class="hero_text">
-                            Das Frontend nutzt die bekannten Backend Endpoints und praesentiert sie
-                            als moderne, visuell starke Anwendung mit Fokus auf Klarheit,
-                            Geschwindigkeit und Begeisterung.
-                        </p>
-                        <div class="hero_actions">
-                            <button class="primary_cta" type="button" data-jump-view="view_search">
-                                <i class="fa-solid fa-magnifying-glass"></i>
-                                <span>Suche starten</span>
-                            </button>
-                            <button class="secondary_cta" type="button" data-jump-view="view_peers">
-                                <i class="fa-solid fa-diagram-project"></i>
-                                <span>Peers ansehen</span>
-                            </button>
+            <section class="content">
+                <div id="view_overview" class="view">
+                    <div class="hero_panel glass">
+                        <div>
+                            <div class="eyebrow">Control</div>
+                            <h1 class="hero_title">Fast access to peers, chat and search</h1>
+                            <div class="hero_actions">
+                                <button class="primary_cta" type="button" data_jump_view="view_search">
+                                    <span class="btn_icon btn_icon_search">
+                                        <svg class="icon_svg" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+                                    </span>
+                                    <span>Search</span>
+                                </button>
+                                <button class="secondary_cta" type="button" data_jump_view="view_peers">
+                                    <span class="btn_icon btn_icon_peers">
+                                        <svg class="icon_svg" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M22 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
+                                    </span>
+                                    <span>Peers</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="hero_right">
+                            <div class="status_card">
+                                <div class="status_card_head">
+                                    <span>Live status</span>
+                                    <button id="btn_status_refresh" class="panel_btn small" type="button">
+                                        <span class="btn_icon btn_icon_refresh">
+                                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M21 2v6h-6"></path><path d="M3 12a9 9 0 0 1 15.55-6.36L21 8"></path><path d="M3 22v-6h6"></path><path d="M21 12a9 9 0 0 1-15.55 6.36L3 16"></path></svg>
+                                        </span>
+                                        <span>Refresh</span>
+                                    </button>
+                                </div>
+                                <div class="status_grid">
+                                    <div class="status_tile"><div class="status_tile_label">peer id</div><div id="st_peer_id" class="status_tile_value">-</div></div>
+                                    <div class="status_tile"><div class="status_tile_label">known peers</div><div id="st_known_peers" class="status_tile_value">0</div></div>
+                                    <div class="status_tile"><div class="status_tile_label">chat peer</div><div id="st_chat_peer" class="status_tile_value">-</div></div>
+                                    <div class="status_tile"><div class="status_tile_label">topic</div><div id="st_chat_topic" class="status_tile_value">-</div></div>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
-                    <div class="hero_panel_right">
-                        <div class="orbital_card">
-                            <div class="orbital_ring orbital_ring_a"></div>
-                            <div class="orbital_ring orbital_ring_b"></div>
-                            <div class="orbital_core">
-                                <i class="fa-solid fa-brain"></i>
+                    <div class="overview_feature_grid">
+                        <div class="feature_card panel glass">
+                            <div class="feature_head">
+                                <div class="feature_icon gradient_blue">
+                                    <svg class="icon_svg" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M22 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
+                                </div>
+                                <div><div class="feature_title">Peers</div><div class="feature_text">Connect and monitor nodes</div></div>
                             </div>
-                            <div class="orbital_stat orbital_stat_a">
-                                <div class="orbital_label">peer id</div>
-                                <div class="orbital_value mono" id="st_peer_id">-</div>
-                            </div>
-                            <div class="orbital_stat orbital_stat_b">
-                                <div class="orbital_label">known peers</div>
-                                <div class="orbital_value" id="st_known_peers">0</div>
-                            </div>
-                            <div class="orbital_stat orbital_stat_c">
-                                <div class="orbital_label">chat peer</div>
-                                <div class="orbital_value mono" id="st_chat_peer">-</div>
-                            </div>
-                            <div class="orbital_stat orbital_stat_d">
-                                <div class="orbital_label">chat topic</div>
-                                <div class="orbital_value mono" id="st_chat_topic">-</div>
-                            </div>
+                            <button class="feature_btn" type="button" data_jump_view="view_peers">Open</button>
                         </div>
-                    </div>
-                </section>
 
-                <section class="view" id="view_overview">
-                    <div class="dashboard_grid">
-                        <article class="feature_card glass">
-                            <div class="feature_icon gradient_purple">
-                                <i class="fa-solid fa-diagram-project"></i>
+                        <div class="feature_card panel glass">
+                            <div class="feature_head">
+                                <div class="feature_icon gradient_purple">
+                                    <svg class="icon_svg" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                                </div>
+                                <div><div class="feature_title">Chat</div><div class="feature_text">Direct p2p messaging</div></div>
                             </div>
-                            <div class="feature_title">Peers</div>
-                            <div class="feature_text">Netzwerkpartner erkennen, verbinden und steuern.</div>
-                            <button class="feature_btn" type="button" data-jump-view="view_peers">Open</button>
-                        </article>
+                            <button class="feature_btn" type="button" data_jump_view="view_chat">Open</button>
+                        </div>
 
-                        <article class="feature_card glass">
-                            <div class="feature_icon gradient_blue">
-                                <i class="fa-solid fa-comments"></i>
+                        <div class="feature_card panel glass">
+                            <div class="feature_head">
+                                <div class="feature_icon gradient_green">
+                                    <svg class="icon_svg" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+                                </div>
+                                <div><div class="feature_title">Search</div><div class="feature_text">Hybrid results and file actions</div></div>
                             </div>
-                            <div class="feature_title">Chat</div>
-                            <div class="feature_text">Direkter Nachrichtenaustausch ueber P2P.</div>
-                            <button class="feature_btn" type="button" data-jump-view="view_chat">Open</button>
-                        </article>
+                            <button class="feature_btn" type="button" data_jump_view="view_search">Open</button>
+                        </div>
 
-                        <article class="feature_card glass">
-                            <div class="feature_icon gradient_green">
-                                <i class="fa-solid fa-magnifying-glass"></i>
+                        <div class="feature_card panel glass">
+                            <div class="feature_head">
+                                <div class="feature_icon gradient_orange">
+                                    <svg class="icon_svg" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6"></path></svg>
+                                </div>
+                                <div><div class="feature_title">Docs</div><div class="feature_text">Preview and download</div></div>
                             </div>
-                            <div class="feature_title">Hybrid Search</div>
-                            <div class="feature_text">Wissen im Netzwerk finden und sofort lesen.</div>
-                            <button class="feature_btn" type="button" data-jump-view="view_search">Open</button>
-                        </article>
+                            <button class="feature_btn" type="button" data_jump_view="view_docs">Open</button>
+                        </div>
 
-                        <article class="feature_card glass">
-                            <div class="feature_icon gradient_orange">
-                                <i class="fa-solid fa-file-waveform"></i>
+                        <div class="feature_card panel glass">
+                            <div class="feature_head">
+                                <div class="feature_icon gradient_red">
+                                    <svg class="icon_svg" viewBox="0 0 24 24"><path d="M3 12h4l3 8 4-16 3 8h4"></path></svg>
+                                </div>
+                                <div><div class="feature_title">Events</div><div class="feature_text">Audit and live stream</div></div>
                             </div>
-                            <div class="feature_title">Documents</div>
-                            <div class="feature_text">Dateien laden, ansehen und herunterladen.</div>
-                            <button class="feature_btn" type="button" data-jump-view="view_library">Open</button>
-                        </article>
+                            <button class="feature_btn" type="button" data_jump_view="view_events">Open</button>
+                        </div>
 
-                        <article class="feature_card glass">
-                            <div class="feature_icon gradient_red">
-                                <i class="fa-solid fa-bolt"></i>
+                        <div class="feature_card panel glass">
+                            <div class="feature_head">
+                                <div class="feature_icon gradient_gold">
+                                    <svg class="icon_svg" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="10" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+                                </div>
+                                <div><div class="feature_title">IAM</div><div class="feature_text">Access and rights</div></div>
                             </div>
-                            <div class="feature_title">Events</div>
-                            <div class="feature_text">Diagnose und Aktivitaeten in Echtzeit sehen.</div>
-                            <button class="feature_btn" type="button" data-jump-view="view_events">Open</button>
-                        </article>
-
-                        <article class="feature_card glass">
-                            <div class="feature_icon gradient_gold">
-                                <i class="fa-solid fa-shield-halved"></i>
-                            </div>
-                            <div class="feature_title">IAM</div>
-                            <div class="feature_text">Benutzende, Gruppen und Pfade absichern.</div>
-                            <button class="feature_btn" type="button" data-jump-view="view_iam">Open</button>
-                        </article>
+                            <button class="feature_btn" type="button" data_jump_view="view_iam">Open</button>
+                        </div>
                     </div>
 
                     <div class="overview_panels">
-                        <section class="panel glass">
+                        <div class="panel glass">
                             <div class="panel_head">
-                                <div class="panel_title">
-                                    <i class="fa-solid fa-heart-pulse"></i>
-                                    <span>Live status</span>
-                                </div>
-                                <button class="panel_btn" id="btn_status_refresh" type="button">Refresh</button>
-                            </div>
-                            <div class="status_tiles">
-                                <div class="status_tile">
-                                    <div class="status_tile_label">peer id</div>
-                                    <div class="status_tile_value mono" id="st_peer_id_2">-</div>
-                                </div>
-                                <div class="status_tile">
-                                    <div class="status_tile_label">known peers</div>
-                                    <div class="status_tile_value" id="st_known_peers_2">0</div>
-                                </div>
-                                <div class="status_tile">
-                                    <div class="status_tile_label">chat peer</div>
-                                    <div class="status_tile_value mono" id="st_chat_peer_2">-</div>
-                                </div>
-                                <div class="status_tile">
-                                    <div class="status_tile_label">chat topic</div>
-                                    <div class="status_tile_value mono" id="st_chat_topic_2">-</div>
-                                </div>
-                            </div>
-                        </section>
-
-                        <section class="panel glass">
-                            <div class="panel_head">
-                                <div class="panel_title">
-                                    <i class="fa-solid fa-bolt"></i>
-                                    <span>Event stream</span>
-                                </div>
-                                <div class="panel_actions">
-                                    <button class="panel_btn" id="btn_refresh_events_from_overview" type="button">Refresh</button>
-                                    <button class="panel_btn secondary" id="btn_clear_events_box_from_overview" type="button">Clear</button>
-                                </div>
-                            </div>
-                            <pre class="events_box" id="events_box_overview"></pre>
-                        </section>
-                    </div>
-                </section>
-
-                <section class="view hidden" id="view_peers">
-                    <div class="section_head">
-                        <div>
-                            <div class="section_eyebrow">network layer</div>
-                            <h2 class="section_title">Peers</h2>
-                        </div>
-                        <div class="section_actions">
-                            <button class="panel_btn" id="btn_refresh_peers" type="button">
-                                <i class="fa-solid fa-rotate-right"></i>
-                                <span>Refresh peers</span>
-                            </button>
-                            <button class="panel_btn secondary" id="btn_copy_local_peer_id" type="button">
-                                <i class="fa-solid fa-copy"></i>
-                                <span>Copy local peer id</span>
-                            </button>
-                        </div>
-                    </div>
-
-                    <div class="peers_layout">
-                        <section class="panel glass">
-                            <div class="panel_head">
-                                <div class="panel_title">
-                                    <i class="fa-solid fa-nodes"></i>
-                                    <span>Known peers</span>
-                                </div>
-                            </div>
-                            <div class="table_wrap">
-                                <table class="table">
-                                    <thead>
-                                        <tr>
-                                            <th>peer_id</th>
-                                            <th>online</th>
-                                            <th>action</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody id="peers_table"></tbody>
-                                </table>
-                            </div>
-                        </section>
-
-                        <section class="panel glass">
-                            <div class="panel_head">
-                                <div class="panel_title">
-                                    <i class="fa-solid fa-plug-circle-plus"></i>
-                                    <span>Manual connect</span>
-                                </div>
-                            </div>
-                            <div class="stack">
-                                <label class="field_label" for="connect_peer_id">Peer ID</label>
-                                <div class="input_group">
-                                    <div class="input_icon"><i class="fa-solid fa-fingerprint"></i></div>
-                                    <input class="input mono"
-                                           id="connect_peer_id"
-                                           type="text"
-                                           placeholder="peer_id"
-                                           autocomplete="off" />
-                                </div>
-                                <button class="primary_cta wide" id="btn_connect" type="button">
-                                    <i class="fa-solid fa-plug"></i>
-                                    <span>Connect</span>
+                                <div class="panel_title">Status</div>
+                                <button id="btn_status_refresh_2" class="panel_btn small" type="button">
+                                    <span class="btn_icon btn_icon_refresh">
+                                        <svg class="icon_svg" viewBox="0 0 24 24"><path d="M21 2v6h-6"></path><path d="M3 12a9 9 0 0 1 15.55-6.36L21 8"></path><path d="M3 22v-6h6"></path><path d="M21 12a9 9 0 0 1-15.55 6.36L3 16"></path></svg>
+                                    </span>
+                                    <span>Refresh</span>
                                 </button>
-                                <div class="hint_box">
-                                    Die Verbindung setzt den aktuellen Chat Peer und das Chat Topic.
-                                </div>
                             </div>
-                        </section>
-                    </div>
-                </section>
-
-                <section class="view hidden" id="view_chat">
-                    <div class="section_head">
-                        <div>
-                            <div class="section_eyebrow">conversation layer</div>
-                            <h2 class="section_title">Chat</h2>
-                        </div>
-                    </div>
-
-                    <section class="chat_shell glass">
-                        <div class="chat_meta_bar">
-                            <div class="meta_pill">
-                                <i class="fa-solid fa-user-group"></i>
-                                <span>peer: <strong id="chat_meta_peer">-</strong></span>
-                            </div>
-                            <div class="meta_pill">
-                                <i class="fa-solid fa-hashtag"></i>
-                                <span>topic: <strong id="chat_meta_topic">-</strong></span>
+                            <div class="status_grid compact">
+                                <div class="status_tile"><div class="status_tile_label">peer id</div><div id="st_peer_id_2" class="status_tile_value">-</div></div>
+                                <div class="status_tile"><div class="status_tile_label">known peers</div><div id="st_known_peers_2" class="status_tile_value">0</div></div>
+                                <div class="status_tile"><div class="status_tile_label">chat peer</div><div id="st_chat_peer_2" class="status_tile_value">-</div></div>
+                                <div class="status_tile"><div class="status_tile_label">topic</div><div id="st_chat_topic_2" class="status_tile_value">-</div></div>
                             </div>
                         </div>
 
-                        <div class="chat_stage">
-                            <div class="chat_visual">
-                                <div class="chat_visual_glow"></div>
-                                <i class="fa-solid fa-paper-plane"></i>
-                            </div>
-
-                            <div class="chat_composer">
-                                <label class="field_label" for="send_text">Message</label>
-                                <textarea class="textarea"
-                                          id="send_text"
-                                          rows="6"
-                                          placeholder="Nachricht schreiben"></textarea>
-                                <div class="composer_actions">
-                                    <button class="primary_cta" id="btn_send_text" type="button">
-                                        <i class="fa-solid fa-paper-plane"></i>
-                                        <span>Send</span>
+                        <div class="panel glass">
+                            <div class="panel_head">
+                                <div class="panel_title">Events</div>
+                                <div class="panel_actions">
+                                    <button id="btn_refresh_events_from_overview" class="panel_btn small" type="button">
+                                        <span class="btn_icon btn_icon_events">
+                                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M3 12h4l3 8 4-16 3 8h4"></path></svg>
+                                        </span>
+                                        <span>Refresh</span>
                                     </button>
-                                    <button class="secondary_cta" id="btn_send_text_clear" type="button">
-                                        <i class="fa-solid fa-eraser"></i>
+                                    <button id="btn_clear_events_box_from_overview" class="panel_btn small secondary" type="button">
+                                        <span class="btn_icon btn_icon_clear">
+                                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path></svg>
+                                        </span>
                                         <span>Clear</span>
                                     </button>
                                 </div>
-                                <div class="hint_box">
-                                    Zum Senden ist eine aktive Peer Verbindung erforderlich.
-                                </div>
                             </div>
-                        </div>
-                    </section>
-                </section>
-
-                <section class="view hidden" id="view_search">
-                    <div class="section_head">
-                        <div>
-                            <div class="section_eyebrow">knowledge retrieval</div>
-                            <h2 class="section_title">Hybrid Search</h2>
-                        </div>
-                        <div class="section_actions">
-                            <button class="panel_btn" id="btn_search_poll_once" type="button">
-                                <i class="fa-solid fa-satellite-dish"></i>
-                                <span>Poll once</span>
-                            </button>
-                            <button class="panel_btn secondary" id="btn_search_stop_poll" type="button">
-                                <i class="fa-solid fa-circle-stop"></i>
-                                <span>Stop</span>
-                            </button>
+                            <pre id="events_box_overview" class="events_box compact"></pre>
                         </div>
                     </div>
+                </div>
 
-                    <div class="search_scene">
-                        <section class="panel glass search_form_panel">
-                            <div class="panel_head">
-                                <div class="panel_title">
-                                    <i class="fa-solid fa-sliders"></i>
-                                    <span>Search control</span>
-                                </div>
+                <div id="view_peers" class="view hidden">
+                    <div class="panel glass">
+                        <div class="section_head">
+                            <div>
+                                <div class="section_eyebrow">Peers</div>
+                                <h2 class="section_title">Peers</h2>
                             </div>
-
-                            <div class="search_form_grid">
-                                <div>
-                                    <label class="field_label" for="search_mode">Mode</label>
-                                    <div class="input_group">
-                                        <div class="input_icon"><i class="fa-solid fa-network-wired"></i></div>
-                                        <select class="select" id="search_mode">
-                                            <option value="combi" selected>combi</option>
-                                        </select>
-                                    </div>
-                                </div>
-
-                                <div>
-                                    <label class="field_label" for="search_limit">Limit</label>
-                                    <div class="input_group">
-                                        <div class="input_icon"><i class="fa-solid fa-list-ol"></i></div>
-                                        <input class="input"
-                                               id="search_limit"
-                                               type="number"
-                                               min="1"
-                                               max="50"
-                                               value="10" />
-                                    </div>
-                                </div>
-                            </div>
-
-                            <form id="search_form" autocomplete="off" class="search_bar">
-                                <div class="input_group search_query_group">
-                                    <div class="input_icon"><i class="fa-solid fa-magnifying-glass"></i></div>
-                                    <input class="input"
-                                           id="search_query"
-                                           type="text"
-                                           placeholder="z. B. KI Wissensmanagement Mittelstand"
-                                           autocomplete="off"
-                                           inputmode="text" />
-                                </div>
-                                <button class="primary_cta" id="btn_search" type="submit">
-                                    <i class="fa-solid fa-stars"></i>
-                                    <span>Search</span>
+                            <div class="section_actions">
+                                <button id="btn_refresh_peers" class="panel_btn" type="button">
+                                    <span class="btn_icon btn_icon_refresh">
+                                        <svg class="icon_svg" viewBox="0 0 24 24"><path d="M21 2v6h-6"></path><path d="M3 12a9 9 0 0 1 15.55-6.36L21 8"></path><path d="M3 22v-6h6"></path><path d="M21 12a9 9 0 0 1-15.55 6.36L3 16"></path></svg>
+                                    </span>
+                                    <span>Refresh</span>
                                 </button>
-                                <button class="secondary_cta" id="btn_search_clear" type="button">
-                                    <i class="fa-solid fa-broom"></i>
+                                <button id="btn_copy_local_peer_id" class="panel_btn secondary" type="button">
+                                    <span class="btn_icon btn_icon_copy">
+                                        <svg class="icon_svg" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                                    </span>
+                                    <span>Copy local peer id</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="section_grid section_grid_2">
+                            <div class="panel glass">
+                                <div class="panel_title">Known peers</div>
+                                <div class="table_wrap">
+                                    <table class="table peer_rich_table">
+                                        <thead>
+                                            <tr>
+                                                <th>Peer_id</th>
+                                                <th>Name</th>
+                                                <th>Ort</th>
+                                                <th>Status</th>
+                                                <th>Erreichbarkeit</th>
+                                                <th>Zuletzt online</th>
+                                                <th>Letzte Aktion</th>
+                                                <th>Aktion</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="peers_table"></tbody>
+                                    </table>
+                                </div>
+                            </div>
+
+                            <div class="panel glass">
+                                <div class="panel_title">Connect</div>
+                                <div class="stack">
+                                    <label class="field_label" for="connect_peer_id">Peer ID</label>
+                                    <div class="input_group">
+                                        <div class="input_icon">
+                                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M22 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
+                                        </div>
+                                        <input id="connect_peer_id" class="input" type="text" autocomplete="off">
+                                    </div>
+                                    <button id="btn_connect" class="primary_cta wide" type="button">
+                                        <span class="btn_icon btn_icon_connect">
+                                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M8 12h8"></path><path d="M12 8l4 4-4 4"></path><path d="M20 12a8 8 0 1 1-2.34-5.66"></path></svg>
+                                        </span>
+                                        <span>Connect</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="view_chat" class="view hidden">
+                    <div class="chat_shell glass">
+                        <div class="section_head">
+                            <div>
+                                <div class="section_eyebrow">Chat</div>
+                                <h2 class="section_title">Chat</h2>
+                            </div>
+                        </div>
+
+                        <div class="chat_meta_bar">
+                            <div class="meta_pill">peer: <span id="chat_meta_peer">-</span></div>
+                            <div class="meta_pill">topic: <span id="chat_meta_topic">-</span></div>
+                        </div>
+
+                        <div class="stack">
+                            <label class="field_label" for="send_text">Message</label>
+                            <textarea id="send_text" class="textarea"></textarea>
+                            <div class="composer_actions">
+                                <button id="btn_send_text" class="primary_cta" type="button">
+                                    <span class="btn_icon btn_icon_send">
+                                        <svg class="icon_svg" viewBox="0 0 24 24"><path d="M22 2L11 13"></path><path d="M22 2L15 22l-4-9-9-4 20-7z"></path></svg>
+                                    </span>
+                                    <span>Send</span>
+                                </button>
+                                <button id="btn_send_text_clear" class="secondary_cta" type="button">
+                                    <span class="btn_icon btn_icon_clear">
+                                        <svg class="icon_svg" viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path></svg>
+                                    </span>
                                     <span>Clear</span>
                                 </button>
-                            </form>
+                            </div>
+                        </div>
+                    </div>
+                </div>
 
-                            <div class="search_meta">
-                                <div class="meta_pill">
-                                    <i class="fa-solid fa-id-badge"></i>
-                                    <span>search_id: <strong id="search_id">-</strong></span>
-                                </div>
-                                <div class="meta_pill">
-                                    <i class="fa-solid fa-wave-square"></i>
-                                    <span>poll_state: <strong id="search_poll_state">idle</strong></span>
+                <div id="view_search" class="view hidden">
+                    <div class="panel glass">
+                        <div class="section_head">
+                            <div>
+                                <div class="section_eyebrow">Search</div>
+                                <h2 class="section_title">Search</h2>
+                            </div>
+                            <div class="section_actions">
+                                <button id="btn_search_poll_once" class="panel_btn" type="button">
+                                    <span class="btn_icon btn_icon_refresh">
+                                        <svg class="icon_svg" viewBox="0 0 24 24"><path d="M21 2v6h-6"></path><path d="M3 12a9 9 0 0 1 15.55-6.36L21 8"></path><path d="M3 22v-6h6"></path><path d="M21 12a9 9 0 0 1-15.55 6.36L3 16"></path></svg>
+                                    </span>
+                                    <span>Poll once</span>
+                                </button>
+                                <button id="btn_search_stop_poll" class="panel_btn secondary" type="button">
+                                    <span class="btn_icon btn_icon_stop">
+                                        <svg class="icon_svg" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
+                                    </span>
+                                    <span>Stop</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="section_grid section_grid_search">
+                            <div class="panel glass">
+                                <div class="panel_title">Hybrid search</div>
+
+                                <form id="search_form" class="stack">
+                                    <div class="search_form_grid">
+                                        <div>
+                                            <label class="field_label" for="search_mode">Mode</label>
+                                            <div class="input_group">
+                                                <div class="input_icon">
+                                                    <svg class="icon_svg" viewBox="0 0 24 24"><path d="M4 7h16"></path><path d="M7 12h10"></path><path d="M10 17h4"></path></svg>
+                                                </div>
+                                                <select id="search_mode" class="select">
+                                                    <option value="combi">combi</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <label class="field_label" for="search_limit">Limit</label>
+                                            <div class="input_group">
+                                                <div class="input_icon">
+                                                    <svg class="icon_svg" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"></path><path d="M9 9h6v6H9z"></path></svg>
+                                                </div>
+                                                <input id="search_limit" class="input" type="number" min="1" max="50" value="10">
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div class="search_bar">
+                                        <div class="input_group">
+                                            <div class="input_icon">
+                                                <svg class="icon_svg" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+                                            </div>
+                                            <input id="search_query" class="input" type="text" autocomplete="off">
+                                        </div>
+                                        <button id="btn_search" class="primary_cta" type="submit">
+                                            <span class="btn_icon btn_icon_search">
+                                                <svg class="icon_svg" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+                                            </span>
+                                            <span>Search</span>
+                                        </button>
+                                        <button id="btn_search_clear" class="secondary_cta" type="button">
+                                            <span class="btn_icon btn_icon_clear">
+                                                <svg class="icon_svg" viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path></svg>
+                                            </span>
+                                            <span>Clear</span>
+                                        </button>
+                                    </div>
+
+                                    <div class="search_meta">
+                                        <div class="meta_pill">search_id: <span id="search_id">-</span></div>
+                                        <div class="meta_pill">poll_state: <span id="search_poll_state">idle</span></div>
+                                    </div>
+                                </form>
+
+                                <div class="search_results_wrap">
+                                    <table class="table search_result_table">
+                                        <thead>
+                                            <tr>
+                                                <th>Titel</th>
+                                                <th>Dateiname</th>
+                                                <th>PeerID</th>
+                                                <th>PeerName</th>
+                                                <th>Score</th>
+                                                <th>Tags</th>
+                                                <th>Klassifikation</th>
+                                                <th>Aktionen</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="search_results"></tbody>
+                                    </table>
                                 </div>
                             </div>
-                        </section>
 
-                        <div class="search_results_layout">
-                            <section class="panel glass">
+                            <div class="panel glass">
                                 <div class="panel_head">
-                                    <div class="panel_title">
-                                        <i class="fa-solid fa-layer-group"></i>
-                                        <span>Result list</span>
-                                    </div>
-                                </div>
-                                <div id="search_results" class="search_results"></div>
-                            </section>
-
-                            <section class="panel glass">
-                                <div class="panel_head">
-                                    <div class="panel_title">
-                                        <i class="fa-solid fa-file-lines"></i>
-                                        <span>Document viewer</span>
-                                    </div>
-                                    <button class="panel_btn secondary" id="btn_doc_clear" type="button">
-                                        <i class="fa-solid fa-xmark"></i>
+                                    <div class="panel_title">Viewer</div>
+                                    <button id="btn_doc_clear" class="panel_btn small secondary" type="button">
+                                        <span class="btn_icon btn_icon_clear">
+                                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path></svg>
+                                        </span>
                                         <span>Clear</span>
                                     </button>
                                 </div>
 
-                                <div class="doc_header mono" id="doc_title">-</div>
+                                <div id="doc_title" class="doc_header">-</div>
 
                                 <div id="doc_text_wrap">
-                                    <pre class="doc_text" id="doc_text"></pre>
-                                    <div class="hint_box">
-                                        Klick auf einen Treffer, um Text oder Datei anzuzeigen.
-                                    </div>
+                                    <pre id="doc_text" class="doc_text"></pre>
                                 </div>
 
                                 <div id="doc_preview_wrap" class="hidden">
-                                    <iframe id="doc_file_preview"
-                                            title="document_preview"></iframe>
-                                    <div class="hint_box">
-                                        PDF Dateien werden direkt angezeigt. Andere Dateitypen werden heruntergeladen.
+                                    <iframe id="doc_file_preview" title="preview"></iframe>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="view_docs" class="view hidden">
+                    <div class="panel glass">
+                        <div class="section_head">
+                            <div>
+                                <div class="section_eyebrow">Docs</div>
+                                <h2 class="section_title">Docs</h2>
+                            </div>
+                            <div class="section_actions">
+                                <button id="btn_docs_refresh" class="panel_btn" type="button">
+                                    <span class="btn_icon btn_icon_refresh">
+                                        <svg class="icon_svg" viewBox="0 0 24 24"><path d="M21 2v6h-6"></path><path d="M3 12a9 9 0 0 1 15.55-6.36L21 8"></path><path d="M3 22v-6h6"></path><path d="M21 12a9 9 0 0 1-15.55 6.36L3 16"></path></svg>
+                                    </span>
+                                    <span>Refresh explorer</span>
+                                </button>
+                                <button class="secondary_cta" type="button" data_jump_view="view_search">
+                                    <span class="btn_icon btn_icon_search">
+                                        <svg class="icon_svg" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+                                    </span>
+                                    <span>To search</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="panel glass">
+                            <div class="panel_title">Document explorer across all peers</div>
+                            <div class="table_wrap docs_explorer_wrap">
+                                <table class="table docs_table">
+                                    <thead>
+                                        <tr>
+                                            <th>Icon</th>
+                                            <th>Dateiname</th>
+                                            <th>Pfad</th>
+                                            <th>Peer_id</th>
+                                            <th>Peer</th>
+                                            <th>Status</th>
+                                            <th>Verfuegbarkeit</th>
+                                            <th>Erstellt am</th>
+                                            <th>Zuletzt angefordert</th>
+                                            <th>Download</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="docs_explorer_table"></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="view_events" class="view hidden">
+                    <div class="panel glass">
+                        <div class="section_head">
+                            <div>
+                                <div class="section_eyebrow">Events</div>
+                                <h2 class="section_title">Events</h2>
+                            </div>
+                            <div class="section_actions">
+                                <button id="btn_refresh_events" class="panel_btn" type="button">
+                                    <span class="btn_icon btn_icon_events">
+                                        <svg class="icon_svg" viewBox="0 0 24 24"><path d="M3 12h4l3 8 4-16 3 8h4"></path></svg>
+                                    </span>
+                                    <span>Refresh</span>
+                                </button>
+                                <button id="btn_clear_events_box" class="panel_btn secondary" type="button">
+                                    <span class="btn_icon btn_icon_clear">
+                                        <svg class="icon_svg" viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path></svg>
+                                    </span>
+                                    <span>Clear</span>
+                                </button>
+                            </div>
+                        </div>
+                        <pre id="events_box" class="events_box events_large"></pre>
+                    </div>
+                </div>
+
+                <div id="view_iam" class="view hidden">
+                    <div class="panel glass">
+                        <div class="section_head">
+                            <div>
+                                <div class="section_eyebrow">IAM</div>
+                                <h2 class="section_title">IAM</h2>
+                            </div>
+                        </div>
+
+                        <div class="section_grid section_grid_iam">
+                            <div class="panel glass">
+                                <div class="panel_title">Login</div>
+                                <div class="stack">
+                                    <label class="field_label" for="iam_login_user">User</label>
+                                    <div class="input_group">
+                                        <div class="input_icon"><svg class="icon_svg" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"></circle><path d="M4 20a8 8 0 0 1 16 0"></path></svg></div>
+                                        <input id="iam_login_user" class="input" type="text" autocomplete="off">
                                     </div>
+
+                                    <label class="field_label" for="iam_login_pass">Password</label>
+                                    <div class="input_group">
+                                        <div class="input_icon"><svg class="icon_svg" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="10" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg></div>
+                                        <input id="iam_login_pass" class="input" type="password" autocomplete="off">
+                                    </div>
+
+                                    <button id="btn_iam_login" class="primary_cta" type="button">
+                                        <span class="btn_icon btn_icon_login">
+                                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path><path d="M10 17l5-5-5-5"></path><path d="M15 12H3"></path></svg>
+                                        </span>
+                                        <span>Login</span>
+                                    </button>
+
+                                    <div class="meta_pill">session: <span id="iam_session">-</span></div>
                                 </div>
-                            </section>
+                            </div>
+
+                            <div class="panel glass">
+                                <div class="panel_title">Group add</div>
+                                <div class="stack">
+                                    <label class="field_label" for="iam_group">Group</label>
+                                    <div class="input_group">
+                                        <div class="input_icon"><svg class="icon_svg" viewBox="0 0 24 24"><path d="M3 7h18"></path><path d="M3 12h18"></path><path d="M3 17h18"></path></svg></div>
+                                        <input id="iam_group" class="input" type="text" autocomplete="off">
+                                    </div>
+
+                                    <div class="field_label">Rights</div>
+                                    <div class="rights_grid">
+                                        <label class="check_tile"><input id="iam_group_right_read" type="checkbox"> read</label>
+                                        <label class="check_tile"><input id="iam_group_right_write" type="checkbox"> write</label>
+                                        <label class="check_tile"><input id="iam_group_right_create" type="checkbox"> create</label>
+                                        <label class="check_tile"><input id="iam_group_right_publish" type="checkbox"> publish</label>
+                                        <label class="check_tile"><input id="iam_group_right_local" type="checkbox"> local</label>
+                                        <label class="check_tile"><input id="iam_group_right_public" type="checkbox"> public</label>
+                                        <label class="check_tile"><input id="iam_group_right_admin" type="checkbox"> admin</label>
+                                    </div>
+
+                                    <div class="meta_pill">rights_mask_dec: <span id="iam_group_rights_preview">0</span></div>
+
+                                    <button id="btn_iam_group_add" class="primary_cta" type="button">
+                                        <span class="btn_icon btn_icon_add">
+                                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>
+                                        </span>
+                                        <span>Add group</span>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div class="panel glass">
+                                <div class="panel_title">User add</div>
+                                <div class="stack">
+                                    <label class="field_label" for="iam_user">User</label>
+                                    <div class="input_group">
+                                        <div class="input_icon"><svg class="icon_svg" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"></circle><path d="M4 20a8 8 0 0 1 16 0"></path></svg></div>
+                                        <input id="iam_user" class="input" type="text" autocomplete="off">
+                                    </div>
+
+                                    <label class="field_label" for="iam_user_pass">Password</label>
+                                    <div class="input_group">
+                                        <div class="input_icon"><svg class="icon_svg" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="10" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg></div>
+                                        <input id="iam_user_pass" class="input" type="password" autocomplete="off">
+                                    </div>
+
+                                    <label class="field_label" for="iam_user_group_select">Group</label>
+                                    <div class="input_group">
+                                        <div class="input_icon"><svg class="icon_svg" viewBox="0 0 24 24"><path d="M7 10h10"></path><path d="M7 14h7"></path><path d="M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"></path></svg></div>
+                                        <select id="iam_user_group_select" class="select"></select>
+                                    </div>
+
+                                    <button id="btn_iam_user_add" class="primary_cta" type="button">
+                                        <span class="btn_icon btn_icon_add_user">
+                                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><path d="M20 8v6"></path><path d="M17 11h6"></path></svg>
+                                        </span>
+                                        <span>Add user</span>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div class="panel glass">
+                                <div class="panel_title">Path add</div>
+                                <div class="stack">
+                                    <label class="field_label" for="iam_path">Path</label>
+                                    <div class="input_group">
+                                        <div class="input_icon"><svg class="icon_svg" viewBox="0 0 24 24"><path d="M3 7h5l2 2h11v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path></svg></div>
+                                        <input id="iam_path" class="input" type="text" autocomplete="off">
+                                    </div>
+
+                                    <label class="field_label" for="iam_path_group">Group or -</label>
+                                    <div class="input_group">
+                                        <div class="input_icon"><svg class="icon_svg" viewBox="0 0 24 24"><path d="M3 7h18"></path><path d="M6 12h12"></path><path d="M9 17h6"></path></svg></div>
+                                        <input id="iam_path_group" class="input" type="text" autocomplete="off">
+                                    </div>
+
+                                    <label class="field_label" for="iam_path_public">Public</label>
+                                    <div class="input_group">
+                                        <div class="input_icon"><svg class="icon_svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M3 12h18"></path><path d="M12 3a15 15 0 0 1 0 18"></path><path d="M12 3a15 15 0 0 0 0 18"></path></svg></div>
+                                        <select id="iam_path_public" class="select">
+                                            <option value="true">public=true</option>
+                                            <option value="false">public=false</option>
+                                        </select>
+                                    </div>
+
+                                    <div class="field_label">Rights</div>
+                                    <div class="rights_grid">
+                                        <label class="check_tile"><input id="iam_path_right_read" type="checkbox"> read</label>
+                                        <label class="check_tile"><input id="iam_path_right_write" type="checkbox"> write</label>
+                                        <label class="check_tile"><input id="iam_path_right_create" type="checkbox"> create</label>
+                                        <label class="check_tile"><input id="iam_path_right_publish" type="checkbox"> publish</label>
+                                        <label class="check_tile"><input id="iam_path_right_local" type="checkbox"> local</label>
+                                        <label class="check_tile"><input id="iam_path_right_public" type="checkbox"> public</label>
+                                        <label class="check_tile"><input id="iam_path_right_admin" type="checkbox"> admin</label>
+                                    </div>
+
+                                    <div class="meta_pill">rights_mask_dec: <span id="iam_path_rights_preview">0</span></div>
+
+                                    <button id="btn_iam_path_add" class="primary_cta" type="button">
+                                        <span class="btn_icon btn_icon_add">
+                                            <svg class="icon_svg" viewBox="0 0 24 24"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>
+                                        </span>
+                                        <span>Add path</span>
+                                    </button>
+                                </div>
+                            </div>
                         </div>
                     </div>
-                </section>
-
-                <section class="view hidden" id="view_library">
-                    <div class="section_head">
-                        <div>
-                            <div class="section_eyebrow">document access</div>
-                            <h2 class="section_title">Documents</h2>
-                        </div>
-                    </div>
-
-                    <section class="panel glass center_panel">
-                        <div class="big_icon">
-                            <i class="fa-solid fa-folder-open"></i>
-                        </div>
-                        <h3 class="center_title">Dokumente ueber Suche entdecken</h3>
-                        <p class="center_text">
-                            Diese Anwendung nutzt die bekannten Datei Endpoints im Zusammenhang mit
-                            Suchtreffern. Ueber die Suche lassen sich Dokumente abrufen, als Text
-                            anzeigen oder herunterladen.
-                        </p>
-                        <button class="primary_cta" type="button" data-jump-view="view_search">
-                            <i class="fa-solid fa-magnifying-glass"></i>
-                            <span>Zur Suche</span>
-                        </button>
-                    </section>
-                </section>
-
-                <section class="view hidden" id="view_events">
-                    <div class="section_head">
-                        <div>
-                            <div class="section_eyebrow">diagnostics</div>
-                            <h2 class="section_title">Events</h2>
-                        </div>
-                        <div class="section_actions">
-                            <button class="panel_btn" id="btn_refresh_events" type="button">
-                                <i class="fa-solid fa-rotate-right"></i>
-                                <span>Refresh</span>
-                            </button>
-                            <button class="panel_btn secondary" id="btn_clear_events_box" type="button">
-                                <i class="fa-solid fa-trash"></i>
-                                <span>Clear</span>
-                            </button>
-                        </div>
-                    </div>
-
-                    <section class="panel glass">
-                        <div class="panel_head">
-                            <div class="panel_title">
-                                <i class="fa-solid fa-bolt-lightning"></i>
-                                <span>Event ring</span>
-                            </div>
-                        </div>
-                        <pre class="events_box events_large" id="events_box"></pre>
-                    </section>
-                </section>
-
-                <section class="view hidden" id="view_iam">
-                    <div class="section_head">
-                        <div>
-                            <div class="section_eyebrow">identity and access</div>
-                            <h2 class="section_title">IAM</h2>
-                        </div>
-                    </div>
-
-                    <div class="iam_grid">
-                        <section class="panel glass">
-                            <div class="panel_head">
-                                <div class="panel_title">
-                                    <i class="fa-solid fa-right-to-bracket"></i>
-                                    <span>Login</span>
-                                </div>
-                            </div>
-                            <div class="stack">
-                                <label class="field_label" for="iam_login_user">User</label>
-                                <div class="input_group">
-                                    <div class="input_icon"><i class="fa-solid fa-user"></i></div>
-                                    <input class="input" id="iam_login_user" type="text" placeholder="user" />
-                                </div>
-
-                                <label class="field_label" for="iam_login_pass">Password</label>
-                                <div class="input_group">
-                                    <div class="input_icon"><i class="fa-solid fa-lock"></i></div>
-                                    <input class="input" id="iam_login_pass" type="password" placeholder="password" />
-                                </div>
-
-                                <button class="primary_cta wide" id="btn_iam_login" type="button">
-                                    <i class="fa-solid fa-right-to-bracket"></i>
-                                    <span>Login</span>
-                                </button>
-
-                                <div class="meta_pill">
-                                    <i class="fa-solid fa-key"></i>
-                                    <span>session: <strong class="mono" id="iam_session">-</strong></span>
-                                </div>
-                            </div>
-                        </section>
-
-                        <section class="panel glass">
-                            <div class="panel_head">
-                                <div class="panel_title">
-                                    <i class="fa-solid fa-people-group"></i>
-                                    <span>Group add</span>
-                                </div>
-                            </div>
-                            <div class="stack">
-                                <label class="field_label" for="iam_group">Group</label>
-                                <div class="input_group">
-                                    <div class="input_icon"><i class="fa-solid fa-users"></i></div>
-                                    <input class="input" id="iam_group" type="text" placeholder="group" />
-                                </div>
-
-                                <div class="rights_grid">
-                                    <label class="check_tile"><input type="checkbox" id="iam_group_right_read" /> <span>read</span></label>
-                                    <label class="check_tile"><input type="checkbox" id="iam_group_right_write" /> <span>write</span></label>
-                                    <label class="check_tile"><input type="checkbox" id="iam_group_right_create" /> <span>create</span></label>
-                                    <label class="check_tile"><input type="checkbox" id="iam_group_right_publish" /> <span>publish</span></label>
-                                    <label class="check_tile"><input type="checkbox" id="iam_group_right_local" /> <span>local</span></label>
-                                    <label class="check_tile"><input type="checkbox" id="iam_group_right_public" /> <span>public</span></label>
-                                    <label class="check_tile"><input type="checkbox" id="iam_group_right_admin" /> <span>admin</span></label>
-                                </div>
-
-                                <div class="meta_pill">
-                                    <i class="fa-solid fa-binary"></i>
-                                    <span>rights_mask_dec: <strong class="mono" id="iam_group_rights_preview">0</strong></span>
-                                </div>
-
-                                <button class="primary_cta wide" id="btn_iam_group_add" type="button">
-                                    <i class="fa-solid fa-plus"></i>
-                                    <span>Add group</span>
-                                </button>
-                            </div>
-                        </section>
-
-                        <section class="panel glass">
-                            <div class="panel_head">
-                                <div class="panel_title">
-                                    <i class="fa-solid fa-user-plus"></i>
-                                    <span>User add</span>
-                                </div>
-                            </div>
-                            <div class="stack">
-                                <label class="field_label" for="iam_user">User</label>
-                                <div class="input_group">
-                                    <div class="input_icon"><i class="fa-solid fa-user-plus"></i></div>
-                                    <input class="input" id="iam_user" type="text" placeholder="user" />
-                                </div>
-
-                                <label class="field_label" for="iam_user_pass">Password</label>
-                                <div class="input_group">
-                                    <div class="input_icon"><i class="fa-solid fa-lock"></i></div>
-                                    <input class="input" id="iam_user_pass" type="password" placeholder="password" />
-                                </div>
-
-                                <label class="field_label" for="iam_user_group_select">Group</label>
-                                <div class="input_group">
-                                    <div class="input_icon"><i class="fa-solid fa-layer-group"></i></div>
-                                    <select class="select" id="iam_user_group_select"></select>
-                                </div>
-
-                                <button class="primary_cta wide" id="btn_iam_user_add" type="button">
-                                    <i class="fa-solid fa-user-plus"></i>
-                                    <span>Add user</span>
-                                </button>
-                            </div>
-                        </section>
-
-                        <section class="panel glass">
-                            <div class="panel_head">
-                                <div class="panel_title">
-                                    <i class="fa-solid fa-route"></i>
-                                    <span>Path add</span>
-                                </div>
-                            </div>
-                            <div class="stack">
-                                <label class="field_label" for="iam_path">Path</label>
-                                <div class="input_group">
-                                    <div class="input_icon"><i class="fa-solid fa-folder-tree"></i></div>
-                                    <input class="input" id="iam_path" type="text" placeholder="path" />
-                                </div>
-
-                                <label class="field_label" for="iam_path_group">Group or -</label>
-                                <div class="input_group">
-                                    <div class="input_icon"><i class="fa-solid fa-users-gear"></i></div>
-                                    <input class="input" id="iam_path_group" type="text" placeholder="group or -" />
-                                </div>
-
-                                <label class="field_label" for="iam_path_public">Public</label>
-                                <div class="input_group">
-                                    <div class="input_icon"><i class="fa-solid fa-earth-europe"></i></div>
-                                    <select class="select" id="iam_path_public">
-                                        <option value="true">public=true</option>
-                                        <option value="false">public=false</option>
-                                    </select>
-                                </div>
-
-                                <div class="rights_grid">
-                                    <label class="check_tile"><input type="checkbox" id="iam_path_right_read" /> <span>read</span></label>
-                                    <label class="check_tile"><input type="checkbox" id="iam_path_right_write" /> <span>write</span></label>
-                                    <label class="check_tile"><input type="checkbox" id="iam_path_right_create" /> <span>create</span></label>
-                                    <label class="check_tile"><input type="checkbox" id="iam_path_right_publish" /> <span>publish</span></label>
-                                    <label class="check_tile"><input type="checkbox" id="iam_path_right_local" /> <span>local</span></label>
-                                    <label class="check_tile"><input type="checkbox" id="iam_path_right_public" /> <span>public</span></label>
-                                    <label class="check_tile"><input type="checkbox" id="iam_path_right_admin" /> <span>admin</span></label>
-                                </div>
-
-                                <div class="meta_pill">
-                                    <i class="fa-solid fa-binary"></i>
-                                    <span>rights_mask_dec: <strong class="mono" id="iam_path_rights_preview">0</strong></span>
-                                </div>
-
-                                <button class="primary_cta wide" id="btn_iam_path_add" type="button">
-                                    <i class="fa-solid fa-plus"></i>
-                                    <span>Add path</span>
-                                </button>
-                            </div>
-                        </section>
-                    </div>
-                </section>
-            </main>
-        </div>
+                </div>
+            </section>
+        </main>
     </div>
 
     <div id="toast" class="toast hidden"></div>
-
     <script src="/app.js"></script>
 </body>
 </html>

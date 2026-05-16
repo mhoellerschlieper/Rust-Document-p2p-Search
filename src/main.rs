@@ -101,7 +101,7 @@ pub mod embedding_backend;
 mod web_server;
 use crate::web_server::{
     run_web_server, web_command, web_doc_text_resp, web_ok_resp, web_peer_view,
-    web_search_dispatch_resp, web_search_hit, web_search_resp, web_shared_state, web_status_view, web_file_fetch_resp, I_EVENT_RING_MAX,
+    web_search_dispatch_resp, web_search_hit, web_search_resp, web_shared_state, web_status_view, web_file_fetch_resp, web_docs_entry, I_EVENT_RING_MAX,
 };
 
 mod config;
@@ -1201,6 +1201,26 @@ fn collect_webdav_entries_from_dir_recursive(
     walk_dir(s_peer_id, p_dir, p_dir, &mut v_entries);
     v_entries
 }
+
+fn is_peer_online_in_web_state(
+    st_web: &Arc<Mutex<web_shared_state>>,
+    s_peer_id: &str,
+) -> bool {
+    let g = match st_web.lock() {
+        Ok(x) => x,
+        Err(_) => {
+            return false;
+        }
+    };
+
+    for o_peer in &g.v_peers {
+        if o_peer.s_peer_id == s_peer_id {
+            return o_peer.b_online;
+        }
+    }
+
+    false
+}
 /* ========================================================================================== */
 /* Main                                                                                       */
 /* ========================================================================================== */
@@ -1351,29 +1371,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         idx_tan.clone(),
         idx_vec.clone(),
     ));
-    /* Local peer id fuer Anzeige unter /peers und zur Zuordnung local -> eigener peer */
-    webdav_gateway.set_local_peer_id(&swarm.local_peer_id().to_string());
 
-     /*
-     * Echte Dateien aus dem konfigurierten Dokumentenverzeichnis lesen.
-     * Diese Dateien werden dem lokalen Peer zugeordnet.
+    /*
+     * Local peer id setzen.
+     * Dokumente sollen im Explorer unter /peers/<peer_id>/docs sichtbar sein.
      */
-    let p_local_doc_dir = PathBuf::from(cfg_get().s_doc_dir.clone());
     let s_local_peer_id: String = swarm.local_peer_id().to_string();
     webdav_gateway.set_local_peer_id(&s_local_peer_id);
 
-    let p_local_doc_dir = PathBuf::from(cfg_get().s_doc_dir.clone());
-    let v_local_entries = collect_webdav_entries_from_dir(
-        &s_local_peer_id,
-        p_local_doc_dir.as_path(),
+    /*
+     * Rekursive lokale Dokumentliste aufbauen.
+     * Dadurch erscheinen auch Dateien aus Unterordnern sauber im Explorer.
+     */
+    let s_local_peer_id_refresh: String = swarm.local_peer_id().to_string();
+    let p_local_doc_dir_refresh = PathBuf::from(cfg_get().s_doc_dir.clone());
+    let v_local_entries_refresh = collect_webdav_entries_from_dir_recursive(
+        &s_local_peer_id_refresh,
+        p_local_doc_dir_refresh.as_path(),
     );
-
     webdav_gateway.register_peer_entries(
-        &s_local_peer_id,
-        v_local_entries,
+        &s_local_peer_id_refresh,
+        v_local_entries_refresh,
     );
 
-    
     let s_webdav_bind: String = "127.0.0.1:1900".to_string();
     {
         let gateway_clone = webdav_gateway.clone();
@@ -2013,6 +2033,120 @@ async fn handle_web_command(
             };
 
             let _ = tx.send(resp);
+        }
+
+        web_command::docs_explorer_get { tx } => {
+            let s_local_peer_id = swarm.local_peer_id().to_string();
+            let mut v_out: Vec<web_docs_entry> = Vec::new();
+
+            match collect_local_doc_entries() {
+                Ok(v_local) => {
+                    for o_entry in v_local {
+                        v_out.push(web_docs_entry {
+                            s_name: o_entry.s_name.clone(),
+                            s_path: o_entry.s_path.clone(),
+                            s_peer_id: s_local_peer_id.clone(),
+                            b_local: true,
+                            b_online: true,
+                            i_size: o_entry.i_size,
+                            i_mtime_unix: o_entry.i_mtime_unix,
+                            s_status: "local".to_string(),
+                            s_availability: "available".to_string(),
+                        });
+                    }
+                }
+                Err(_) => {
+                }
+            }
+
+            {
+                let g = match st_web.lock() {
+                    Ok(x) => x,
+                    Err(_) => {
+                        let _ = tx.send(v_out);
+                        return;
+                    }
+                };
+
+                for o_peer in &g.v_peers {
+                    let s_peer_id = o_peer.s_peer_id.clone();
+                    if s_peer_id == s_local_peer_id {
+                        continue;
+                    }
+
+                    v_out.push(web_docs_entry {
+                        s_name: "shared_remote_placeholder.pdf".to_string(),
+                        s_path: "shared_remote_placeholder.pdf".to_string(),
+                        s_peer_id: s_peer_id.clone(),
+                        b_local: false,
+                        b_online: o_peer.b_online,
+                        i_size: 0,
+                        i_mtime_unix: 0,
+                        s_status: if o_peer.b_online { "online".to_string() } else { "offline".to_string() },
+                        s_availability: if o_peer.b_online { "reachable".to_string() } else { "limited".to_string() },
+                    });
+                }
+
+                for (_i_search_id, o_search_state) in &g.h_search_cache {
+                    for o_hit in &o_search_state.v_hits {
+                        let s_peer_id = o_hit.s_peer_id.clone();
+                        let b_local = s_peer_id == s_local_peer_id;
+                        let b_online = if b_local {
+                            true
+                        } else {
+                            is_peer_online_in_web_state(&st_web, &s_peer_id)
+                        };
+
+                        v_out.push(web_docs_entry {
+                            s_name: safe_file_name_from_path(&o_hit.s_doc),
+                            s_path: o_hit.s_doc.clone(),
+                            s_peer_id: s_peer_id.clone(),
+                            b_local: b_local,
+                            b_online: b_online,
+                            i_size: 0,
+                            i_mtime_unix: 0,
+                            s_status: if b_local {
+                                "local".to_string()
+                            } else if b_online {
+                                "indexed".to_string()
+                            } else {
+                                "offline".to_string()
+                            },
+                            s_availability: if b_local {
+                                "available".to_string()
+                            } else if b_online {
+                                "search".to_string()
+                            } else {
+                                "limited".to_string()
+                            },
+                        });
+                    }
+                }
+            }
+
+            let mut h_seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+            let mut v_unique: Vec<web_docs_entry> = Vec::new();
+
+            for o_item in v_out {
+                let s_key = format!("{}::{}", o_item.s_peer_id, o_item.s_path);
+                if h_seen.contains_key(&s_key) {
+                    continue;
+                }
+                h_seen.insert(s_key, true);
+                v_unique.push(o_item);
+            }
+
+            v_unique.sort_by(|a, b| {
+                if a.b_local && !b.b_local {
+                    return std::cmp::Ordering::Less;
+                }
+                if !a.b_local && b.b_local {
+                    return std::cmp::Ordering::Greater;
+                }
+                a.s_name.cmp(&b.s_name)
+            });
+
+            let _ = tx.send(v_unique);
         }
 
         _ => {
