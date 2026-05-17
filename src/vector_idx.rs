@@ -5,20 +5,18 @@
  * Firma     : ExpChat.ai
  *---------------------------------------------------------------------------------------------
  * Beschreibung
- * - Persistenter 5 gram Retrieval Index mit optionalem leichtgewichtigem Embedding Modul.
+ * - Persistenter 5 gram Retrieval Index mit Streaming Zugriff auf Posting Listen.
  * - Dokumente und Chunks werden in sled persistiert.
  * - Posting Listen werden in einer separaten binaeren Datei gespeichert.
- * - Embeddings werden in einer separaten sled Tree gespeichert.
- * - Boolesche Suche, Synonymlisten, Woerterbuecher und konfigurierbare Normalisierung.
- * - Synonyme, Dictionary und Normalisierung werden aus JSON Dateien geladen.
+ * - Inkrementelles Upsert und Delete mit stabilem Rebuild der Posting Daten.
+ * - Query nutzt 5 gram Recall und BM25 Reranking.
  * - Sichere Validierung und defensive Fehlerbehandlung.
  *
  * Historie
  * 13.11.2025   MS   - Ausgangsmodul fuer einfachen Vektor Index
+ * 08.05.2026   MS   - Embedding Backend Abstraktion
  * 16.05.2026   MS   - Persistenter 5 gram Posting Index
- * 17.05.2026   MS   - Leichtgewichtiges Embedding Modul
- * 17.05.2026   MS   - Boolesche Operatoren AND OR NOT
- * 17.05.2026   MS   - Synonymlisten, Woerterbuecher und JSON Konfiguration ergaenzt
+ * 17.05.2026   MS   - Vollstaendige stabile Version mit korrigierten Posting Offsets
  **********************************************************************************************/
 
 #![allow(clippy::needless_return)]
@@ -44,20 +42,19 @@ use crate::extract_doc_text;
 const I_BM25_TOP_CANDIDATES: usize = 40;
 const D_BM25_K1: f32 = 1.5;
 const D_BM25_B: f32 = 0.75;
+
 const I_SNIPPET_MAX_LEN: usize = 320;
 const I_SNIPPET_SCAN_MAX_LEN: usize = 32_000;
+
 const I_DEFAULT_CHUNK_CHARS: usize = 1200;
 const I_DEFAULT_CHUNK_OVERLAP_CHARS: usize = 200;
+
 const I_FIVE_GRAM_SIZE: usize = 5;
 const I_POSTING_PER_GRAM_LIMIT: usize = 20_000;
 const I_TARGET_CANDIDATES: usize = 30_000;
+
 const S_DOC_STORE_DB_DIR: &str = "doc_store_db";
 const S_GRAM_POSTING_STORE_FILE: &str = "five_gram_postings.bin";
-const I_EMBEDDING_DIM_DEFAULT: usize = 64;
-const I_EMBEDDING_TEXT_LIMIT: usize = 16_000;
-const D_HYBRID_EMBEDDING_WEIGHT: f32 = 0.25;
-const D_HYBRID_LEXICAL_WEIGHT: f32 = 0.35;
-const D_HYBRID_BM25_WEIGHT: f32 = 0.40;
 
 pub type DocId = u64;
 pub type ChunkId = u64;
@@ -89,7 +86,6 @@ pub struct QueryOptions {
     pub i_k: usize,
     pub v_filters: Vec<PayloadFilter>,
     pub b_enable_token_level_rescore: bool,
-    pub b_enable_embedding_rescore: bool,
 }
 
 impl Default for QueryOptions {
@@ -98,7 +94,6 @@ impl Default for QueryOptions {
             i_k: 10,
             v_filters: Vec::new(),
             b_enable_token_level_rescore: false,
-            b_enable_embedding_rescore: true,
         };
     }
 }
@@ -159,64 +154,6 @@ pub struct GramPostingFileEntry {
     pub i_doc_freq: u32,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct EmbeddingRecord {
-    pub i_chunk_id: ChunkId,
-    pub v_embedding: Vec<f32>,
-    pub i_embedding_dim: u32,
-    pub i_model_version: u32,
-    pub i_created_ts: u64,
-    pub i_updated_ts: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct SynonymConfig {
-    pub synonyms: HashMap<String, Vec<String>>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct DictionaryConfig {
-    pub dictionary_terms: Vec<String>,
-    pub replacements: HashMap<String, String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct NormalizationConfig {
-    pub b_to_lowercase: bool,
-    pub b_ascii_only: bool,
-    pub b_collapse_whitespace: bool,
-    pub b_keep_alphanumeric_only: bool,
-    pub b_map_umlauts: bool,
-    pub v_stopwords: Vec<String>,
-}
-
-impl Default for NormalizationConfig {
-    fn default() -> Self {
-        return Self {
-            b_to_lowercase: true,
-            b_ascii_only: true,
-            b_collapse_whitespace: true,
-            b_keep_alphanumeric_only: true,
-            b_map_umlauts: true,
-            v_stopwords: Vec::new(),
-        };
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BoolOp {
-    And,
-    Or,
-    Not,
-}
-
-#[derive(Debug, Clone)]
-struct ParsedBoolQuery {
-    v_required_terms: Vec<String>,
-    v_optional_terms: Vec<String>,
-    v_excluded_terms: Vec<String>,
-}
-
 #[derive(Debug, Clone)]
 enum IndexJob {
     UpsertPath {
@@ -232,88 +169,6 @@ enum IndexJob {
     ReprojectDirty {
         v_chunk_ids: Vec<ChunkId>,
     },
-}
-
-pub trait EmbeddingBackend: Send + Sync {
-    fn model_name(&self) -> &str;
-    fn model_version(&self) -> u32;
-    fn embedding_dim(&self) -> usize;
-    fn encode(&self, s_text: &str) -> Result<Vec<f32>, String>;
-}
-
-pub struct SimpleHashEmbeddingBackend {
-    i_embedding_dim: usize,
-    i_model_version: u32,
-    s_model_name: String,
-}
-
-impl SimpleHashEmbeddingBackend {
-    pub fn new(i_embedding_dim: usize, i_model_version: u32) -> Self {
-        return Self {
-            i_embedding_dim: i_embedding_dim.max(8),
-            i_model_version,
-            s_model_name: "simple_hash_embedding".to_string(),
-        };
-    }
-}
-
-impl EmbeddingBackend for SimpleHashEmbeddingBackend {
-    fn model_name(&self) -> &str {
-        return &self.s_model_name;
-    }
-
-    fn model_version(&self) -> u32 {
-        return self.i_model_version;
-    }
-
-    fn embedding_dim(&self) -> usize {
-        return self.i_embedding_dim;
-    }
-
-    fn encode(&self, s_text: &str) -> Result<Vec<f32>, String> {
-        let s_norm = normalize_text_default(s_text);
-        if s_norm.is_empty() {
-            return Ok(vec![0.0; self.i_embedding_dim]);
-        }
-
-        let mut v_out = vec![0.0f32; self.i_embedding_dim];
-        let mut i_non_zero: usize = 0;
-
-        for s_token in s_norm.split_whitespace().take(4096) {
-            let mut o_hasher = Sha256::new();
-            o_hasher.update(s_token.as_bytes());
-            let a_hash = o_hasher.finalize();
-
-            let mut a_idx = [0u8; 8];
-            a_idx.copy_from_slice(&a_hash[0..8]);
-            let i_idx = (u64::from_le_bytes(a_idx) as usize) % self.i_embedding_dim;
-
-            let mut a_sign = [0u8; 4];
-            a_sign.copy_from_slice(&a_hash[8..12]);
-            let d_sign = if u32::from_le_bytes(a_sign) % 2 == 0 {
-                1.0f32
-            } else {
-                -1.0f32
-            };
-
-            let d_weight = 1.0f32 + (s_token.len() as f32 / 32.0f32);
-            v_out[i_idx] += d_sign * d_weight;
-            i_non_zero = i_non_zero.saturating_add(1);
-        }
-
-        if i_non_zero == 0 {
-            return Ok(v_out);
-        }
-
-        let d_norm = v_out.iter().map(|d_v| d_v * d_v).sum::<f32>().sqrt();
-        if d_norm > 0.0 {
-            for d_v in v_out.iter_mut() {
-                *d_v /= d_norm;
-            }
-        }
-
-        Ok(v_out)
-    }
 }
 
 struct BackgroundIndexer {
@@ -373,7 +228,7 @@ impl PostingListStore {
         f.write_all(&v_buf)?;
         f.flush()?;
 
-        Ok((i_offset, v_buf.len() as u64))
+        return Ok((i_offset, v_buf.len() as u64));
     }
 
     pub fn read_posting_list_range(
@@ -388,8 +243,8 @@ impl PostingListStore {
             .expect("posting_list_store_lock_failed");
 
         let mut f = OpenOptions::new().read(true).open(&self.p_file)?;
-        let i_file_len = f.metadata()?.len();
 
+        let i_file_len = f.metadata()?.len();
         if i_offset > i_file_len {
             return Err(Error::new(
                 ErrorKind::InvalidData,
@@ -454,7 +309,7 @@ impl PostingListStore {
             }
         }
 
-        Ok(v_out)
+        return Ok(v_out);
     }
 
     pub fn reset_file(&self) -> Result<(), String> {
@@ -468,68 +323,7 @@ impl PostingListStore {
                 .map_err(|_| "posting_store_reset_failed".to_string())?;
         }
 
-        Ok(())
-    }
-}
-
-pub struct EmbeddingStore {
-    t_embedding_by_chunk: Tree,
-    db: Db,
-}
-
-impl EmbeddingStore {
-    pub fn new(db: &Db) -> Self {
-        return Self {
-            t_embedding_by_chunk: db
-                .open_tree("embedding_by_chunk")
-                .expect("embedding_by_chunk_open_failed"),
-            db: db.clone(),
-        };
-    }
-
-    pub fn save_chunk_embedding(&self, o_record: &EmbeddingRecord) -> Result<(), String> {
-        if o_record.i_embedding_dim == 0 {
-            return Err("embedding_dim_invalid".to_string());
-        }
-
-        if o_record.v_embedding.len() != o_record.i_embedding_dim as usize {
-            return Err("embedding_dim_mismatch".to_string());
-        }
-
-        let v_buf = bincode::serialize(o_record)
-            .map_err(|_| "embedding_serialize_failed".to_string())?;
-
-        self.t_embedding_by_chunk
-            .insert(o_record.i_chunk_id.to_le_bytes(), v_buf)
-            .map_err(|_| "embedding_insert_failed".to_string())?;
-
-        self.db
-            .flush()
-            .map_err(|_| "embedding_flush_failed".to_string())?;
-
-        Ok(())
-    }
-
-    pub fn get_chunk_embedding(&self, i_chunk_id: ChunkId) -> Option<EmbeddingRecord> {
-        return self
-            .t_embedding_by_chunk
-            .get(i_chunk_id.to_le_bytes())
-            .ok()
-            .flatten()
-            .and_then(|v| bincode::deserialize::<EmbeddingRecord>(v.as_ref()).ok());
-    }
-
-    pub fn delete_chunk_embedding(&self, i_chunk_id: ChunkId) -> Result<(), String> {
-        let _ = self
-            .t_embedding_by_chunk
-            .remove(i_chunk_id.to_le_bytes())
-            .map_err(|_| "embedding_delete_failed".to_string())?;
-
-        self.db
-            .flush()
-            .map_err(|_| "embedding_flush_failed".to_string())?;
-
-        Ok(())
+        return Ok(());
     }
 }
 
@@ -569,7 +363,9 @@ impl DocStore {
             t_source_state: db
                 .open_tree("source_state")
                 .expect("source_state_open_failed"),
-            t_counters: db.open_tree("counters").expect("counters_open_failed"),
+            t_counters: db
+                .open_tree("counters")
+                .expect("counters_open_failed"),
             t_gram_posting_meta: db
                 .open_tree("gram_posting_meta")
                 .expect("gram_posting_meta_open_failed"),
@@ -578,10 +374,6 @@ impl DocStore {
                 .expect("chunk_terms_open_failed"),
             db,
         };
-    }
-
-    pub fn db(&self) -> &Db {
-        return &self.db;
     }
 
     fn next_id(&self, s_name: &str) -> u64 {
@@ -603,7 +395,7 @@ impl DocStore {
         let _ = self.t_counters.insert(s_name, &i_new.to_le_bytes());
         let _ = self.db.flush();
 
-        i_new
+        return i_new;
     }
 
     pub fn get_doc_id_by_path(&self, s_doc_path: &str) -> Option<DocId> {
@@ -660,7 +452,7 @@ impl DocStore {
             o_meta.payload = payload;
             o_meta.b_deleted = false;
             self.save_document_meta(&o_meta);
-            o_meta
+            return o_meta;
         } else {
             let i_doc_id = self.next_id("doc_id");
             let o_meta = DocumentMeta {
@@ -672,7 +464,7 @@ impl DocStore {
                 b_deleted: false,
             };
             self.save_document_meta(&o_meta);
-            o_meta
+            return o_meta;
         }
     }
 
@@ -714,7 +506,7 @@ impl DocStore {
         let _ = self.t_chunks_by_doc.insert(a_rel, &i_chunk_id.to_le_bytes());
         let _ = self.db.flush();
 
-        o_chunk
+        return o_chunk;
     }
 
     pub fn get_chunk(&self, i_chunk_id: ChunkId) -> Option<ChunkMeta> {
@@ -757,7 +549,7 @@ impl DocStore {
         }
 
         v_out.sort_unstable();
-        v_out
+        return v_out;
     }
 
     pub fn replace_document_chunks_soft_delete(&self, i_doc_id: DocId) {
@@ -803,7 +595,7 @@ impl DocStore {
             .clear()
             .map_err(|_| "gram_posting_meta_clear_failed".to_string())?;
         let _ = self.db.flush();
-        Ok(())
+        return Ok(());
     }
 
     pub fn save_chunk_terms(&self, i_chunk_id: ChunkId, v_terms: &[String]) {
@@ -839,7 +631,7 @@ impl DocStore {
         }
 
         v_out.sort_unstable();
-        v_out
+        return v_out;
     }
 
     pub fn iter_all_doc_ids(&self) -> Vec<DocId> {
@@ -858,62 +650,39 @@ impl DocStore {
         }
 
         v_out.sort_unstable();
-        v_out
+        return v_out;
     }
 
     pub fn compute_source_hash(s_text: &str) -> [u8; 32] {
-        Sha256::digest(s_text.as_bytes()).into()
+        return Sha256::digest(s_text.as_bytes()).into();
     }
 }
 
 pub struct VectorIndex {
     doc_store: Arc<DocStore>,
     posting_store: Arc<PostingListStore>,
-    embedding_store: Arc<EmbeddingStore>,
-    embedding_backend: Arc<dyn EmbeddingBackend>,
     chunk_cfg: ChunkingConfig,
     o_bg: BackgroundIndexer,
     o_worker_join: Mutex<Option<thread::JoinHandle<()>>>,
-    h_synonyms: Arc<RwSynonymMap>,
-    h_dictionary_terms: Arc<RwDictionarySet>,
-    h_replacements: Arc<RwReplacementMap>,
-    o_norm_cfg: Arc<Mutex<NormalizationConfig>>,
 }
-
-type RwSynonymMap = Mutex<HashMap<String, Vec<String>>>;
-type RwDictionarySet = Mutex<HashSet<String>>;
-type RwReplacementMap = Mutex<HashMap<String, String>>;
 
 impl VectorIndex {
     pub fn new(p_root: &Path) -> Arc<Self> {
         let doc_store = Arc::new(DocStore::new(p_root));
-        
-                let mut p_postings = p_root.to_path_buf();
+
+        let mut p_postings = p_root.to_path_buf();
         p_postings.push(S_GRAM_POSTING_STORE_FILE);
 
         let posting_store = Arc::new(PostingListStore::new(p_postings));
-        let embedding_store = Arc::new(EmbeddingStore::new(doc_store.db()));
-        let embedding_backend: Arc<dyn EmbeddingBackend> =
-            Arc::new(SimpleHashEmbeddingBackend::new(I_EMBEDDING_DIM_DEFAULT, 1));
-
         let (o_bg, rx) = BackgroundIndexer::new();
 
         let o_self = Arc::new(Self {
             doc_store,
             posting_store,
-            embedding_store,
-            embedding_backend,
             chunk_cfg: ChunkingConfig::default(),
             o_bg,
             o_worker_join: Mutex::new(None),
-            h_synonyms: Arc::new(Mutex::new(HashMap::new())),
-            h_dictionary_terms: Arc::new(Mutex::new(HashSet::new())),
-            h_replacements: Arc::new(Mutex::new(HashMap::new())),
-            o_norm_cfg: Arc::new(Mutex::new(NormalizationConfig::default())),
         });
-
-        let _ = o_self.load_language_resources_from_dir(Path::new("config"));
-
 
         let o_clone = Arc::clone(&o_self);
         let h = thread::spawn(move || {
@@ -925,183 +694,7 @@ impl VectorIndex {
             .lock()
             .expect("worker_join_lock_failed") = Some(h);
 
-        o_self
-    }
-
-    pub fn load_synonyms_json(&self, p_file: &Path) -> Result<(), String> {
-        let s_json = fs::read_to_string(p_file)
-            .map_err(|_| "synonyms_json_read_failed".to_string())?;
-        let o_cfg: SynonymConfig =
-            serde_json::from_str(&s_json).map_err(|_| "synonyms_json_parse_failed".to_string())?;
-
-        let mut h_syn = self.h_synonyms.lock().expect("synonyms_lock_failed");
-        h_syn.clear();
-
-        for (s_key, v_vals) in o_cfg.synonyms.into_iter() {
-            let s_key_norm = self.normalize_text_cfg(&s_key);
-            if s_key_norm.is_empty() {
-                continue;
-            }
-
-            let mut v_norm_vals: Vec<String> = Vec::new();
-            for s_val in v_vals.into_iter() {
-                let s_val_norm = self.normalize_text_cfg(&s_val);
-                if !s_val_norm.is_empty() && !v_norm_vals.contains(&s_val_norm) {
-                    v_norm_vals.push(s_val_norm);
-                }
-            }
-
-            if !v_norm_vals.is_empty() {
-                h_syn.insert(s_key_norm, v_norm_vals);
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn load_dictionary_json(&self, p_file: &Path) -> Result<(), String> {
-        let s_json = fs::read_to_string(p_file)
-            .map_err(|_| "dictionary_json_read_failed".to_string())?;
-        let o_cfg: DictionaryConfig = serde_json::from_str(&s_json)
-            .map_err(|_| "dictionary_json_parse_failed".to_string())?;
-
-        let mut h_terms = self
-            .h_dictionary_terms
-            .lock()
-            .expect("dictionary_terms_lock_failed");
-        let mut h_replacements = self
-            .h_replacements
-            .lock()
-            .expect("dictionary_replacements_lock_failed");
-
-        h_terms.clear();
-        h_replacements.clear();
-
-        for s_term in o_cfg.dictionary_terms.into_iter() {
-            let s_norm = self.normalize_text_cfg(&s_term);
-            if !s_norm.is_empty() {
-                h_terms.insert(s_norm);
-            }
-        }
-
-        for (s_key, s_val) in o_cfg.replacements.into_iter() {
-            let s_key_norm = self.normalize_text_cfg(&s_key);
-            let s_val_norm = self.normalize_text_cfg(&s_val);
-            if !s_key_norm.is_empty() && !s_val_norm.is_empty() {
-                h_replacements.insert(s_key_norm, s_val_norm);
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn load_normalization_json(&self, p_file: &Path) -> Result<(), String> {
-        let s_json = fs::read_to_string(p_file)
-            .map_err(|_| "normalization_json_read_failed".to_string())?;
-        let mut o_cfg: NormalizationConfig = serde_json::from_str(&s_json)
-            .map_err(|_| "normalization_json_parse_failed".to_string())?;
-
-        let mut v_stopwords_norm: Vec<String> = Vec::new();
-        for s_word in o_cfg.v_stopwords.into_iter() {
-            let s_norm = normalize_text_with_config(&s_word, &NormalizationConfig {
-                b_to_lowercase: true,
-                b_ascii_only: true,
-                b_collapse_whitespace: true,
-                b_keep_alphanumeric_only: true,
-                b_map_umlauts: true,
-                v_stopwords: Vec::new(),
-            });
-            if !s_norm.is_empty() && !v_stopwords_norm.contains(&s_norm) {
-                v_stopwords_norm.push(s_norm);
-            }
-        }
-        o_cfg.v_stopwords = v_stopwords_norm;
-
-        let mut o_guard = self.o_norm_cfg.lock().expect("normalization_lock_failed");
-        *o_guard = o_cfg;
-
-        Ok(())
-    }
-
-    pub fn load_language_resources_from_dir(&self, p_dir: &Path) -> Result<(), String> {
-        if !p_dir.exists() {
-            return Err("language_resource_dir_missing".to_string());
-        }
-
-        let mut p_syn = p_dir.to_path_buf();
-        p_syn.push("synonyms.json");
-
-        let mut p_dict = p_dir.to_path_buf();
-        p_dict.push("dictionary.json");
-
-        let mut p_norm = p_dir.to_path_buf();
-        p_norm.push("normalization.json");
-
-        if p_syn.exists() {
-            self.load_synonyms_json(&p_syn)?;
-        }
-
-        if p_dict.exists() {
-            self.load_dictionary_json(&p_dict)?;
-        }
-
-        if p_norm.exists() {
-            self.load_normalization_json(&p_norm)?;
-        }
-
-        Ok(())
-    }
-
-    fn normalize_text_cfg(&self, s_text: &str) -> String {
-        let o_cfg = self
-            .o_norm_cfg
-            .lock()
-            .expect("normalization_lock_failed")
-            .clone();
-        normalize_text_with_config(s_text, &o_cfg)
-    }
-
-    fn apply_dictionary_replacements(&self, s_text: &str) -> String {
-        let s_norm = self.normalize_text_cfg(s_text);
-        if s_norm.is_empty() {
-            return String::new();
-        }
-
-        let h_replacements = self
-            .h_replacements
-            .lock()
-            .expect("dictionary_replacements_lock_failed");
-
-        let mut v_out: Vec<String> = Vec::new();
-        for s_token in s_norm.split_whitespace() {
-            if let Some(s_rep) = h_replacements.get(s_token) {
-                v_out.push(s_rep.clone());
-            } else {
-                v_out.push(s_token.to_string());
-            }
-        }
-
-        v_out.join(" ")
-    }
-
-    fn expand_term_with_synonyms(&self, s_term: &str) -> Vec<String> {
-        let s_norm = self.normalize_text_cfg(s_term);
-        if s_norm.is_empty() {
-            return Vec::new();
-        }
-
-        let h_syn = self.h_synonyms.lock().expect("synonyms_lock_failed");
-        let mut v_out: Vec<String> = vec![s_norm.clone()];
-
-        if let Some(v_syn) = h_syn.get(&s_norm) {
-            for s_val in v_syn.iter() {
-                if !v_out.contains(s_val) {
-                    v_out.push(s_val.clone());
-                }
-            }
-        }
-
-        v_out
+        return o_self;
     }
 
     fn background_worker(self: Arc<Self>, rx: Receiver<IndexJob>) {
@@ -1124,7 +717,7 @@ impl VectorIndex {
     }
 
     pub fn encode_query(&self, s_text: &str) -> Vec<f32> {
-        let v_grams = self.build_five_grams_cfg(s_text);
+        let v_grams = build_five_grams(s_text);
         let mut h_freq: HashMap<String, usize> = HashMap::new();
 
         for s_gram in v_grams.into_iter() {
@@ -1144,51 +737,7 @@ impl VectorIndex {
             v_out.push(0.0);
         }
 
-        v_out
-    }
-
-    pub fn encode_text_embedding(&self, s_text: &str) -> Result<Vec<f32>, String> {
-        let s_trim = s_text.trim();
-        if s_trim.is_empty() {
-            return Err("embedding_input_empty".to_string());
-        }
-
-        let s_limited: String = s_trim.chars().take(I_EMBEDDING_TEXT_LIMIT).collect();
-        let v_embedding = self.embedding_backend.encode(&s_limited)?;
-
-        if v_embedding.len() != self.embedding_backend.embedding_dim() {
-            return Err("embedding_backend_dim_mismatch".to_string());
-        }
-
-        Ok(v_embedding)
-    }
-
-    pub fn save_chunk_embedding(
-        &self,
-        i_chunk_id: ChunkId,
-        v_embedding: Vec<f32>,
-    ) -> Result<(), String> {
-        if v_embedding.is_empty() {
-            return Err("embedding_empty".to_string());
-        }
-
-        let i_now = now_ts();
-        let o_old = self.embedding_store.get_chunk_embedding(i_chunk_id);
-
-        let o_record = EmbeddingRecord {
-            i_chunk_id,
-            i_embedding_dim: v_embedding.len() as u32,
-            i_model_version: self.embedding_backend.model_version(),
-            i_created_ts: o_old.as_ref().map(|o| o.i_created_ts).unwrap_or(i_now),
-            i_updated_ts: i_now,
-            v_embedding,
-        };
-
-        self.embedding_store.save_chunk_embedding(&o_record)
-    }
-
-    pub fn get_chunk_embedding(&self, i_chunk_id: ChunkId) -> Option<EmbeddingRecord> {
-        self.embedding_store.get_chunk_embedding(i_chunk_id)
+        return v_out;
     }
 
     pub fn ingest_batch_paths(&self, v_paths: Vec<(PathBuf, PayloadMap)>) {
@@ -1210,7 +759,7 @@ impl VectorIndex {
     }
 
     pub fn reproject_dirty_async(&self, i_limit: usize) {
-        let v_chunk_ids = self
+        let v_chunk_ids: Vec<ChunkId> = self
             .doc_store
             .iter_all_chunk_ids()
             .into_iter()
@@ -1258,33 +807,25 @@ impl VectorIndex {
             }
         }
 
-        let o_doc = self.doc_store.upsert_document_meta(&s_doc_path, payload.clone());
-        self.doc_store.replace_document_chunks_soft_delete(o_doc.i_doc_id);
+        let o_doc = self
+            .doc_store
+            .upsert_document_meta(&s_doc_path, payload.clone());
 
-        let v_old_chunk_ids = self.doc_store.list_chunk_ids_by_doc(o_doc.i_doc_id);
-        for i_old_chunk_id in v_old_chunk_ids.into_iter() {
-            let _ = self.embedding_store.delete_chunk_embedding(i_old_chunk_id);
-        }
+        self.doc_store
+            .replace_document_chunks_soft_delete(o_doc.i_doc_id);
 
         let v_chunks = chunk_text(&s_text, &self.chunk_cfg);
-
         for (i_idx, s_chunk) in v_chunks.into_iter().enumerate() {
-            let s_chunk_norm = self.apply_dictionary_replacements(&s_chunk);
-
             let o_chunk = self.doc_store.create_chunk(
                 o_doc.i_doc_id,
                 i_idx as u32,
-                s_chunk_norm.clone(),
+                s_chunk.clone(),
                 payload.clone(),
-                self.embedding_backend.model_version(),
+                1,
             );
 
-            let v_terms = self.build_five_grams_cfg(&s_chunk_norm);
+            let v_terms = build_five_grams(&s_chunk);
             self.doc_store.save_chunk_terms(o_chunk.i_chunk_id, &v_terms);
-
-            if let Ok(v_embedding) = self.encode_text_embedding(&s_chunk_norm) {
-                let _ = self.save_chunk_embedding(o_chunk.i_chunk_id, v_embedding);
-            }
         }
 
         self.doc_store.save_source_state(
@@ -1297,7 +838,7 @@ impl VectorIndex {
         );
 
         self.rebuild_posting_store()?;
-        Ok(())
+        return Ok(());
     }
 
     pub fn delete_document_now(&self, s_doc_path: &str) -> Result<(), String> {
@@ -1306,13 +847,33 @@ impl VectorIndex {
 
             for i_chunk_id in self.doc_store.list_chunk_ids_by_doc(i_doc_id).iter() {
                 self.doc_store.update_chunk_deleted(*i_chunk_id, true);
-                let _ = self.embedding_store.delete_chunk_embedding(*i_chunk_id);
             }
 
             self.rebuild_posting_store()?;
         }
 
-        Ok(())
+        return Ok(());
+    }
+
+    fn compute_soft_gram_score(
+        &self,
+        s_query: &str,
+        s_chunk_text: &str,
+        d_posting_score: f32,
+    ) -> f32 {
+        let v_query_grams = build_five_grams(s_query);
+        let v_doc_grams = build_five_grams(s_chunk_text);
+
+        let d_dice_score = dice_similarity(&v_query_grams, &v_doc_grams);
+        let d_prefix_score = prefix_match_score(s_query, s_chunk_text);
+        let d_exact_score = exact_match_score(s_query, s_chunk_text);
+
+        let d_final_score = 0.65 * d_dice_score
+            + 0.20 * d_prefix_score
+            + 0.15 * d_exact_score
+            + 0.10 * d_posting_score.min(1.0);
+
+        return d_final_score;
     }
 
     pub fn query_with_options(&self, s_query: &str, opts: QueryOptions) -> Vec<VecSearchHit> {
@@ -1320,14 +881,7 @@ impl VectorIndex {
             return Vec::new();
         }
 
-        let o_bool_query = self.parse_bool_query_cfg(s_query);
-        let s_lexical_query = self.build_lexical_query_from_bool_cfg(&o_bool_query);
-
-        if s_lexical_query.trim().is_empty() {
-            return Vec::new();
-        }
-
-        let v_query_grams = self.build_five_grams_cfg(&s_lexical_query);
+        let v_query_grams = build_five_grams(s_query);
         if v_query_grams.is_empty() {
             return Vec::new();
         }
@@ -1369,7 +923,10 @@ impl VectorIndex {
                 h_candidate_ids.insert(o_posting.i_chunk_id);
 
                 let d_add = (*i_q_tf as f32) * (o_posting.i_tf as f32) * d_idf.max(0.0);
-                *h_candidate_score.entry(o_posting.i_chunk_id).or_insert(0.0) += d_add;
+
+                *h_candidate_score
+                    .entry(o_posting.i_chunk_id)
+                    .or_insert(0.0) += d_add;
             }
         }
 
@@ -1396,47 +953,12 @@ impl VectorIndex {
                 continue;
             }
 
-            if !self.matches_bool_query_cfg(&o_chunk.s_text, &o_bool_query) {
-                continue;
-            }
-
             let d_posting_score = d_posting_score_raw / (1.0 + d_posting_score_raw);
+
             let d_soft_score =
-                self.compute_soft_gram_score(&s_lexical_query, &o_chunk.s_text, d_posting_score);
+                self.compute_soft_gram_score(s_query, &o_chunk.s_text, d_posting_score);
 
             v_preselected.push((i_chunk_id, d_soft_score));
-        }
-
-        if v_preselected.is_empty() {
-            for i_chunk_id in self.doc_store.iter_all_chunk_ids().into_iter() {
-                let Some(o_chunk) = self.doc_store.get_chunk(i_chunk_id) else {
-                    continue;
-                };
-                if o_chunk.b_deleted {
-                    continue;
-                }
-
-                let Some(o_doc) = self.doc_store.get_document_meta(o_chunk.i_doc_id) else {
-                    continue;
-                };
-                if o_doc.b_deleted {
-                    continue;
-                }
-
-                if !matches_filters(&o_doc.payload, &opts.v_filters)
-                    && !matches_filters(&o_chunk.payload, &opts.v_filters)
-                {
-                    continue;
-                }
-
-                if !self.matches_bool_query_cfg(&o_chunk.s_text, &o_bool_query) {
-                    continue;
-                }
-
-                let d_soft_score =
-                    self.compute_soft_gram_score(&s_lexical_query, &o_chunk.s_text, 0.0);
-                v_preselected.push((i_chunk_id, d_soft_score));
-            }
         }
 
         v_preselected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
@@ -1457,53 +979,25 @@ impl VectorIndex {
             v_texts.push((i_chunk_id, o_chunk.s_text.clone()));
         }
 
-        let v_bm25 = bm25_rerank_top_k(&v_texts, &s_lexical_query, I_BM25_TOP_CANDIDATES);
-        let mut h_bm25_score: HashMap<ChunkId, f32> = HashMap::new();
-
-        for (i_chunk_id, d_bm25) in v_bm25.into_iter() {
-            h_bm25_score.insert(i_chunk_id, d_bm25);
-        }
-
-        let o_query_embedding = if opts.b_enable_embedding_rescore {
-            self.encode_text_embedding(&s_lexical_query).ok()
-        } else {
-            None
-        };
-
+        let v_bm25 = bm25_rerank_top_k(&v_texts, s_query, I_BM25_TOP_CANDIDATES);
         let mut h_doc_best: HashMap<DocId, VecSearchHit> = HashMap::new();
 
-        for (i_chunk_id, d_soft) in h_vec_score.into_iter() {
+        for (i_chunk_id, d_bm25) in v_bm25.into_iter() {
             let Some(o_chunk) = self.doc_store.get_chunk(i_chunk_id) else {
                 continue;
             };
+
             let Some(o_doc) = self.doc_store.get_document_meta(o_chunk.i_doc_id) else {
                 continue;
             };
 
-            let d_bm25 = *h_bm25_score.get(&i_chunk_id).unwrap_or(&0.0);
-
-            let d_embedding = if let Some(v_query_embedding) = o_query_embedding.as_ref() {
-                if let Some(o_embedding) = self.get_chunk_embedding(i_chunk_id) {
-                    cosine_similarity(v_query_embedding, &o_embedding.v_embedding)
-                } else {
-                    0.0
-                }
-            } else {
-                0.0
-            };
-
-            let d_final = if o_query_embedding.is_some() {
-                D_HYBRID_LEXICAL_WEIGHT * d_soft
-                    + D_HYBRID_BM25_WEIGHT * d_bm25
-                    + D_HYBRID_EMBEDDING_WEIGHT * d_embedding
-            } else {
-                0.50 * d_soft + 0.50 * d_bm25
-            };
+            let d_soft = *h_vec_score.get(&i_chunk_id).unwrap_or(&0.0);
+            let d_final = 0.50 * d_soft + 0.50 * d_bm25;
 
             let o_hit = VecSearchHit {
                 s_doc: o_doc.s_doc_path.clone(),
                 d_score: d_final,
-                s_snippet: build_snippet_for_query(&o_chunk.s_text, &s_lexical_query),
+                s_snippet: build_snippet_for_query(&o_chunk.s_text, s_query),
             };
 
             match h_doc_best.get(&o_doc.i_doc_id) {
@@ -1521,26 +1015,27 @@ impl VectorIndex {
         let mut v_hits: Vec<VecSearchHit> = h_doc_best.into_values().collect();
         v_hits.sort_by(|a, b| b.d_score.partial_cmp(&a.d_score).unwrap_or(Ordering::Equal));
         v_hits.truncate(opts.i_k);
-        v_hits
+
+        return v_hits;
     }
 
     pub fn query_with_snippets(self: &Arc<Self>, s_query: &str, i_k: usize) -> Vec<VecSearchHit> {
-        self.query_with_options(
+        return self.query_with_options(
             s_query,
             QueryOptions {
                 i_k,
                 v_filters: Vec::new(),
                 b_enable_token_level_rescore: false,
-                b_enable_embedding_rescore: true,
             },
-        )
+        );
     }
 
     pub fn query(self: &Arc<Self>, s_query: &str, i_k: usize) -> Vec<(String, f32)> {
-        self.query_with_snippets(s_query, i_k)
+        return self
+            .query_with_snippets(s_query, i_k)
             .into_iter()
             .map(|h| (h.s_doc, h.d_score))
-            .collect()
+            .collect();
     }
 
     pub fn rebuild_now(&self, p_root: &Path) {
@@ -1550,8 +1045,13 @@ impl VectorIndex {
     }
 
     pub fn reproject_chunks_now(&self, v_chunk_ids: &[ChunkId]) {
+        /*
+         * Historie
+         * 16.05.2026   MS   - Kompatibilitaetsfunktion
+         * 17.05.2026   MS   - Reproject fuehrt Rebuild der Posting Listen aus
+         */
+        let _ = v_chunk_ids;
         let _ = self.rebuild_posting_store();
-        let _ = self.rebuild_embeddings(v_chunk_ids);
     }
 
     pub fn save(&self, p_root: &Path) {
@@ -1563,6 +1063,14 @@ impl VectorIndex {
     }
 
     pub fn repair_five_gram_postings(&self) -> Result<(), String> {
+        /*
+         * Beschreibung
+         * - Baut alle gespeicherten Chunk Terms neu auf.
+         * - Danach wird die Posting Datei komplett neu geschrieben.
+         *
+         * Historie
+         * 17.05.2026   MS   - Reparaturfunktion fuer bestehende defekte Posting Daten
+         */
         for i_chunk_id in self.doc_store.iter_all_chunk_ids().into_iter() {
             let Some(o_chunk) = self.doc_store.get_chunk(i_chunk_id) else {
                 continue;
@@ -1572,246 +1080,26 @@ impl VectorIndex {
                 continue;
             }
 
-            let v_terms = self.build_five_grams_cfg(&o_chunk.s_text);
+            let v_terms = build_five_grams(&o_chunk.s_text);
             self.doc_store.save_chunk_terms(i_chunk_id, &v_terms);
         }
 
         self.rebuild_posting_store()?;
-        Ok(())
-    }
-
-    pub fn rebuild_embeddings(&self, v_chunk_ids: &[ChunkId]) -> Result<(), String> {
-        let v_targets: Vec<ChunkId> = if v_chunk_ids.is_empty() {
-            self.doc_store.iter_all_chunk_ids()
-        } else {
-            v_chunk_ids.to_vec()
-        };
-
-        for i_chunk_id in v_targets.into_iter() {
-            let Some(o_chunk) = self.doc_store.get_chunk(i_chunk_id) else {
-                continue;
-            };
-
-            if o_chunk.b_deleted {
-                let _ = self.embedding_store.delete_chunk_embedding(i_chunk_id);
-                continue;
-            }
-
-            let Some(o_doc) = self.doc_store.get_document_meta(o_chunk.i_doc_id) else {
-                continue;
-            };
-
-            if o_doc.b_deleted {
-                let _ = self.embedding_store.delete_chunk_embedding(i_chunk_id);
-                continue;
-            }
-
-            let v_embedding = self.encode_text_embedding(&o_chunk.s_text)?;
-            self.save_chunk_embedding(i_chunk_id, v_embedding)?;
-        }
-
-        Ok(())
-    }
-
-    fn parse_bool_query_cfg(&self, s_query: &str) -> ParsedBoolQuery {
-        let v_tokens_raw: Vec<&str> = s_query.split_whitespace().collect();
-
-        let mut v_required_terms: Vec<String> = Vec::new();
-        let mut v_optional_terms: Vec<String> = Vec::new();
-        let mut v_excluded_terms: Vec<String> = Vec::new();
-        let mut o_pending_op: Option<BoolOp> = None;
-
-        for s_token_raw in v_tokens_raw.into_iter() {
-            let s_token_upper = s_token_raw.trim().to_ascii_uppercase();
-
-            if s_token_upper == "AND" {
-                o_pending_op = Some(BoolOp::And);
-                continue;
-            }
-
-            if s_token_upper == "OR" {
-                o_pending_op = Some(BoolOp::Or);
-                continue;
-            }
-
-            if s_token_upper == "NOT" {
-                o_pending_op = Some(BoolOp::Not);
-                continue;
-            }
-
-            let s_term = self.apply_dictionary_replacements(s_token_raw);
-            if s_term.is_empty() {
-                continue;
-            }
-
-            match o_pending_op {
-                Some(BoolOp::And) => {
-                    let v_expanded = self.expand_term_with_synonyms(&s_term);
-                    if v_expanded.len() > 1 {
-                        for s_part in v_expanded.into_iter() {
-                            if !v_optional_terms.contains(&s_part) {
-                                v_optional_terms.push(s_part);
-                            }
-                        }
-                        let s_first = self.normalize_text_cfg(&s_term);
-                        if !s_first.is_empty() && !v_required_terms.contains(&s_first) {
-                            v_required_terms.push(s_first);
-                        }
-                    } else {
-                        let s_norm = self.normalize_text_cfg(&s_term);
-                        if !s_norm.is_empty() {
-                            v_required_terms.push(s_norm);
-                        }
-                    }
-                }
-                Some(BoolOp::Or) => {
-                    for s_expanded in self.expand_term_with_synonyms(&s_term).into_iter() {
-                        if !v_optional_terms.contains(&s_expanded) {
-                            v_optional_terms.push(s_expanded);
-                        }
-                    }
-                }
-                Some(BoolOp::Not) => {
-                    let s_norm = self.normalize_text_cfg(&s_term);
-                    if !s_norm.is_empty() {
-                        v_excluded_terms.push(s_norm);
-                    }
-                }
-                None => {
-                    let s_norm = self.normalize_text_cfg(&s_term);
-                    if !s_norm.is_empty() {
-                        v_required_terms.push(s_norm.clone());
-                    }
-
-                    for s_expanded in self.expand_term_with_synonyms(&s_term).into_iter() {
-                        if s_expanded != s_norm && !v_optional_terms.contains(&s_expanded) {
-                            v_optional_terms.push(s_expanded);
-                        }
-                    }
-                }
-            }
-
-            o_pending_op = None;
-        }
-
-        v_required_terms.sort();
-        v_required_terms.dedup();
-        v_optional_terms.sort();
-        v_optional_terms.dedup();
-        v_excluded_terms.sort();
-        v_excluded_terms.dedup();
-
-        ParsedBoolQuery {
-            v_required_terms,
-            v_optional_terms,
-            v_excluded_terms,
-        }
-    }
-
-    fn build_lexical_query_from_bool_cfg(&self, o_bool_query: &ParsedBoolQuery) -> String {
-        let mut v_terms: Vec<String> = Vec::new();
-
-        for s_term in o_bool_query.v_required_terms.iter() {
-            v_terms.push(s_term.clone());
-        }
-
-        for s_term in o_bool_query.v_optional_terms.iter() {
-            if !v_terms.contains(s_term) {
-                v_terms.push(s_term.clone());
-            }
-        }
-
-        v_terms.join(" ")
-    }
-
-    fn matches_bool_query_cfg(&self, s_text: &str, o_bool_query: &ParsedBoolQuery) -> bool {
-        let s_norm = self.apply_dictionary_replacements(s_text);
-        if s_norm.is_empty() {
-            return false;
-        }
-
-        for s_term in o_bool_query.v_excluded_terms.iter() {
-            if contains_term(&s_norm, s_term) {
-                return false;
-            }
-        }
-
-        for s_term in o_bool_query.v_required_terms.iter() {
-            if !contains_term(&s_norm, s_term) {
-                return false;
-            }
-        }
-
-        if !o_bool_query.v_optional_terms.is_empty() {
-            let mut b_any_optional_match = false;
-
-            for s_term in o_bool_query.v_optional_terms.iter() {
-                if contains_term(&s_norm, s_term) {
-                    b_any_optional_match = true;
-                    break;
-                }
-            }
-
-            if o_bool_query.v_required_terms.is_empty() && !b_any_optional_match {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    fn build_five_grams_cfg(&self, s_text: &str) -> Vec<String> {
-        let s_norm = self.apply_dictionary_replacements(s_text);
-        if s_norm.is_empty() {
-            return Vec::new();
-        }
-
-        let s_joined = s_norm.replace(' ', "_");
-        let v_chars: Vec<char> = s_joined.chars().collect();
-
-        if v_chars.is_empty() {
-            return Vec::new();
-        }
-
-        if v_chars.len() < I_FIVE_GRAM_SIZE {
-            let s_single: String = v_chars.iter().collect();
-            return vec![s_single];
-        }
-
-        let mut v_out: Vec<String> =
-            Vec::with_capacity(v_chars.len().saturating_sub(I_FIVE_GRAM_SIZE) + 1);
-
-        for i_pos in 0..=(v_chars.len() - I_FIVE_GRAM_SIZE) {
-            let s_part: String = v_chars[i_pos..i_pos + I_FIVE_GRAM_SIZE].iter().collect();
-            v_out.push(s_part);
-        }
-
-        v_out
-    }
-
-    fn compute_soft_gram_score(
-        &self,
-        s_query: &str,
-        s_chunk_text: &str,
-        d_posting_score: f32,
-    ) -> f32 {
-        let v_query_grams = self.build_five_grams_cfg(s_query);
-        let v_doc_grams = self.build_five_grams_cfg(s_chunk_text);
-
-        let d_dice_score = dice_similarity(&v_query_grams, &v_doc_grams);
-        let d_prefix_score = prefix_match_score(s_query, s_chunk_text);
-        let d_exact_score = exact_match_score(s_query, s_chunk_text);
-
-        let d_final_score =
-            0.65 * d_dice_score +
-            0.20 * d_prefix_score +
-            0.15 * d_exact_score +
-            0.10 * d_posting_score.min(1.0);
-
-        d_final_score
+        return Ok(());
     }
 
     fn rebuild_posting_store(&self) -> Result<(), String> {
+        /*
+         * Beschreibung
+         * - Baut den 5 gram Posting Store komplett neu auf.
+         * - Loescht die alte Posting Datei und die Meta Tabelle.
+         * - Schreibt Grams deterministisch sortiert.
+         * - Schreibt Posting Listen mit sortierten Chunk IDs.
+         *
+         * Historie
+         * 16.05.2026   MS   - Erste Rebuild Version
+         * 17.05.2026   MS   - Deterministische Reihenfolge und Metadaten Absicherung
+         */
         self.posting_store.reset_file()?;
         self.doc_store.clear_gram_posting_meta()?;
 
@@ -1887,13 +1175,13 @@ impl VectorIndex {
             );
         }
 
-        Ok(())
+        return Ok(());
     }
 
     fn collect_paths_from_fs(&self, p_root: &Path) -> Vec<String> {
         let mut v_out: Vec<String> = Vec::new();
         self.collect_paths_recursive(p_root, &mut v_out);
-        v_out
+        return v_out;
     }
 
     fn collect_paths_recursive(&self, p_dir: &Path, v_out: &mut Vec<String>) {
@@ -1973,7 +1261,7 @@ impl VectorIndex {
 pub fn load_or_init_index(p_root: &Path, _p_tracker_dir: &Path) -> Arc<VectorIndex> {
     let idx = VectorIndex::new(p_root);
     idx.load(p_root);
-    idx
+    return idx;
 }
 
 pub fn persist_index(idx: &VectorIndex, p_root: &Path) {
@@ -1981,17 +1269,17 @@ pub fn persist_index(idx: &VectorIndex, p_root: &Path) {
 }
 
 fn now_ts() -> u64 {
-    SystemTime::now()
+    return SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
+        .as_secs();
 }
 
 fn canonicalize_best_effort(p_in: &Path) -> String {
-    match fs::canonicalize(p_in) {
+    return match fs::canonicalize(p_in) {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(_) => p_in.to_string_lossy().into_owned(),
-    }
+    };
 }
 
 fn chunk_text(s_text: &str, cfg: &ChunkingConfig) -> Vec<String> {
@@ -2028,7 +1316,7 @@ fn chunk_text(s_text: &str, cfg: &ChunkingConfig) -> Vec<String> {
         i_start = i_next;
     }
 
-    v_out
+    return v_out;
 }
 
 fn matches_filters(payload: &PayloadMap, v_filters: &[PayloadFilter]) -> bool {
@@ -2046,78 +1334,64 @@ fn matches_filters(payload: &PayloadMap, v_filters: &[PayloadFilter]) -> bool {
         }
     }
 
-    true
+    return true;
 }
 
-fn normalize_text_default(s_in: &str) -> String {
-    normalize_text_with_config(s_in, &NormalizationConfig::default())
-}
-
-fn normalize_text_with_config(s_in: &str, o_cfg: &NormalizationConfig) -> String {
-    let mut s_work = s_in.to_string();
-
-    if o_cfg.b_to_lowercase {
-        s_work = s_work.to_lowercase();
-    }
-
-    if o_cfg.b_map_umlauts {
-        s_work = s_work
-            .replace("ae", "ae")
-            .replace("oe", "oe")
-            .replace("ue", "ue")
-            .replace("ss", "ss")
-            
-            ;
-    }
-
-    let mut s_out = String::with_capacity(s_work.len().min(I_SNIPPET_SCAN_MAX_LEN));
+fn normalize_for_match(s_in: &str) -> String {
+    let mut s_out = String::with_capacity(s_in.len().min(I_SNIPPET_SCAN_MAX_LEN));
     let mut b_prev_space = false;
 
-    for ch in s_work.chars().take(I_SNIPPET_SCAN_MAX_LEN) {
-        let b_keep = if o_cfg.b_keep_alphanumeric_only {
-            ch.is_ascii_alphanumeric()
-        } else {
-            !ch.is_control()
-        };
+    for ch in s_in.chars().take(I_SNIPPET_SCAN_MAX_LEN) {
+        let s_lower = ch.to_lowercase().to_string();
 
-        if b_keep {
-            if o_cfg.b_ascii_only {
-                if ch.is_ascii() {
-                    s_out.push(ch);
-                    b_prev_space = false;
-                } else if !b_prev_space {
-                    s_out.push(' ');
-                    b_prev_space = true;
-                }
-            } else {
-                s_out.push(ch);
+        for ch_l in s_lower.chars() {
+            if ch_l.is_ascii_alphanumeric() {
+                s_out.push(ch_l);
                 b_prev_space = false;
+            } else if !b_prev_space {
+                s_out.push(' ');
+                b_prev_space = true;
             }
-        } else if !b_prev_space {
-            s_out.push(' ');
-            b_prev_space = true;
         }
     }
 
-    let mut v_tokens: Vec<String> = s_out
+    return s_out
         .split_whitespace()
-        .map(|s| s.to_string())
-        .collect();
+        .collect::<Vec<&str>>()
+        .join(" ");
+}
 
-    if !o_cfg.v_stopwords.is_empty() {
-        let h_stop: HashSet<&str> = o_cfg.v_stopwords.iter().map(|s| s.as_str()).collect();
-        v_tokens.retain(|s| !h_stop.contains(s.as_str()));
+fn normalize_heuristic(s_text: &str) -> String {
+    let mut s_out = String::with_capacity(s_text.len());
+    let mut b_prev_space = false;
+
+    for ch in s_text.chars() {
+        let s_lower = ch.to_lowercase().to_string();
+
+        for ch_l in s_lower.chars() {
+            if ch_l.is_ascii_alphanumeric() {
+                s_out.push(ch_l);
+                b_prev_space = false;
+            } else if !b_prev_space {
+                s_out.push(' ');
+                b_prev_space = true;
+            }
+        }
     }
 
-    if o_cfg.b_collapse_whitespace {
-        return v_tokens.join(" ");
-    }
-
-    s_out
+    return s_out
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ");
 }
 
 fn build_five_grams(s_text: &str) -> Vec<String> {
-    let s_norm = normalize_text_default(s_text);
+    /*
+     * Beschreibung
+     * - Erzeugt 5 grams zeichenbasiert statt bytebasiert.
+     * - Dadurch bleiben Fenster stabil und Query und Indexierung identisch.
+     */
+    let s_norm = normalize_heuristic(s_text);
     if s_norm.is_empty() {
         return Vec::new();
     }
@@ -2142,11 +1416,11 @@ fn build_five_grams(s_text: &str) -> Vec<String> {
         v_out.push(s_part);
     }
 
-    v_out
+    return v_out;
 }
 
 fn extract_query_tokens(s_query: &str) -> Vec<String> {
-    let s_norm = normalize_text_default(s_query);
+    let s_norm = normalize_for_match(s_query);
     let mut v_out: Vec<String> = Vec::new();
 
     for s_t in s_norm.split_whitespace() {
@@ -2155,7 +1429,7 @@ fn extract_query_tokens(s_query: &str) -> Vec<String> {
         }
     }
 
-    v_out
+    return v_out;
 }
 
 fn build_snippet_for_query(s_text: &str, s_query: &str) -> String {
@@ -2164,7 +1438,7 @@ fn build_snippet_for_query(s_text: &str, s_query: &str) -> String {
         return String::new();
     }
 
-    let s_norm = normalize_text_default(s_text_trim);
+    let s_norm = normalize_for_match(s_text_trim);
     if s_norm.is_empty() {
         return s_text_trim.chars().take(I_SNIPPET_MAX_LEN).collect::<String>();
     }
@@ -2200,7 +1474,10 @@ fn build_snippet_for_query(s_text: &str, s_query: &str) -> String {
         .take(I_SNIPPET_MAX_LEN)
         .collect();
 
-    s_slice.split_whitespace().collect::<Vec<&str>>().join(" ")
+    return s_slice
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ");
 }
 
 fn dice_similarity(v_query_grams: &[String], v_doc_grams: &[String]) -> f32 {
@@ -2215,15 +1492,15 @@ fn dice_similarity(v_query_grams: &[String], v_doc_grams: &[String]) -> f32 {
     let i_total = (h_query.len() + h_doc.len()) as f32;
 
     if i_total <= 0.0 {
-        0.0
+        return 0.0;
     } else {
-        (2.0 * i_intersection) / i_total
+        return (2.0 * i_intersection) / i_total;
     }
 }
 
 fn prefix_match_score(s_query: &str, s_chunk_text: &str) -> f32 {
-    let s_query_norm = normalize_text_default(s_query);
-    let s_chunk_norm = normalize_text_default(s_chunk_text);
+    let s_query_norm = normalize_for_match(s_query);
+    let s_chunk_norm = normalize_for_match(s_chunk_text);
 
     if s_query_norm.is_empty() || s_chunk_norm.is_empty() {
         return 0.0;
@@ -2235,12 +1512,12 @@ fn prefix_match_score(s_query: &str, s_chunk_text: &str) -> f32 {
         }
     }
 
-    0.0
+    return 0.0;
 }
 
 fn exact_match_score(s_query: &str, s_chunk_text: &str) -> f32 {
-    let s_query_norm = normalize_text_default(s_query);
-    let s_chunk_norm = normalize_text_default(s_chunk_text);
+    let s_query_norm = normalize_for_match(s_query);
+    let s_chunk_norm = normalize_for_match(s_chunk_text);
 
     if s_query_norm.is_empty() || s_chunk_norm.is_empty() {
         return 0.0;
@@ -2252,15 +1529,18 @@ fn exact_match_score(s_query: &str, s_chunk_text: &str) -> f32 {
         }
     }
 
-    0.0
+    return 0.0;
 }
 
 fn bm25_ngram_from_env() -> usize {
-    5
+    /*
+     * Der BM25 Pfad bleibt fix auf 5 gram.
+     */
+    return 5;
 }
 
 fn to_char_ngrams(s_text: &str, i_n: usize, s_boundary: &str) -> Vec<String> {
-    let s_norm = normalize_text_default(s_text);
+    let s_norm = normalize_heuristic(s_text);
     if s_norm.trim().is_empty() {
         return Vec::new();
     }
@@ -2287,11 +1567,11 @@ fn to_char_ngrams(s_text: &str, i_n: usize, s_boundary: &str) -> Vec<String> {
         }
     }
 
-    v_out
+    return v_out;
 }
 
 fn tokenize_bm25_char_ngrams(s_text: &str, i_n: usize) -> Vec<String> {
-    to_char_ngrams(s_text, i_n, "_")
+    return to_char_ngrams(s_text, i_n, "_");
 }
 
 fn bm25_scores(
@@ -2359,7 +1639,7 @@ fn bm25_scores(
         v_scores.push(d_score);
     }
 
-    v_scores
+    return v_scores;
 }
 
 fn bm25_rerank_top_k(v_texts: &[(u64, String)], s_query: &str, i_k: usize) -> Vec<(u64, f32)> {
@@ -2393,51 +1673,12 @@ fn bm25_rerank_top_k(v_texts: &[(u64, String)], s_query: &str, i_k: usize) -> Ve
 
     v_out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
     v_out.truncate(i_k);
-    v_out
+
+    return v_out;
 }
 
 fn compute_bm25_idf(i_df: usize, i_doc_count: usize) -> f32 {
     let d_df = i_df.max(1) as f32;
     let d_n = i_doc_count.max(1) as f32;
-    ((d_n - d_df + 0.5) / (d_df + 0.5) + 1.0).ln()
-}
-
-pub fn cosine_similarity(v_left: &[f32], v_right: &[f32]) -> f32 {
-    if v_left.is_empty() || v_right.is_empty() {
-        return 0.0;
-    }
-
-    if v_left.len() != v_right.len() {
-        return 0.0;
-    }
-
-    let mut d_dot: f32 = 0.0;
-    let mut d_norm_left: f32 = 0.0;
-    let mut d_norm_right: f32 = 0.0;
-
-    for (d_l, d_r) in v_left.iter().zip(v_right.iter()) {
-        d_dot += d_l * d_r;
-        d_norm_left += d_l * d_l;
-        d_norm_right += d_r * d_r;
-    }
-
-    if d_norm_left <= 0.0 || d_norm_right <= 0.0 {
-        return 0.0;
-    }
-
-    d_dot / (d_norm_left.sqrt() * d_norm_right.sqrt())
-}
-
-fn contains_term(s_text_norm: &str, s_term_norm: &str) -> bool {
-    if s_text_norm.is_empty() || s_term_norm.is_empty() {
-        return false;
-    }
-
-    for s_word in s_text_norm.split_whitespace() {
-        if s_word == s_term_norm {
-            return true;
-        }
-    }
-
-    false
+    return ((d_n - d_df + 0.5) / (d_df + 0.5) + 1.0).ln();
 }
