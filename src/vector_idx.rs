@@ -16,6 +16,7 @@
  * - Beim Reindex werden nur betroffene Dokumente in den Indizes ersetzt oder ergaenzt.
  * - Normale Suche: Bool wirkt als Score.
  * - Explizite Bool Query: Bool wirkt als Score Filter.
+ * - Explizites AND wird logarithmisch stark geboostet, damit sehr genaue Treffer dominieren.
  *
  * Historie
  * 13.11.2025   MS   - Ausgangsmodul fuer einfachen Vektor Index
@@ -26,6 +27,7 @@
  * 17.05.2026   MS   - Umbau auf invertierten 5 gram Dateindex unter inv_idx
  * 17.05.2026   MS   - Delta Reindexing fuer neue und geaenderte Dokumente ergaenzt
  * 17.05.2026   MS   - Bool Scoring fuer normale Suche und Bool Score Filter ergaenzt
+ * 17.05.2026   MS   - Logarithmischer AND Boost fuer hochpraezise Treffer ergaenzt
  **********************************************************************************************/
 
 #![allow(clippy::needless_return)]
@@ -68,6 +70,13 @@ const D_HYBRID_BM25_WEIGHT: f32 = 0.40;
 const D_BOOL_FILTER_THRESHOLD: f32 = 0.55;
 const D_NORMAL_SEARCH_BOOL_WEIGHT: f32 = 0.15;
 const D_EXPLICIT_BOOL_SEARCH_BOOL_WEIGHT: f32 = 0.30;
+
+/* Logarithmischer AND Boost
+ * - Hebt Dokumente mit voll erfuellten AND Bedingungen stark an.
+ * - Dokumente mit nur teilweiser Erfuellung werden dagegen klar abgewertet.
+ */
+const D_AND_LOG_BOOST_MAX: f32 = 6.0;
+const D_AND_LOG_PENALTY_MAX: f32 = 0.85;
 
 pub type DocId = u64;
 pub type ChunkId = u64;
@@ -225,6 +234,9 @@ struct ParsedBoolQuery {
     v_required_terms: Vec<String>,
     v_optional_terms: Vec<String>,
     v_excluded_terms: Vec<String>,
+    i_and_term_count: usize,
+    i_or_term_count: usize,
+    i_not_term_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -390,7 +402,6 @@ impl InvertedIndexStore {
         Historie:
         - 17.05.2026   Marcus Schlieper   - Umstellung von Sammeldatei auf invertierten Dateindex
         */
-
         if s_gram.is_empty() {
             return Err(Error::new(ErrorKind::InvalidInput, "gram_empty"));
         }
@@ -428,8 +439,8 @@ impl InvertedIndexStore {
             f.write_all(&o_posting.i_chunk_id.to_le_bytes())?;
             f.write_all(&o_posting.i_tf.to_le_bytes())?;
         }
-
         f.flush()?;
+
         Ok((s_rel_file, i_byte_len))
     }
 
@@ -459,7 +470,6 @@ impl InvertedIndexStore {
 
         let mut f = OpenOptions::new().read(true).open(&p_file)?;
         let i_file_len = f.metadata()?.len();
-
         if i_file_len < 4 {
             return Err(Error::new(
                 ErrorKind::InvalidData,
@@ -470,7 +480,6 @@ impl InvertedIndexStore {
         let mut a_count = [0u8; 4];
         f.read_exact(&mut a_count)?;
         let i_count = u32::from_le_bytes(a_count) as usize;
-
         let i_expected_len = 4u64.saturating_add((i_count as u64).saturating_mul(12));
         if i_expected_len != i_file_len {
             return Err(Error::new(
@@ -487,7 +496,6 @@ impl InvertedIndexStore {
             let mut a_tf = [0u8; 4];
             f.read_exact(&mut a_chunk)?;
             f.read_exact(&mut a_tf)?;
-
             v_out.push(GramPostingRecord {
                 i_chunk_id: u64::from_le_bytes(a_chunk),
                 i_tf: u32::from_le_bytes(a_tf),
@@ -566,7 +574,6 @@ impl EmbeddingStore {
         if o_record.i_embedding_dim == 0 {
             return Err("embedding_dim_invalid".to_string());
         }
-
         if o_record.v_embedding.len() != o_record.i_embedding_dim as usize {
             return Err("embedding_dim_mismatch".to_string());
         }
@@ -624,8 +631,8 @@ impl DocStore {
     pub fn new(p_root: &Path) -> Self {
         let mut p_db = p_root.to_path_buf();
         p_db.push(S_DOC_STORE_DB_DIR);
-
         let _ = fs::create_dir_all(&p_db);
+
         let db = sled::open(&p_db).expect("doc_store_db_open_failed");
 
         return Self {
@@ -764,7 +771,6 @@ impl DocStore {
         i_model_version: u32,
     ) -> ChunkMeta {
         let i_chunk_id = self.next_id("chunk_id");
-
         let o_chunk = ChunkMeta {
             i_chunk_id,
             i_doc_id,
@@ -783,8 +789,8 @@ impl DocStore {
         a_rel[0..8].copy_from_slice(&i_doc_id.to_be_bytes());
         a_rel[8..12].copy_from_slice(&i_chunk_ordinal.to_be_bytes());
         let _ = self.t_chunks_by_doc.insert(a_rel, &i_chunk_id.to_le_bytes());
-
         let _ = self.db.flush();
+
         o_chunk
     }
 
@@ -819,7 +825,6 @@ impl DocStore {
             let Ok((_, v)) = item else {
                 continue;
             };
-
             if v.len() == 8 {
                 let mut a = [0u8; 8];
                 a.copy_from_slice(v.as_ref());
@@ -923,38 +928,32 @@ impl DocStore {
 
     pub fn iter_all_chunk_ids(&self) -> Vec<ChunkId> {
         let mut v_out: Vec<ChunkId> = Vec::new();
-
         for item in self.t_chunk_by_id.iter() {
             let Ok((k, _)) = item else {
                 continue;
             };
-
             if k.len() == 8 {
                 let mut a = [0u8; 8];
                 a.copy_from_slice(k.as_ref());
                 v_out.push(u64::from_le_bytes(a));
             }
         }
-
         v_out.sort_unstable();
         v_out
     }
 
     pub fn iter_all_doc_ids(&self) -> Vec<DocId> {
         let mut v_out: Vec<DocId> = Vec::new();
-
         for item in self.t_doc_by_id.iter() {
             let Ok((k, _)) = item else {
                 continue;
             };
-
             if k.len() == 8 {
                 let mut a = [0u8; 8];
                 a.copy_from_slice(k.as_ref());
                 v_out.push(u64::from_le_bytes(a));
             }
         }
-
         v_out.sort_unstable();
         v_out
     }
@@ -988,8 +987,8 @@ impl VectorIndex {
 
         let mut p_inv_idx = p_root.to_path_buf();
         p_inv_idx.push(S_INV_IDX_DIR);
-
         let inv_idx_store = Arc::new(InvertedIndexStore::new(p_inv_idx));
+
         let embedding_store = Arc::new(EmbeddingStore::new(doc_store.db()));
         let embedding_backend: Arc<dyn EmbeddingBackend> =
             Arc::new(SimpleHashEmbeddingBackend::new(I_EMBEDDING_DIM_DEFAULT, 1));
@@ -1059,8 +1058,8 @@ impl VectorIndex {
     pub fn load_dictionary_json(&self, p_file: &Path) -> Result<(), String> {
         let s_json =
             fs::read_to_string(p_file).map_err(|_| "dictionary_json_read_failed".to_string())?;
-        let o_cfg: DictionaryConfig = serde_json::from_str(&s_json)
-            .map_err(|_| "dictionary_json_parse_failed".to_string())?;
+        let o_cfg: DictionaryConfig =
+            serde_json::from_str(&s_json).map_err(|_| "dictionary_json_parse_failed".to_string())?;
 
         let mut h_terms = self
             .h_dictionary_terms
@@ -1095,7 +1094,6 @@ impl VectorIndex {
     pub fn load_normalization_json(&self, p_file: &Path) -> Result<(), String> {
         let s_json =
             fs::read_to_string(p_file).map_err(|_| "normalization_json_read_failed".to_string())?;
-
         let mut o_cfg: NormalizationConfig = serde_json::from_str(&s_json)
             .map_err(|_| "normalization_json_parse_failed".to_string())?;
 
@@ -1112,7 +1110,6 @@ impl VectorIndex {
                     v_stopwords: Vec::new(),
                 },
             );
-
             if !s_norm.is_empty() && !v_stopwords_norm.contains(&s_norm) {
                 v_stopwords_norm.push(s_norm);
             }
@@ -1256,7 +1253,6 @@ impl VectorIndex {
 
         let s_limited: String = s_trim.chars().take(I_EMBEDDING_TEXT_LIMIT).collect();
         let v_embedding = self.embedding_backend.encode(&s_limited)?;
-
         if v_embedding.len() != self.embedding_backend.embedding_dim() {
             return Err("embedding_backend_dim_mismatch".to_string());
         }
@@ -1316,7 +1312,7 @@ impl VectorIndex {
             .iter_all_chunk_ids()
             .into_iter()
             .take(i_limit)
-            .collect::<Vec<ChunkId>>();
+            .collect::<Vec<_>>();
 
         if !v_chunk_ids.is_empty() {
             let _ = self.o_bg.tx.send(IndexJob::ReprojectDirty { v_chunk_ids });
@@ -1334,7 +1330,6 @@ impl VectorIndex {
         Historie:
         - 17.05.2026   Marcus Schlieper   - Zyklisches Delta Sync statt Vollrebuild
         */
-
         let mut v_jobs: Vec<(PathBuf, PayloadMap)> = Vec::new();
         Self::crawl_collect(root, &mut v_jobs);
 
@@ -1350,7 +1345,6 @@ impl VectorIndex {
     pub fn upsert_path_now(&self, p_path: &Path, payload: PayloadMap) -> Result<(), String> {
         let s_doc_path = canonicalize_best_effort(p_path);
         let md = fs::metadata(p_path).map_err(|_| "metadata_failed".to_string())?;
-
         let i_modified_ts = md
             .modified()
             .unwrap_or(SystemTime::UNIX_EPOCH)
@@ -1372,8 +1366,8 @@ impl VectorIndex {
         }
 
         let o_doc = self.doc_store.upsert_document_meta(&s_doc_path, payload.clone());
-
         let v_old_chunk_ids = self.doc_store.list_chunk_ids_by_doc(o_doc.i_doc_id);
+
         let v_old_chunk_ids_active: Vec<ChunkId> = v_old_chunk_ids
             .iter()
             .copied()
@@ -1399,7 +1393,6 @@ impl VectorIndex {
 
         for (i_idx, s_chunk) in v_chunks.into_iter().enumerate() {
             let s_chunk_norm = self.apply_dictionary_replacements(&s_chunk);
-
             let o_chunk = self.doc_store.create_chunk(
                 o_doc.i_doc_id,
                 i_idx as u32,
@@ -1427,6 +1420,7 @@ impl VectorIndex {
         );
 
         let h_new_grams = self.collect_grams_for_chunk_ids(&v_new_chunk_ids);
+
         let mut h_dirty_grams: HashSet<String> = HashSet::new();
         h_dirty_grams.extend(h_old_grams.into_iter());
         h_dirty_grams.extend(h_new_grams.into_iter());
@@ -1536,7 +1530,6 @@ impl VectorIndex {
             }
 
             let d_bool_soft_score = self.compute_bool_soft_score(&o_chunk.s_text, &o_bool_query);
-
             if b_has_explicit_bool_ops && d_bool_soft_score < D_BOOL_FILTER_THRESHOLD {
                 continue;
             }
@@ -1545,13 +1538,18 @@ impl VectorIndex {
             let d_soft_score_base =
                 self.compute_soft_gram_score(&s_lexical_query, &o_chunk.s_text, d_posting_score);
 
-            let d_soft_score = if b_has_explicit_bool_ops {
+            let mut d_soft_score = if b_has_explicit_bool_ops {
                 ((1.0 - D_EXPLICIT_BOOL_SEARCH_BOOL_WEIGHT) * d_soft_score_base)
                     + (D_EXPLICIT_BOOL_SEARCH_BOOL_WEIGHT * d_bool_soft_score)
             } else {
                 ((1.0 - D_NORMAL_SEARCH_BOOL_WEIGHT) * d_soft_score_base)
                     + (D_NORMAL_SEARCH_BOOL_WEIGHT * d_bool_soft_score)
             };
+
+            if b_has_explicit_bool_ops {
+                let d_and_factor = self.compute_and_log_boost_factor(&o_chunk.s_text, &o_bool_query);
+                d_soft_score *= d_and_factor;
+            }
 
             v_preselected.push((i_chunk_id, d_soft_score));
         }
@@ -1579,7 +1577,6 @@ impl VectorIndex {
                 }
 
                 let d_bool_soft_score = self.compute_bool_soft_score(&o_chunk.s_text, &o_bool_query);
-
                 if b_has_explicit_bool_ops && d_bool_soft_score < D_BOOL_FILTER_THRESHOLD {
                     continue;
                 }
@@ -1587,13 +1584,19 @@ impl VectorIndex {
                 let d_soft_score_base =
                     self.compute_soft_gram_score(&s_lexical_query, &o_chunk.s_text, 0.0);
 
-                let d_soft_score = if b_has_explicit_bool_ops {
+                let mut d_soft_score = if b_has_explicit_bool_ops {
                     ((1.0 - D_EXPLICIT_BOOL_SEARCH_BOOL_WEIGHT) * d_soft_score_base)
                         + (D_EXPLICIT_BOOL_SEARCH_BOOL_WEIGHT * d_bool_soft_score)
                 } else {
                     ((1.0 - D_NORMAL_SEARCH_BOOL_WEIGHT) * d_soft_score_base)
                         + (D_NORMAL_SEARCH_BOOL_WEIGHT * d_bool_soft_score)
                 };
+
+                if b_has_explicit_bool_ops {
+                    let d_and_factor =
+                        self.compute_and_log_boost_factor(&o_chunk.s_text, &o_bool_query);
+                    d_soft_score *= d_and_factor;
+                }
 
                 v_preselected.push((i_chunk_id, d_soft_score));
             }
@@ -1619,7 +1622,6 @@ impl VectorIndex {
 
         let v_bm25 = bm25_rerank_top_k(&v_texts, &s_lexical_query, I_BM25_TOP_CANDIDATES);
         let mut h_bm25_score: HashMap<ChunkId, f32> = HashMap::new();
-
         for (i_chunk_id, d_bm25) in v_bm25.into_iter() {
             h_bm25_score.insert(i_chunk_id, d_bm25);
         }
@@ -1640,7 +1642,12 @@ impl VectorIndex {
                 continue;
             };
 
-            let d_bm25 = *h_bm25_score.get(&i_chunk_id).unwrap_or(&0.0);
+            let mut d_bm25 = *h_bm25_score.get(&i_chunk_id).unwrap_or(&0.0);
+
+            if b_has_explicit_bool_ops {
+                let d_and_factor = self.compute_and_log_boost_factor(&o_chunk.s_text, &o_bool_query);
+                d_bm25 *= d_and_factor;
+            }
 
             let d_embedding = if let Some(v_query_embedding) = o_query_embedding.as_ref() {
                 if let Some(o_embedding) = self.get_chunk_embedding(i_chunk_id) {
@@ -1729,7 +1736,6 @@ impl VectorIndex {
             let Some(o_chunk) = self.doc_store.get_chunk(i_chunk_id) else {
                 continue;
             };
-
             if o_chunk.b_deleted {
                 continue;
             }
@@ -1842,7 +1848,6 @@ impl VectorIndex {
         Historie:
         - 17.05.2026   Marcus Schlieper   - Delta Update fuer invertierten Dateindex
         */
-
         if h_dirty_grams.is_empty() {
             return Ok(());
         }
@@ -1863,7 +1868,6 @@ impl VectorIndex {
                         .inv_idx_store
                         .delete_posting_file_by_rel(&o_old_meta.s_rel_file);
                 }
-
                 self.doc_store.delete_gram_posting_meta(&s_gram)?;
                 continue;
             }
@@ -1883,7 +1887,6 @@ impl VectorIndex {
 
             let i_expected_byte_len =
                 4u64.saturating_add((v_postings.len() as u64).saturating_mul(12));
-
             if i_byte_len != i_expected_byte_len {
                 return Err("posting_store_record_count_mismatch".to_string());
             }
@@ -1903,11 +1906,14 @@ impl VectorIndex {
 
     fn parse_bool_query_cfg(&self, s_query: &str) -> ParsedBoolQuery {
         let v_tokens_raw: Vec<&str> = s_query.split_whitespace().collect();
-
         let mut v_required_terms: Vec<String> = Vec::new();
         let mut v_optional_terms: Vec<String> = Vec::new();
         let mut v_excluded_terms: Vec<String> = Vec::new();
+
         let mut o_pending_op: Option<BoolOp> = None;
+        let mut i_and_term_count: usize = 0;
+        let mut i_or_term_count: usize = 0;
+        let mut i_not_term_count: usize = 0;
 
         for s_token_raw in v_tokens_raw.into_iter() {
             let s_token_upper = s_token_raw.trim().to_ascii_uppercase();
@@ -1932,6 +1938,7 @@ impl VectorIndex {
 
             match o_pending_op {
                 Some(BoolOp::And) => {
+                    i_and_term_count = i_and_term_count.saturating_add(1);
                     let v_expanded = self.expand_term_with_synonyms(&s_term);
                     if v_expanded.len() > 1 {
                         for s_part in v_expanded.into_iter() {
@@ -1939,7 +1946,6 @@ impl VectorIndex {
                                 v_optional_terms.push(s_part);
                             }
                         }
-
                         let s_first = self.normalize_text_cfg(&s_term);
                         if !s_first.is_empty() && !v_required_terms.contains(&s_first) {
                             v_required_terms.push(s_first);
@@ -1952,6 +1958,7 @@ impl VectorIndex {
                     }
                 }
                 Some(BoolOp::Or) => {
+                    i_or_term_count = i_or_term_count.saturating_add(1);
                     for s_expanded in self.expand_term_with_synonyms(&s_term).into_iter() {
                         if !v_optional_terms.contains(&s_expanded) {
                             v_optional_terms.push(s_expanded);
@@ -1959,6 +1966,7 @@ impl VectorIndex {
                     }
                 }
                 Some(BoolOp::Not) => {
+                    i_not_term_count = i_not_term_count.saturating_add(1);
                     let s_norm = self.normalize_text_cfg(&s_term);
                     if !s_norm.is_empty() {
                         v_excluded_terms.push(s_norm);
@@ -1969,7 +1977,6 @@ impl VectorIndex {
                     if !s_norm.is_empty() {
                         v_required_terms.push(s_norm.clone());
                     }
-
                     for s_expanded in self.expand_term_with_synonyms(&s_term).into_iter() {
                         if s_expanded != s_norm && !v_optional_terms.contains(&s_expanded) {
                             v_optional_terms.push(s_expanded);
@@ -1983,10 +1990,8 @@ impl VectorIndex {
 
         v_required_terms.sort();
         v_required_terms.dedup();
-
         v_optional_terms.sort();
         v_optional_terms.dedup();
-
         v_excluded_terms.sort();
         v_excluded_terms.dedup();
 
@@ -1994,6 +1999,9 @@ impl VectorIndex {
             v_required_terms,
             v_optional_terms,
             v_excluded_terms,
+            i_and_term_count,
+            i_or_term_count,
+            i_not_term_count,
         }
     }
 
@@ -2023,8 +2031,8 @@ impl VectorIndex {
 
         Historie:
         - 17.05.2026   Marcus Schlieper   - Erste Version fuer weiches Bool Ranking
+        - 17.05.2026   Marcus Schlieper   - Grundlage fuer logarithmischen AND Boost
         */
-
         let s_norm = self.apply_dictionary_replacements(s_text);
         if s_norm.is_empty() {
             return 0.0;
@@ -2074,6 +2082,45 @@ impl VectorIndex {
             0.75 * d_required_score + 0.25 * d_optional_score - 0.60 * d_excluded_penalty;
 
         d_score.clamp(0.0, 1.0)
+    }
+
+    fn compute_and_log_boost_factor(&self, s_text: &str, o_bool_query: &ParsedBoolQuery) -> f32 {
+        /*
+        Beschreibung:
+        - Bei expliziten AND Queries wird die Praezision stark bevorzugt.
+        - Wenn alle Required Terms gefunden werden, steigt der Faktor logarithmisch deutlich.
+        - Bei Teiltreffern wird der Faktor stark abgesenkt.
+        - Ziel ist, dass exakte AND Treffer praktisch alle anderen Dokumente dominieren.
+
+        Historie:
+        - 17.05.2026   Marcus Schlieper   - Logarithmischer AND Boost fuer praezise Bool Queries
+        */
+        if o_bool_query.i_and_term_count == 0 || o_bool_query.v_required_terms.is_empty() {
+            return 1.0;
+        }
+
+        let s_norm = self.apply_dictionary_replacements(s_text);
+        if s_norm.is_empty() {
+            return 0.1;
+        }
+
+        let mut i_required_hits: usize = 0;
+        for s_term in o_bool_query.v_required_terms.iter() {
+            if contains_term_soft(&s_norm, s_term) {
+                i_required_hits = i_required_hits.saturating_add(1);
+            }
+        }
+
+        let i_required_total = o_bool_query.v_required_terms.len().max(1);
+        let d_ratio = (i_required_hits as f32) / (i_required_total as f32);
+
+        if i_required_hits >= i_required_total {
+            let d_boost = 1.0 + ((i_required_total as f32) + 1.0).ln() * D_AND_LOG_BOOST_MAX;
+            return d_boost.max(1.0);
+        }
+
+        let d_penalty = 1.0 - (((1.0 - d_ratio).max(0.0) + 1.0).ln() * D_AND_LOG_PENALTY_MAX);
+        d_penalty.clamp(0.10, 0.95)
     }
 
     fn build_five_grams_cfg(&self, s_text: &str) -> Vec<String> {
@@ -2162,15 +2209,11 @@ impl VectorIndex {
                 h_gram_to_postings
                     .entry(s_gram)
                     .or_insert_with(Vec::new)
-                    .push(GramPostingRecord {
-                        i_chunk_id,
-                        i_tf,
-                    });
+                    .push(GramPostingRecord { i_chunk_id, i_tf });
             }
         }
 
-        let mut v_grams: Vec<(String, Vec<GramPostingRecord>)> =
-            h_gram_to_postings.into_iter().collect();
+        let mut v_grams: Vec<(String, Vec<GramPostingRecord>)> = h_gram_to_postings.into_iter().collect();
         v_grams.sort_by(|a, b| a.0.cmp(&b.0));
 
         for (_, v_postings) in v_grams.iter_mut() {
@@ -2190,7 +2233,6 @@ impl VectorIndex {
 
             let i_expected_byte_len =
                 4u64.saturating_add((v_postings.len() as u64).saturating_mul(12));
-
             if i_byte_len != i_expected_byte_len {
                 return Err("posting_store_record_count_mismatch".to_string());
             }
@@ -2248,7 +2290,6 @@ impl VectorIndex {
             let Some(o_doc) = self.doc_store.get_document_meta(i_doc_id) else {
                 continue;
             };
-
             if o_doc.b_deleted {
                 continue;
             }
@@ -2522,7 +2563,7 @@ fn build_snippet_for_query(s_text: &str, s_query: &str) -> String {
 
     s_slice
         .split_whitespace()
-        .collect::<Vec<&str>>()
+        .collect::<Vec<_>>()
         .join(" ")
 }
 
@@ -2631,7 +2672,6 @@ fn bm25_scores(
     let mut h_df: HashMap<String, usize> = HashMap::new();
     for v_doc in v_docs_tokens.iter() {
         let mut h_seen: HashSet<&str> = HashSet::new();
-
         for s_term in v_doc.iter() {
             if h_seen.insert(s_term.as_str()) {
                 *h_df.entry(s_term.clone()).or_insert(0) += 1;
@@ -2649,11 +2689,9 @@ fn bm25_scores(
     let mut v_tf: Vec<HashMap<&str, usize>> = Vec::with_capacity(v_docs_tokens.len());
     for v_doc in v_docs_tokens.iter() {
         let mut h_tf: HashMap<&str, usize> = HashMap::new();
-
         for s_t in v_doc.iter() {
             *h_tf.entry(s_t.as_str()).or_insert(0) += 1;
         }
-
         v_tf.push(h_tf);
     }
 
@@ -2729,7 +2767,6 @@ pub fn cosine_similarity(v_left: &[f32], v_right: &[f32]) -> f32 {
     if v_left.is_empty() || v_right.is_empty() {
         return 0.0;
     }
-
     if v_left.len() != v_right.len() {
         return 0.0;
     }
@@ -2774,7 +2811,6 @@ fn contains_term_soft(s_text_norm: &str, s_term_norm: &str) -> bool {
     - Gemeinsame 5 gram Treffer sind positiv.
     - So bleiben Angebot und Angebote in der Bool Bewertung verwandt.
     */
-
     if s_text_norm.is_empty() || s_term_norm.is_empty() {
         return false;
     }
@@ -2791,7 +2827,6 @@ fn contains_term_soft(s_text_norm: &str, s_term_norm: &str) -> bool {
         let v_left = build_five_grams(s_word);
         let v_right = build_five_grams(s_term_norm);
         let d_dice = dice_similarity(&v_left, &v_right);
-
         if d_dice >= 0.45 {
             return true;
         }
@@ -2807,7 +2842,6 @@ fn has_explicit_bool_ops(s_query: &str) -> bool {
             return true;
         }
     }
-
     false
 }
 
