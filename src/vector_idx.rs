@@ -2,35 +2,23 @@
  * Modulname : vector_idx
  * Datei     : vector_idx.rs
  * Autor     : Marcus Schlieper
+ * Firma     : ExpChat.ai
  *---------------------------------------------------------------------------------------------
  * Beschreibung
- * - MUVERA orientierte Retrieval Implementierung in einer Datei.
- * - Persistente Dokumente, Chunks, Token Daten, MUVERA Vektoren und Metadaten.
- * - Inkrementelles Insert und Delete.
- * - Stabile Dokument IDs und Chunk IDs.
- * - Chunking Strategie.
- * - Persistente Metadaten.
- * - Filter auf Payload.
- * - Batch Ingestion.
- * - Hintergrund Indexierung.
- * - Sauberer Rebuild Prozess.
- * - Kein erneutes Dateilesen im Query Pfad.
- * - BM25 Re Ranking auf Top Kandidaten nach MUVERA und Token Recall.
- * - Persistenter Token Posting Index fuer lexikalischen Recall.
- * - Robusteres MUVERA mit:
- *   - erweiterter Tokenisierung
- *   - Soft Assignment Top 2
- *   - speziellem Query Pooling fuer kurze Queries
- *   - multilingualem Subword Recall ueber char 3 bis 5 grams
+ * - Persistenter 5 gram Retrieval Index mit optionalem leichtgewichtigem Embedding Modul.
+ * - Dokumente und Chunks werden in sled persistiert.
+ * - Posting Listen werden in einer separaten binaeren Datei gespeichert.
+ * - Embeddings werden in einer separaten sled Tree gespeichert.
+ * - Inkrementelles Upsert und Delete mit stabilem Rebuild der Posting Daten.
+ * - Query nutzt 5 gram Recall, BM25 Reranking und boolesche Operatoren.
+ * - Sichere Validierung und defensive Fehlerbehandlung.
  *
  * Historie
  * 13.11.2025   MS   - Ausgangsmodul fuer einfachen Vektor Index
- * 08.05.2026   MS   - Embedding Backend Abstraktion
- * 16.05.2026   MS   - MUVERA Version 1 ohne ANN
- * 16.05.2026   MS   - MUVERA Version 2 mit Modell Swap, Reprojektion und SimHash Buckets
- * 16.05.2026   MS   - Persistenter Token Posting Index fuer lexikalischen Recall
- * 16.05.2026   MS   - Erweiterte MUVERA Tokenisierung und Soft Assignment Top 2
- * 16.05.2026   MS   - Multilingualer Subword Recall ueber char 3 bis 5 grams
+ * 16.05.2026   MS   - Persistenter 5 gram Posting Index
+ * 17.05.2026   MS   - Stabile Version mit korrigierten Posting Offsets
+ * 17.05.2026   MS   - Erweiterung um leichtgewichtiges Embedding Modul
+ * 17.05.2026   MS   - Boolesche Operatoren AND OR NOT wieder eingebaut
  **********************************************************************************************/
 
 #![allow(clippy::needless_return)]
@@ -42,7 +30,7 @@ use sled::{Db, Tree};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     mpsc::{channel, Receiver, Sender},
@@ -51,51 +39,25 @@ use std::sync::{
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::embedding_backend::{create_backend_from_env, EmbeddingBackend, I_VEC_DIM_DEFAULT};
 use crate::extract_doc_text;
 
 const I_BM25_TOP_CANDIDATES: usize = 40;
 const D_BM25_K1: f32 = 1.5;
 const D_BM25_B: f32 = 0.75;
-const I_BM25_NGRAM_DEFAULT: usize = 5;
-const I_BM25_NGRAM_MIN: usize = 3;
-const I_BM25_NGRAM_MAX: usize = 6;
-
 const I_SNIPPET_MAX_LEN: usize = 320;
 const I_SNIPPET_SCAN_MAX_LEN: usize = 32_000;
-
 const I_DEFAULT_CHUNK_CHARS: usize = 1200;
 const I_DEFAULT_CHUNK_OVERLAP_CHARS: usize = 200;
-
-const I_DEFAULT_MUVERA_CLUSTER_COUNT: usize = 32;
-const I_DEFAULT_SIMHASH_BITS: usize = 64;
-const I_DEFAULT_QUERY_PRESELECT: usize = 2000;
-const I_DEFAULT_BUCKET_PREFIX_BITS: usize = 12;
-const I_DEFAULT_FINE_SCORE_TOP_K: usize = 24;
-
-const I_TOKEN_POSTING_PER_TERM_LIMIT: usize = 20_000;
-const I_TOKEN_POSTING_TARGET_CANDIDATES: usize = 20_000;
-
-const I_MUVERA_ASSIGN_TOP_K: usize = 2;
-const I_MUVERA_CHAR_NGRAM_MIN: usize = 3;
-const I_MUVERA_CHAR_NGRAM_MAX: usize = 5;
-const I_MUVERA_SHORT_QUERY_WORD_THRESHOLD: usize = 3;
-
-const D_MUVERA_QUERY_MAX_POOL_WEIGHT_SHORT: f32 = 0.55;
-const D_MUVERA_QUERY_MEAN_POOL_WEIGHT_SHORT: f32 = 0.45;
-const D_MUVERA_DOC_MAX_POOL_WEIGHT: f32 = 0.20;
-const D_MUVERA_DOC_MEAN_POOL_WEIGHT: f32 = 0.80;
-
-const D_SUBWORD_CANDIDATE_WEIGHT_SHORT_QUERY: f32 = 0.45;
-const D_SUBWORD_CANDIDATE_WEIGHT_NORMAL_QUERY: f32 = 0.30;
-const D_WORD_CANDIDATE_WEIGHT_SHORT_QUERY: f32 = 0.15;
-const D_WORD_CANDIDATE_WEIGHT_NORMAL_QUERY: f32 = 0.10;
-
+const I_FIVE_GRAM_SIZE: usize = 5;
+const I_POSTING_PER_GRAM_LIMIT: usize = 20_000;
+const I_TARGET_CANDIDATES: usize = 30_000;
 const S_DOC_STORE_DB_DIR: &str = "doc_store_db";
-const S_MODEL_ACTIVE_FILE: &str = "muvera_model_active.bin";
-const S_MODEL_STAGING_FILE: &str = "muvera_model_staging.bin";
-const S_TOKEN_STORE_FILE: &str = "token_vectors_compact.bin";
-const S_MUVERA_STORE_FILE: &str = "muvera_vectors.bin";
+const S_GRAM_POSTING_STORE_FILE: &str = "five_gram_postings.bin";
+const I_EMBEDDING_DIM_DEFAULT: usize = 64;
+const I_EMBEDDING_TEXT_LIMIT: usize = 16_000;
+const D_HYBRID_EMBEDDING_WEIGHT: f32 = 0.25;
+const D_HYBRID_LEXICAL_WEIGHT: f32 = 0.35;
+const D_HYBRID_BM25_WEIGHT: f32 = 0.40;
 
 pub type DocId = u64;
 pub type ChunkId = u64;
@@ -127,15 +89,17 @@ pub struct QueryOptions {
     pub i_k: usize,
     pub v_filters: Vec<PayloadFilter>,
     pub b_enable_token_level_rescore: bool,
+    pub b_enable_embedding_rescore: bool,
 }
 
 impl Default for QueryOptions {
     fn default() -> Self {
-        Self {
+        return Self {
             i_k: 10,
             v_filters: Vec::new(),
             b_enable_token_level_rescore: false,
-        }
+            b_enable_embedding_rescore: true,
+        };
     }
 }
 
@@ -175,71 +139,152 @@ pub struct ChunkingConfig {
 
 impl Default for ChunkingConfig {
     fn default() -> Self {
-        Self {
+        return Self {
             i_chunk_chars: I_DEFAULT_CHUNK_CHARS,
             i_chunk_overlap_chars: I_DEFAULT_CHUNK_OVERLAP_CHARS,
-        }
+        };
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct MuveraConfig {
-    pub i_token_dim: usize,
-    pub i_cluster_count: usize,
-    pub i_simhash_bits: usize,
-    pub i_bucket_prefix_bits: usize,
-    pub i_query_preselect: usize,
-    pub i_bm25_top_k: usize,
-    pub i_fine_score_top_k: usize,
-    pub i_model_version: u32,
+pub struct GramPostingRecord {
+    pub i_chunk_id: ChunkId,
+    pub i_tf: u32,
 }
 
-impl Default for MuveraConfig {
-    fn default() -> Self {
-        Self {
-            i_token_dim: I_VEC_DIM_DEFAULT.max(64),
-            i_cluster_count: I_DEFAULT_MUVERA_CLUSTER_COUNT,
-            i_simhash_bits: I_DEFAULT_SIMHASH_BITS,
-            i_bucket_prefix_bits: I_DEFAULT_BUCKET_PREFIX_BITS,
-            i_query_preselect: I_DEFAULT_QUERY_PRESELECT,
-            i_bm25_top_k: I_BM25_TOP_CANDIDATES,
-            i_fine_score_top_k: I_DEFAULT_FINE_SCORE_TOP_K,
-            i_model_version: 1,
-        }
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GramPostingFileEntry {
+    pub i_offset: u64,
+    pub i_byte_len: u64,
+    pub i_doc_freq: u32,
+}
+
+/**********************************************************************************************
+ * Modulname : vector_idx
+ * Datei     : vector_idx.rs
+ * Autor     : Marcus Schlieper
+ *---------------------------------------------------------------------------------------------
+ * Beschreibung
+ * - Persistierter Embedding Datensatz pro Chunk.
+ *
+ * Historie
+ * 17.05.2026   MS   - Struktur erstellt
+ **********************************************************************************************/
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EmbeddingRecord {
+    pub i_chunk_id: ChunkId,
+    pub v_embedding: Vec<f32>,
+    pub i_embedding_dim: u32,
+    pub i_model_version: u32,
+    pub i_created_ts: u64,
+    pub i_updated_ts: u64,
+}
+
+/**********************************************************************************************
+ * Modulname : vector_idx
+ * Datei     : vector_idx.rs
+ * Autor     : Marcus Schlieper
+ *---------------------------------------------------------------------------------------------
+ * Beschreibung
+ * - Abstraktion fuer ein leichtgewichtiges Embedding Backend.
+ *
+ * Historie
+ * 17.05.2026   MS   - Trait erstellt
+ **********************************************************************************************/
+
+pub trait EmbeddingBackend: Send + Sync {
+    fn model_name(&self) -> &str;
+    fn model_version(&self) -> u32;
+    fn embedding_dim(&self) -> usize;
+    fn encode(&self, s_text: &str) -> Result<Vec<f32>, String>;
+}
+
+/**********************************************************************************************
+ * Modulname : vector_idx
+ * Datei     : vector_idx.rs
+ * Autor     : Marcus Schlieper
+ *---------------------------------------------------------------------------------------------
+ * Beschreibung
+ * - Sehr leichtgewichtiges lokales Hash Embedding Backend.
+ *
+ * Historie
+ * 17.05.2026   MS   - Backend erstellt
+ **********************************************************************************************/
+
+pub struct SimpleHashEmbeddingBackend {
+    i_embedding_dim: usize,
+    i_model_version: u32,
+    s_model_name: String,
+}
+
+impl SimpleHashEmbeddingBackend {
+    pub fn new(i_embedding_dim: usize, i_model_version: u32) -> Self {
+        return Self {
+            i_embedding_dim: i_embedding_dim.max(8),
+            i_model_version,
+            s_model_name: "simple_hash_embedding".to_string(),
+        };
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ClusterCentroid {
-    pub i_cluster_id: u32,
-    pub v_center: Vec<f32>,
-}
+impl EmbeddingBackend for SimpleHashEmbeddingBackend {
+    fn model_name(&self) -> &str {
+        return &self.s_model_name;
+    }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct MuveraModel {
-    pub cfg: MuveraConfig,
-    pub v_centroids: Vec<ClusterCentroid>,
-}
+    fn model_version(&self) -> u32 {
+        return self.i_model_version;
+    }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TokenVectorRecord {
-    pub i_chunk_id: ChunkId,
-    pub i_token_count: u32,
-    pub i_vector_dim: u32,
-    pub i_file_offset: u64,
-    pub i_byte_len: u64,
-    pub b_quantized_i8: bool,
-}
+    fn embedding_dim(&self) -> usize {
+        return self.i_embedding_dim;
+    }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct MuveraVectorRecord {
-    pub i_chunk_id: ChunkId,
-    pub i_dim: u32,
-    pub i_model_version: u32,
-    pub i_file_offset: u64,
-    pub i_byte_len: u64,
-    pub a_simhash: Vec<u64>,
-    pub i_bucket_key: u32,
+    fn encode(&self, s_text: &str) -> Result<Vec<f32>, String> {
+        let s_norm = normalize_for_match(s_text);
+        if s_norm.is_empty() {
+            return Ok(vec![0.0; self.i_embedding_dim]);
+        }
+
+        let mut v_out = vec![0.0f32; self.i_embedding_dim];
+        let mut i_non_zero: usize = 0;
+
+        for s_token in s_norm.split_whitespace().take(4096) {
+            let mut o_hasher = Sha256::new();
+            o_hasher.update(s_token.as_bytes());
+            let a_hash = o_hasher.finalize();
+
+            let mut a_idx = [0u8; 8];
+            a_idx.copy_from_slice(&a_hash[0..8]);
+            let i_idx = (u64::from_le_bytes(a_idx) as usize) % self.i_embedding_dim;
+
+            let mut a_sign = [0u8; 4];
+            a_sign.copy_from_slice(&a_hash[8..12]);
+            let d_sign = if u32::from_le_bytes(a_sign) % 2 == 0 {
+                1.0f32
+            } else {
+                -1.0f32
+            };
+
+            let d_weight = 1.0f32 + (s_token.len() as f32 / 32.0f32);
+            v_out[i_idx] += d_sign * d_weight;
+            i_non_zero = i_non_zero.saturating_add(1);
+        }
+
+        if i_non_zero == 0 {
+            return Ok(v_out);
+        }
+
+        let d_norm = v_out.iter().map(|d_v| d_v * d_v).sum::<f32>().sqrt();
+        if d_norm > 0.0 {
+            for d_v in v_out.iter_mut() {
+                *d_v /= d_norm;
+            }
+        }
+
+        Ok(v_out)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +304,20 @@ enum IndexJob {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoolOp {
+    And,
+    Or,
+    Not,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedBoolQuery {
+    v_required_terms: Vec<String>,
+    v_optional_terms: Vec<String>,
+    v_excluded_terms: Vec<String>,
+}
+
 struct BackgroundIndexer {
     tx: Sender<IndexJob>,
 }
@@ -266,135 +325,222 @@ struct BackgroundIndexer {
 impl BackgroundIndexer {
     fn new() -> (Self, Receiver<IndexJob>) {
         let (tx, rx) = channel::<IndexJob>();
-        (Self { tx }, rx)
+        return (Self { tx }, rx);
     }
 }
 
-pub struct VectorMatrixStore {
+pub struct PostingListStore {
     p_file: PathBuf,
     o_lock: Mutex<()>,
 }
 
-impl VectorMatrixStore {
+impl PostingListStore {
     pub fn new(p_file: PathBuf) -> Self {
         if let Some(p_parent) = p_file.parent() {
             let _ = fs::create_dir_all(p_parent);
         }
-        Self {
+        return Self {
             p_file,
             o_lock: Mutex::new(()),
-        }
+        };
     }
 
-    pub fn append_vector_f32(&self, v_vec: &[f32]) -> std::io::Result<(u64, u64)> {
-        let _g = self
-            .o_lock
-            .lock()
-            .expect("vector_matrix_store_lock_failed");
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&self.p_file)?;
-        let i_offset = f.seek(SeekFrom::End(0))?;
-        let mut v_buf: Vec<u8> = Vec::with_capacity(v_vec.len() * 4);
-        for d_val in v_vec.iter() {
-            v_buf.extend_from_slice(&d_val.to_le_bytes());
-        }
-        f.write_all(&v_buf)?;
-        f.flush()?;
-        Ok((i_offset, v_buf.len() as u64))
-    }
-
-    pub fn read_vector_f32(&self, i_offset: u64, i_dim: usize) -> std::io::Result<Vec<f32>> {
-        let _g = self
-            .o_lock
-            .lock()
-            .expect("vector_matrix_store_lock_failed");
-        let mut f = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .open(&self.p_file)?;
-        let mut v_buf = vec![0u8; i_dim.saturating_mul(4)];
-        f.seek(SeekFrom::Start(i_offset))?;
-        f.read_exact(&mut v_buf)?;
-        let mut v_out: Vec<f32> = Vec::with_capacity(i_dim);
-        for i_idx in 0..i_dim {
-            let i_pos = i_idx * 4;
-            let a = [
-                v_buf[i_pos],
-                v_buf[i_pos + 1],
-                v_buf[i_pos + 2],
-                v_buf[i_pos + 3],
-            ];
-            v_out.push(f32::from_le_bytes(a));
-        }
-        Ok(v_out)
-    }
-
-    pub fn append_matrix_i8_quantized(
+    pub fn append_posting_list(
         &self,
-        v_matrix: &[Vec<f32>],
-        i_dim: usize,
+        v_postings: &[GramPostingRecord],
     ) -> std::io::Result<(u64, u64)> {
         let _g = self
             .o_lock
             .lock()
-            .expect("vector_matrix_store_lock_failed");
+            .expect("posting_list_store_lock_failed");
+
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(&self.p_file)?;
+
         let i_offset = f.seek(SeekFrom::End(0))?;
-        let mut v_buf: Vec<u8> = Vec::new();
-        for v_row in v_matrix.iter() {
-            for i_idx in 0..i_dim {
-                let d_val = *v_row.get(i_idx).unwrap_or(&0.0);
-                let d_clamped = d_val.clamp(-1.0, 1.0);
-                let i_q = (d_clamped * 127.0).round() as i8;
-                v_buf.push(i_q as u8);
-            }
+        let mut v_buf: Vec<u8> = Vec::with_capacity(4 + v_postings.len() * 12);
+        let i_count = v_postings.len() as u32;
+        v_buf.extend_from_slice(&i_count.to_le_bytes());
+
+        for o_posting in v_postings.iter() {
+            v_buf.extend_from_slice(&o_posting.i_chunk_id.to_le_bytes());
+            v_buf.extend_from_slice(&o_posting.i_tf.to_le_bytes());
         }
+
         f.write_all(&v_buf)?;
         f.flush()?;
         Ok((i_offset, v_buf.len() as u64))
     }
 
-    pub fn read_matrix_i8_quantized(
+    pub fn read_posting_list_range(
         &self,
         i_offset: u64,
-        i_rows: usize,
-        i_dim: usize,
-    ) -> std::io::Result<Vec<Vec<f32>>> {
+        i_byte_len: u64,
+        i_limit: usize,
+    ) -> std::io::Result<Vec<GramPostingRecord>> {
         let _g = self
             .o_lock
             .lock()
-            .expect("vector_matrix_store_lock_failed");
-        let mut f = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .open(&self.p_file)?;
-        let i_byte_len = i_rows.saturating_mul(i_dim);
-        let mut v_buf = vec![0u8; i_byte_len];
+            .expect("posting_list_store_lock_failed");
+
+        let mut f = OpenOptions::new().read(true).open(&self.p_file)?;
+        let i_file_len = f.metadata()?.len();
+
+        if i_offset > i_file_len {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "posting_offset_out_of_range",
+            ));
+        }
+
+        if i_byte_len > i_file_len.saturating_sub(i_offset) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "posting_byte_len_out_of_range",
+            ));
+        }
+
+        let i_len = i_byte_len as usize;
+        if i_len < 4 {
+            return Ok(Vec::new());
+        }
+
+        let mut v_buf = vec![0u8; i_len];
         f.seek(SeekFrom::Start(i_offset))?;
         f.read_exact(&mut v_buf)?;
-        let mut v_out: Vec<Vec<f32>> = Vec::with_capacity(i_rows);
-        let mut i_pos = 0usize;
-        for _ in 0..i_rows {
-            let mut v_row: Vec<f32> = Vec::with_capacity(i_dim);
-            for _ in 0..i_dim {
-                if i_pos >= v_buf.len() {
-                    v_row.push(0.0);
-                } else {
-                    let i_q = v_buf[i_pos] as i8;
-                    v_row.push((i_q as f32) / 127.0);
-                }
-                i_pos += 1;
-            }
-            v_out.push(v_row);
+
+        let mut a_count = [0u8; 4];
+        a_count.copy_from_slice(&v_buf[0..4]);
+        let i_count = u32::from_le_bytes(a_count) as usize;
+
+        let i_expected_len = 4usize.saturating_add(i_count.saturating_mul(12));
+        if i_expected_len != v_buf.len() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "posting_length_mismatch",
+            ));
         }
+
+        let mut v_out: Vec<GramPostingRecord> = Vec::new();
+        let mut i_pos = 4usize;
+
+        for _ in 0..i_count {
+            if i_pos + 12 > v_buf.len() {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "posting_record_truncated",
+                ));
+            }
+
+            let mut a_chunk = [0u8; 8];
+            a_chunk.copy_from_slice(&v_buf[i_pos..i_pos + 8]);
+            i_pos += 8;
+
+            let mut a_tf = [0u8; 4];
+            a_tf.copy_from_slice(&v_buf[i_pos..i_pos + 4]);
+            i_pos += 4;
+
+            v_out.push(GramPostingRecord {
+                i_chunk_id: u64::from_le_bytes(a_chunk),
+                i_tf: u32::from_le_bytes(a_tf),
+            });
+
+            if v_out.len() >= i_limit {
+                break;
+            }
+        }
+
         Ok(v_out)
+    }
+
+    pub fn reset_file(&self) -> Result<(), String> {
+        let _g = self
+            .o_lock
+            .lock()
+            .expect("posting_list_store_lock_failed");
+
+        if self.p_file.exists() {
+            fs::remove_file(&self.p_file)
+                .map_err(|_| "posting_store_reset_failed".to_string())?;
+        }
+
+        Ok(())
+    }
+}
+
+/**********************************************************************************************
+ * Modulname : vector_idx
+ * Datei     : vector_idx.rs
+ * Autor     : Marcus Schlieper
+ *---------------------------------------------------------------------------------------------
+ * Beschreibung
+ * - Persistenter Store fuer Embeddings.
+ *
+ * Historie
+ * 17.05.2026   MS   - Store erstellt
+ **********************************************************************************************/
+
+pub struct EmbeddingStore {
+    t_embedding_by_chunk: Tree,
+    db: Db,
+}
+
+impl EmbeddingStore {
+    pub fn new(db: &Db) -> Self {
+        return Self {
+            t_embedding_by_chunk: db
+                .open_tree("embedding_by_chunk")
+                .expect("embedding_by_chunk_open_failed"),
+            db: db.clone(),
+        };
+    }
+
+    pub fn save_chunk_embedding(&self, o_record: &EmbeddingRecord) -> Result<(), String> {
+        if o_record.i_embedding_dim == 0 {
+            return Err("embedding_dim_invalid".to_string());
+        }
+
+        if o_record.v_embedding.len() != o_record.i_embedding_dim as usize {
+            return Err("embedding_dim_mismatch".to_string());
+        }
+
+        let v_buf = bincode::serialize(o_record)
+            .map_err(|_| "embedding_serialize_failed".to_string())?;
+
+        self.t_embedding_by_chunk
+            .insert(o_record.i_chunk_id.to_le_bytes(), v_buf)
+            .map_err(|_| "embedding_insert_failed".to_string())?;
+
+        self.db
+            .flush()
+            .map_err(|_| "embedding_flush_failed".to_string())?;
+
+        Ok(())
+    }
+
+    pub fn get_chunk_embedding(&self, i_chunk_id: ChunkId) -> Option<EmbeddingRecord> {
+        return self
+            .t_embedding_by_chunk
+            .get(i_chunk_id.to_le_bytes())
+            .ok()
+            .flatten()
+            .and_then(|v| bincode::deserialize::<EmbeddingRecord>(v.as_ref()).ok());
+    }
+
+    pub fn delete_chunk_embedding(&self, i_chunk_id: ChunkId) -> Result<(), String> {
+        let _ = self
+            .t_embedding_by_chunk
+            .remove(i_chunk_id.to_le_bytes())
+            .map_err(|_| "embedding_delete_failed".to_string())?;
+
+        self.db
+            .flush()
+            .map_err(|_| "embedding_flush_failed".to_string())?;
+
+        Ok(())
     }
 }
 
@@ -406,11 +552,8 @@ pub struct DocStore {
     t_chunks_by_doc: Tree,
     t_source_state: Tree,
     t_counters: Tree,
-    t_token_record_by_chunk: Tree,
-    t_muvera_record_by_chunk: Tree,
-    t_dirty_reproject: Tree,
-    t_bucket_by_prefix: Tree,
-    t_postings_by_token: Tree,
+    t_gram_posting_meta: Tree,
+    t_chunk_terms: Tree,
 }
 
 impl DocStore {
@@ -418,8 +561,10 @@ impl DocStore {
         let mut p_db = p_root.to_path_buf();
         p_db.push(S_DOC_STORE_DB_DIR);
         let _ = fs::create_dir_all(&p_db);
+
         let db = sled::open(&p_db).expect("doc_store_db_open_failed");
-        Self {
+
+        return Self {
             t_doc_by_id: db
                 .open_tree("doc_by_id")
                 .expect("doc_by_id_open_failed"),
@@ -436,23 +581,18 @@ impl DocStore {
                 .open_tree("source_state")
                 .expect("source_state_open_failed"),
             t_counters: db.open_tree("counters").expect("counters_open_failed"),
-            t_token_record_by_chunk: db
-                .open_tree("token_record_by_chunk")
-                .expect("token_record_by_chunk_open_failed"),
-            t_muvera_record_by_chunk: db
-                .open_tree("muvera_record_by_chunk")
-                .expect("muvera_record_by_chunk_open_failed"),
-            t_dirty_reproject: db
-                .open_tree("dirty_reproject")
-                .expect("dirty_reproject_open_failed"),
-            t_bucket_by_prefix: db
-                .open_tree("bucket_by_prefix")
-                .expect("bucket_by_prefix_open_failed"),
-            t_postings_by_token: db
-                .open_tree("postings_by_token")
-                .expect("postings_by_token_open_failed"),
+            t_gram_posting_meta: db
+                .open_tree("gram_posting_meta")
+                .expect("gram_posting_meta_open_failed"),
+            t_chunk_terms: db
+                .open_tree("chunk_terms")
+                .expect("chunk_terms_open_failed"),
             db,
-        }
+        };
+    }
+
+    pub fn db(&self) -> &Db {
+        return &self.db;
     }
 
     fn next_id(&self, s_name: &str) -> u64 {
@@ -468,14 +608,16 @@ impl DocStore {
         } else {
             0
         };
+
         let i_new = i_old.saturating_add(1);
         let _ = self.t_counters.insert(s_name, &i_new.to_le_bytes());
         let _ = self.db.flush();
         i_new
     }
 
-    pub fn get_doc_id_by_path(&self, s_doc_path: &str) -> Option<u64> {
-        self.t_doc_id_by_path
+    pub fn get_doc_id_by_path(&self, s_doc_path: &str) -> Option<DocId> {
+        return self
+            .t_doc_id_by_path
             .get(s_doc_path.as_bytes())
             .ok()
             .flatten()
@@ -487,15 +629,16 @@ impl DocStore {
                 } else {
                     None
                 }
-            })
+            });
     }
 
     pub fn get_document_meta(&self, i_doc_id: DocId) -> Option<DocumentMeta> {
-        self.t_doc_by_id
+        return self
+            .t_doc_by_id
             .get(i_doc_id.to_le_bytes())
             .ok()
             .flatten()
-            .and_then(|v| bincode::deserialize::<DocumentMeta>(v.as_ref()).ok())
+            .and_then(|v| bincode::deserialize::<DocumentMeta>(v.as_ref()).ok());
     }
 
     pub fn save_document_meta(&self, o_meta: &DocumentMeta) {
@@ -510,6 +653,7 @@ impl DocStore {
 
     pub fn upsert_document_meta(&self, s_doc_path: &str, payload: PayloadMap) -> DocumentMeta {
         let i_now = now_ts();
+
         if let Some(i_doc_id) = self.get_doc_id_by_path(s_doc_path) {
             let mut o_meta = self.get_document_meta(i_doc_id).unwrap_or(DocumentMeta {
                 i_doc_id,
@@ -519,6 +663,7 @@ impl DocStore {
                 payload: PayloadMap::new(),
                 b_deleted: false,
             });
+
             o_meta.s_doc_path = s_doc_path.to_string();
             o_meta.i_updated_ts = i_now;
             o_meta.payload = payload;
@@ -557,6 +702,7 @@ impl DocStore {
         i_model_version: u32,
     ) -> ChunkMeta {
         let i_chunk_id = self.next_id("chunk_id");
+
         let o_chunk = ChunkMeta {
             i_chunk_id,
             i_doc_id,
@@ -566,23 +712,27 @@ impl DocStore {
             i_model_version,
             b_deleted: false,
         };
+
         if let Ok(v_buf) = bincode::serialize(&o_chunk) {
             let _ = self.t_chunk_by_id.insert(i_chunk_id.to_le_bytes(), v_buf);
         }
+
         let mut a_rel = [0u8; 12];
         a_rel[0..8].copy_from_slice(&i_doc_id.to_be_bytes());
         a_rel[8..12].copy_from_slice(&i_chunk_ordinal.to_be_bytes());
         let _ = self.t_chunks_by_doc.insert(a_rel, &i_chunk_id.to_le_bytes());
         let _ = self.db.flush();
+
         o_chunk
     }
 
     pub fn get_chunk(&self, i_chunk_id: ChunkId) -> Option<ChunkMeta> {
-        self.t_chunk_by_id
+        return self
+            .t_chunk_by_id
             .get(i_chunk_id.to_le_bytes())
             .ok()
             .flatten()
-            .and_then(|v| bincode::deserialize::<ChunkMeta>(v.as_ref()).ok())
+            .and_then(|v| bincode::deserialize::<ChunkMeta>(v.as_ref()).ok());
     }
 
     pub fn save_chunk(&self, o_chunk: &ChunkMeta) {
@@ -599,19 +749,22 @@ impl DocStore {
         }
     }
 
-    pub fn list_chunk_ids_by_doc(&self, i_doc_id: DocId) -> Vec<u64> {
+    pub fn list_chunk_ids_by_doc(&self, i_doc_id: DocId) -> Vec<ChunkId> {
         let a_prefix = i_doc_id.to_be_bytes();
-        let mut v_out: Vec<u64> = Vec::new();
+        let mut v_out: Vec<ChunkId> = Vec::new();
+
         for item in self.t_chunks_by_doc.scan_prefix(a_prefix) {
             let Ok((_, v)) = item else {
                 continue;
             };
+
             if v.len() == 8 {
                 let mut a = [0u8; 8];
                 a.copy_from_slice(v.as_ref());
                 v_out.push(u64::from_le_bytes(a));
             }
         }
+
         v_out.sort_unstable();
         v_out
     }
@@ -630,216 +783,89 @@ impl DocStore {
     }
 
     pub fn get_source_state(&self, s_doc_path: &str) -> Option<SourceState> {
-        self.t_source_state
+        return self
+            .t_source_state
             .get(s_doc_path.as_bytes())
             .ok()
             .flatten()
-            .and_then(|v| bincode::deserialize::<SourceState>(v.as_ref()).ok())
+            .and_then(|v| bincode::deserialize::<SourceState>(v.as_ref()).ok());
     }
 
-    pub fn save_token_record(&self, o_rec: &TokenVectorRecord) {
-        if let Ok(v_buf) = bincode::serialize(o_rec) {
-            let _ = self
-                .t_token_record_by_chunk
-                .insert(o_rec.i_chunk_id.to_le_bytes(), v_buf);
+    pub fn save_gram_posting_meta(&self, s_gram: &str, o_meta: &GramPostingFileEntry) {
+        if let Ok(v_buf) = bincode::serialize(o_meta) {
+            let _ = self.t_gram_posting_meta.insert(s_gram.as_bytes(), v_buf);
             let _ = self.db.flush();
         }
     }
 
-    pub fn get_token_record(&self, i_chunk_id: ChunkId) -> Option<TokenVectorRecord> {
-        self.t_token_record_by_chunk
-            .get(i_chunk_id.to_le_bytes())
+    pub fn get_gram_posting_meta(&self, s_gram: &str) -> Option<GramPostingFileEntry> {
+        return self
+            .t_gram_posting_meta
+            .get(s_gram.as_bytes())
             .ok()
             .flatten()
-            .and_then(|v| bincode::deserialize::<TokenVectorRecord>(v.as_ref()).ok())
+            .and_then(|v| bincode::deserialize::<GramPostingFileEntry>(v.as_ref()).ok());
     }
 
-    pub fn save_muvera_record(&self, o_rec: &MuveraVectorRecord) {
-        if let Ok(v_buf) = bincode::serialize(o_rec) {
-            let _ = self
-                .t_muvera_record_by_chunk
-                .insert(o_rec.i_chunk_id.to_le_bytes(), v_buf);
+    pub fn clear_gram_posting_meta(&self) -> Result<(), String> {
+        self.t_gram_posting_meta
+            .clear()
+            .map_err(|_| "gram_posting_meta_clear_failed".to_string())?;
+        let _ = self.db.flush();
+        Ok(())
+    }
+
+    pub fn save_chunk_terms(&self, i_chunk_id: ChunkId, v_terms: &[String]) {
+        if let Ok(v_buf) = bincode::serialize(v_terms) {
+            let _ = self.t_chunk_terms.insert(i_chunk_id.to_le_bytes(), v_buf);
             let _ = self.db.flush();
         }
     }
 
-    pub fn get_muvera_record(&self, i_chunk_id: ChunkId) -> Option<MuveraVectorRecord> {
-        self.t_muvera_record_by_chunk
+    pub fn get_chunk_terms(&self, i_chunk_id: ChunkId) -> Vec<String> {
+        return self
+            .t_chunk_terms
             .get(i_chunk_id.to_le_bytes())
             .ok()
             .flatten()
-            .and_then(|v| bincode::deserialize::<MuveraVectorRecord>(v.as_ref()).ok())
+            .and_then(|v| bincode::deserialize::<Vec<String>>(v.as_ref()).ok())
+            .unwrap_or_default();
     }
 
-    pub fn mark_chunk_dirty_for_reproject(&self, i_chunk_id: ChunkId) {
-        let _ = self.t_dirty_reproject.insert(i_chunk_id.to_le_bytes(), &[1u8]);
-        let _ = self.db.flush();
-    }
+    pub fn iter_all_chunk_ids(&self) -> Vec<ChunkId> {
+        let mut v_out: Vec<ChunkId> = Vec::new();
 
-    pub fn clear_chunk_dirty_for_reproject(&self, i_chunk_id: ChunkId) {
-        let _ = self.t_dirty_reproject.remove(i_chunk_id.to_le_bytes());
-        let _ = self.db.flush();
-    }
-
-    pub fn list_dirty_reproject_chunks(&self, i_limit: usize) -> Vec<u64> {
-        let mut v_out: Vec<u64> = Vec::new();
-        for item in self.t_dirty_reproject.iter() {
-            let Ok((k, _)) = item else {
-                continue;
-            };
-            if k.len() == 8 {
-                let mut a = [0u8; 8];
-                a.copy_from_slice(k.as_ref());
-                v_out.push(u64::from_le_bytes(a));
-            }
-            if v_out.len() >= i_limit {
-                break;
-            }
-        }
-        v_out
-    }
-
-    fn bucket_key_prefix_to_bytes(i_bucket_key: u32, i_chunk_id: ChunkId) -> [u8; 12] {
-        let mut a = [0u8; 12];
-        a[0..4].copy_from_slice(&i_bucket_key.to_be_bytes());
-        a[4..12].copy_from_slice(&i_chunk_id.to_be_bytes());
-        a
-    }
-
-    pub fn bucket_remove_chunk(&self, i_bucket_key: u32, i_chunk_id: ChunkId) {
-        let a_key = Self::bucket_key_prefix_to_bytes(i_bucket_key, i_chunk_id);
-        let _ = self.t_bucket_by_prefix.remove(a_key);
-        let _ = self.db.flush();
-    }
-
-    pub fn bucket_insert_chunk(&self, i_bucket_key: u32, i_chunk_id: ChunkId) {
-        let a_key = Self::bucket_key_prefix_to_bytes(i_bucket_key, i_chunk_id);
-        let _ = self.t_bucket_by_prefix.insert(a_key, &[1u8]);
-        let _ = self.db.flush();
-    }
-
-    pub fn bucket_list_chunks(&self, i_bucket_key: u32, i_limit: usize) -> Vec<u64> {
-        let mut v_out: Vec<u64> = Vec::new();
-        let a_prefix = i_bucket_key.to_be_bytes();
-        for item in self.t_bucket_by_prefix.scan_prefix(a_prefix) {
-            let Ok((k, _)) = item else {
-                continue;
-            };
-            if k.len() == 12 {
-                let mut a = [0u8; 8];
-                a.copy_from_slice(&k[4..12]);
-                v_out.push(u64::from_be_bytes(a));
-            }
-            if v_out.len() >= i_limit {
-                break;
-            }
-        }
-        v_out
-    }
-
-    fn posting_key_prefix_for_token(s_token: &str) -> Vec<u8> {
-        let a_token = s_token.as_bytes();
-        let i_len = a_token.len().min(u16::MAX as usize) as u16;
-        let mut v_key = Vec::with_capacity(2 + a_token.len());
-        v_key.extend_from_slice(&i_len.to_be_bytes());
-        v_key.extend_from_slice(a_token);
-        v_key
-    }
-
-    fn posting_key_for_token_chunk(s_token: &str, i_chunk_id: ChunkId) -> Vec<u8> {
-        let mut v_key = Self::posting_key_prefix_for_token(s_token);
-        v_key.extend_from_slice(&i_chunk_id.to_be_bytes());
-        v_key
-    }
-
-    pub fn token_postings_insert(&self, s_token: &str, i_chunk_id: ChunkId) {
-        if s_token.is_empty() {
-            return;
-        }
-        let v_key = Self::posting_key_for_token_chunk(s_token, i_chunk_id);
-        let _ = self.t_postings_by_token.insert(v_key, &[1u8]);
-    }
-
-    pub fn token_postings_remove(&self, s_token: &str, i_chunk_id: ChunkId) {
-        if s_token.is_empty() {
-            return;
-        }
-        let v_key = Self::posting_key_for_token_chunk(s_token, i_chunk_id);
-        let _ = self.t_postings_by_token.remove(v_key);
-    }
-
-    pub fn token_postings_list_chunks(&self, s_token: &str, i_limit: usize) -> Vec<u64> {
-        if s_token.is_empty() || i_limit == 0 {
-            return Vec::new();
-        }
-        let v_prefix = Self::posting_key_prefix_for_token(s_token);
-        let mut v_out: Vec<u64> = Vec::new();
-        for item in self.t_postings_by_token.scan_prefix(v_prefix) {
-            let Ok((k, _)) = item else {
-                continue;
-            };
-            if k.len() < 10 {
-                continue;
-            }
-            let i_pos = k.len().saturating_sub(8);
-            let mut a = [0u8; 8];
-            a.copy_from_slice(&k[i_pos..]);
-            v_out.push(u64::from_be_bytes(a));
-            if v_out.len() >= i_limit {
-                break;
-            }
-        }
-        v_out
-    }
-
-    pub fn token_postings_remove_chunk_tokens(&self, i_chunk_id: ChunkId, v_tokens: &[String]) {
-        let mut h_seen: HashSet<&str> = HashSet::new();
-        for s_token in v_tokens.iter() {
-            if h_seen.insert(s_token.as_str()) {
-                self.token_postings_remove(s_token, i_chunk_id);
-            }
-        }
-        let _ = self.db.flush();
-    }
-
-    pub fn token_postings_insert_chunk_tokens(&self, i_chunk_id: ChunkId, v_tokens: &[String]) {
-        let mut h_seen: HashSet<&str> = HashSet::new();
-        for s_token in v_tokens.iter() {
-            if h_seen.insert(s_token.as_str()) {
-                self.token_postings_insert(s_token, i_chunk_id);
-            }
-        }
-        let _ = self.db.flush();
-    }
-
-    pub fn iter_all_chunk_ids(&self) -> Vec<u64> {
-        let mut v_out: Vec<u64> = Vec::new();
         for item in self.t_chunk_by_id.iter() {
             let Ok((k, _)) = item else {
                 continue;
             };
+
             if k.len() == 8 {
                 let mut a = [0u8; 8];
                 a.copy_from_slice(k.as_ref());
                 v_out.push(u64::from_le_bytes(a));
             }
         }
+
         v_out.sort_unstable();
         v_out
     }
 
-    pub fn iter_all_doc_ids(&self) -> Vec<u64> {
-        let mut v_out: Vec<u64> = Vec::new();
+    pub fn iter_all_doc_ids(&self) -> Vec<DocId> {
+        let mut v_out: Vec<DocId> = Vec::new();
+
         for item in self.t_doc_by_id.iter() {
             let Ok((k, _)) = item else {
                 continue;
             };
+
             if k.len() == 8 {
                 let mut a = [0u8; 8];
                 a.copy_from_slice(k.as_ref());
                 v_out.push(u64::from_le_bytes(a));
             }
         }
+
         v_out.sort_unstable();
         v_out
     }
@@ -850,11 +876,10 @@ impl DocStore {
 }
 
 pub struct VectorIndex {
-    backend: Arc<dyn EmbeddingBackend + Send + Sync>,
     doc_store: Arc<DocStore>,
-    token_store: Arc<VectorMatrixStore>,
-    muvera_store: Arc<VectorMatrixStore>,
-    model: Mutex<MuveraModel>,
+    posting_store: Arc<PostingListStore>,
+    embedding_store: Arc<EmbeddingStore>,
+    embedding_backend: Arc<dyn EmbeddingBackend>,
     chunk_cfg: ChunkingConfig,
     o_bg: BackgroundIndexer,
     o_worker_join: Mutex<Option<thread::JoinHandle<()>>>,
@@ -862,28 +887,23 @@ pub struct VectorIndex {
 
 impl VectorIndex {
     pub fn new(p_root: &Path) -> Arc<Self> {
-        let backend = create_backend_from_env();
-        let i_token_dim = backend.dim().max(I_VEC_DIM_DEFAULT);
         let doc_store = Arc::new(DocStore::new(p_root));
 
-        let mut p_token = p_root.to_path_buf();
-        p_token.push(S_TOKEN_STORE_FILE);
+        let mut p_postings = p_root.to_path_buf();
+        p_postings.push(S_GRAM_POSTING_STORE_FILE);
 
-        let mut p_muvera = p_root.to_path_buf();
-        p_muvera.push(S_MUVERA_STORE_FILE);
-
-        let token_store = Arc::new(VectorMatrixStore::new(p_token));
-        let muvera_store = Arc::new(VectorMatrixStore::new(p_muvera));
-        let model = load_or_create_model_active(p_root, i_token_dim);
+        let posting_store = Arc::new(PostingListStore::new(p_postings));
+        let embedding_store = Arc::new(EmbeddingStore::new(doc_store.db()));
+        let embedding_backend: Arc<dyn EmbeddingBackend> =
+            Arc::new(SimpleHashEmbeddingBackend::new(I_EMBEDDING_DIM_DEFAULT, 1));
 
         let (o_bg, rx) = BackgroundIndexer::new();
 
         let o_self = Arc::new(Self {
-            backend,
             doc_store,
-            token_store,
-            muvera_store,
-            model: Mutex::new(model),
+            posting_store,
+            embedding_store,
+            embedding_backend,
             chunk_cfg: ChunkingConfig::default(),
             o_bg,
             o_worker_join: Mutex::new(None),
@@ -909,7 +929,7 @@ impl VectorIndex {
                     let _ = self.upsert_path_now(&p_path, payload);
                 }
                 IndexJob::DeletePath { s_doc_path } => {
-                    self.delete_document_now(&s_doc_path);
+                    let _ = self.delete_document_now(&s_doc_path);
                 }
                 IndexJob::RebuildAll { p_root } => {
                     self.rebuild_now(&p_root);
@@ -922,8 +942,92 @@ impl VectorIndex {
     }
 
     pub fn encode_query(&self, s_text: &str) -> Vec<f32> {
-        let v_token_vectors = self.encode_text_to_token_vectors(s_text);
-        self.project_query_token_vectors_to_muvera(s_text, &v_token_vectors)
+        let v_grams = build_five_grams(s_text);
+        let mut h_freq: HashMap<String, usize> = HashMap::new();
+
+        for s_gram in v_grams.into_iter() {
+            *h_freq.entry(s_gram).or_insert(0) += 1;
+        }
+
+        let mut v_pairs: Vec<(String, usize)> = h_freq.into_iter().collect();
+        v_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut v_out: Vec<f32> = Vec::with_capacity(v_pairs.len() * 2);
+        for (_, i_tf) in v_pairs.into_iter() {
+            v_out.push(i_tf as f32);
+            v_out.push(1.0);
+        }
+
+        if v_out.is_empty() {
+            v_out.push(0.0);
+        }
+
+        v_out
+    }
+
+    /**********************************************************************************************
+     * Beschreibung
+     * - Kodiert Text in ein Embedding ueber das konfigurierte Backend.
+     *
+     * Historie
+     * 17.05.2026   MS   - Funktion erstellt
+     **********************************************************************************************/
+    pub fn encode_text_embedding(&self, s_text: &str) -> Result<Vec<f32>, String> {
+        let s_trim = s_text.trim();
+        if s_trim.is_empty() {
+            return Err("embedding_input_empty".to_string());
+        }
+
+        let s_limited: String = s_trim.chars().take(I_EMBEDDING_TEXT_LIMIT).collect();
+        let v_embedding = self.embedding_backend.encode(&s_limited)?;
+
+        if v_embedding.len() != self.embedding_backend.embedding_dim() {
+            return Err("embedding_backend_dim_mismatch".to_string());
+        }
+
+        Ok(v_embedding)
+    }
+
+    /**********************************************************************************************
+     * Beschreibung
+     * - Speichert ein Chunk Embedding persistent.
+     *
+     * Historie
+     * 17.05.2026   MS   - Funktion erstellt
+     **********************************************************************************************/
+    pub fn save_chunk_embedding(
+        &self,
+        i_chunk_id: ChunkId,
+        v_embedding: Vec<f32>,
+    ) -> Result<(), String> {
+        if v_embedding.is_empty() {
+            return Err("embedding_empty".to_string());
+        }
+
+        let i_now = now_ts();
+        let o_old = self.embedding_store.get_chunk_embedding(i_chunk_id);
+
+        let o_record = EmbeddingRecord {
+            i_chunk_id,
+            i_embedding_dim: v_embedding.len() as u32,
+            i_model_version: self.embedding_backend.model_version(),
+            i_created_ts: o_old.as_ref().map(|o| o.i_created_ts).unwrap_or(i_now),
+            i_updated_ts: i_now,
+            v_embedding,
+        };
+
+        self.embedding_store.save_chunk_embedding(&o_record)
+    }
+
+    /**********************************************************************************************
+     * Beschreibung
+     * - Laedt ein Chunk Embedding aus der Persistenz.
+     *
+     * Historie
+     * 17.05.2026   MS   - Funktion erstellt
+     **********************************************************************************************/
+    pub fn get_chunk_embedding(&self, i_chunk_id: ChunkId) -> Option<EmbeddingRecord> {
+        self.embedding_store.get_chunk_embedding(i_chunk_id)
     }
 
     pub fn ingest_batch_paths(&self, v_paths: Vec<(PathBuf, PayloadMap)>) {
@@ -945,7 +1049,13 @@ impl VectorIndex {
     }
 
     pub fn reproject_dirty_async(&self, i_limit: usize) {
-        let v_chunk_ids = self.doc_store.list_dirty_reproject_chunks(i_limit);
+        let v_chunk_ids = self
+            .doc_store
+            .iter_all_chunk_ids()
+            .into_iter()
+            .take(i_limit)
+            .collect::<Vec<ChunkId>>();
+
         if !v_chunk_ids.is_empty() {
             let _ = self.o_bg.tx.send(IndexJob::ReprojectDirty { v_chunk_ids });
         }
@@ -954,15 +1064,26 @@ impl VectorIndex {
     pub fn sync(self: &Arc<Self>, root: &Path) {
         let mut v_jobs: Vec<(PathBuf, PayloadMap)> = Vec::new();
         Self::crawl_collect(root, &mut v_jobs);
+
         for (p_path, payload) in v_jobs.into_iter() {
             let _ = self.o_bg.tx.send(IndexJob::UpsertPath { p_path, payload });
         }
+
         let h_seen: HashSet<String> = self.collect_paths_from_fs(root).into_iter().collect();
         self.soft_delete_missing_docs(&h_seen);
     }
 
+    /**********************************************************************************************
+     * Beschreibung
+     * - Upsert eines Dokuments mit Chunking, 5 gram Term Speicherung und Embedding Speicherung.
+     *
+     * Historie
+     * 16.05.2026   MS   - Erste Upsert Version
+     * 17.05.2026   MS   - Embedding Integration ergaenzt
+     **********************************************************************************************/
     pub fn upsert_path_now(&self, p_path: &Path, payload: PayloadMap) -> Result<(), String> {
         let s_doc_path = canonicalize_best_effort(p_path);
+
         let md = fs::metadata(p_path).map_err(|_| "metadata_failed".to_string())?;
         let i_modified_ts = md
             .modified()
@@ -977,6 +1098,7 @@ impl VectorIndex {
         }
 
         let a_sha256 = DocStore::compute_source_hash(&s_text);
+
         if let Some(o_old) = self.doc_store.get_source_state(&s_doc_path) {
             if o_old.i_last_modified_ts == i_modified_ts && o_old.a_sha256 == a_sha256 {
                 return Ok(());
@@ -984,59 +1106,29 @@ impl VectorIndex {
         }
 
         let o_doc = self.doc_store.upsert_document_meta(&s_doc_path, payload.clone());
-
-        for i_old_chunk_id in self.doc_store.list_chunk_ids_by_doc(o_doc.i_doc_id).iter() {
-            if let Some(o_old_chunk) = self.doc_store.get_chunk(*i_old_chunk_id) {
-                let v_old_tokens = tokenize_for_postings(&o_old_chunk.s_text);
-                self.doc_store
-                    .token_postings_remove_chunk_tokens(*i_old_chunk_id, &v_old_tokens);
-                if let Some(o_old_muv) = self.doc_store.get_muvera_record(*i_old_chunk_id) {
-                    self.doc_store
-                        .bucket_remove_chunk(o_old_muv.i_bucket_key, *i_old_chunk_id);
-                }
-            }
-        }
-
         self.doc_store.replace_document_chunks_soft_delete(o_doc.i_doc_id);
 
-        let v_chunks = chunk_text(&s_text, &self.chunk_cfg);
-        let i_model_version = self
-            .model
-            .lock()
-            .expect("muvera_model_lock_failed")
-            .cfg
-            .i_model_version;
+        let v_old_chunk_ids = self.doc_store.list_chunk_ids_by_doc(o_doc.i_doc_id);
+        for i_old_chunk_id in v_old_chunk_ids.into_iter() {
+            let _ = self.embedding_store.delete_chunk_embedding(i_old_chunk_id);
+        }
 
+        let v_chunks = chunk_text(&s_text, &self.chunk_cfg);
         for (i_idx, s_chunk) in v_chunks.into_iter().enumerate() {
             let o_chunk = self.doc_store.create_chunk(
                 o_doc.i_doc_id,
                 i_idx as u32,
                 s_chunk.clone(),
                 payload.clone(),
-                i_model_version,
+                self.embedding_backend.model_version(),
             );
 
-            let v_posting_tokens = tokenize_for_postings(&s_chunk);
-            self.doc_store
-                .token_postings_insert_chunk_tokens(o_chunk.i_chunk_id, &v_posting_tokens);
+            let v_terms = build_five_grams(&s_chunk);
+            self.doc_store.save_chunk_terms(o_chunk.i_chunk_id, &v_terms);
 
-            let v_token_vectors = self.encode_text_to_token_vectors(&s_chunk);
-            let (i_token_offset, i_token_len) = self
-                .token_store
-                .append_matrix_i8_quantized(&v_token_vectors, self.token_dim())
-                .map_err(|_| "token_store_write_failed".to_string())?;
-
-            let o_token_rec = TokenVectorRecord {
-                i_chunk_id: o_chunk.i_chunk_id,
-                i_token_count: v_token_vectors.len() as u32,
-                i_vector_dim: self.token_dim() as u32,
-                i_file_offset: i_token_offset,
-                i_byte_len: i_token_len,
-                b_quantized_i8: true,
-            };
-            self.doc_store.save_token_record(&o_token_rec);
-
-            self.write_chunk_projection(&o_chunk, &v_token_vectors)?;
+            if let Ok(v_embedding) = self.encode_text_embedding(&s_chunk) {
+                let _ = self.save_chunk_embedding(o_chunk.i_chunk_id, v_embedding);
+            }
         }
 
         self.doc_store.save_source_state(
@@ -1048,153 +1140,97 @@ impl VectorIndex {
             },
         );
 
+        self.rebuild_posting_store()?;
         Ok(())
     }
 
-    fn write_chunk_projection(
-        &self,
-        o_chunk: &ChunkMeta,
-        v_token_vectors: &[Vec<f32>],
-    ) -> Result<(), String> {
-        let v_muvera = self.project_token_vectors_to_muvera(v_token_vectors);
-        let a_simhash = self.simhash_for_vector(&v_muvera);
-        let i_bucket_key = self.bucket_key_from_simhash(&a_simhash);
-
-        if let Some(o_old) = self.doc_store.get_muvera_record(o_chunk.i_chunk_id) {
-            self.doc_store
-                .bucket_remove_chunk(o_old.i_bucket_key, o_chunk.i_chunk_id);
-        }
-
-        let (i_muvera_offset, i_muvera_len) = self
-            .muvera_store
-            .append_vector_f32(&v_muvera)
-            .map_err(|_| "muvera_store_write_failed".to_string())?;
-
-        let i_model_version = self
-            .model
-            .lock()
-            .expect("muvera_model_lock_failed")
-            .cfg
-            .i_model_version;
-
-        let o_muvera_rec = MuveraVectorRecord {
-            i_chunk_id: o_chunk.i_chunk_id,
-            i_dim: v_muvera.len() as u32,
-            i_model_version,
-            i_file_offset: i_muvera_offset,
-            i_byte_len: i_muvera_len,
-            a_simhash,
-            i_bucket_key,
-        };
-
-        self.doc_store.save_muvera_record(&o_muvera_rec);
-        self.doc_store
-            .bucket_insert_chunk(i_bucket_key, o_chunk.i_chunk_id);
-        self.doc_store
-            .clear_chunk_dirty_for_reproject(o_chunk.i_chunk_id);
-
-        Ok(())
-    }
-
-    pub fn delete_document_now(&self, s_doc_path: &str) {
+    pub fn delete_document_now(&self, s_doc_path: &str) -> Result<(), String> {
         if let Some(i_doc_id) = self.doc_store.get_doc_id_by_path(s_doc_path) {
             self.doc_store.mark_document_deleted(i_doc_id);
+
             for i_chunk_id in self.doc_store.list_chunk_ids_by_doc(i_doc_id).iter() {
-                if let Some(o_chunk) = self.doc_store.get_chunk(*i_chunk_id) {
-                    let v_tokens = tokenize_for_postings(&o_chunk.s_text);
-                    self.doc_store
-                        .token_postings_remove_chunk_tokens(*i_chunk_id, &v_tokens);
-                }
                 self.doc_store.update_chunk_deleted(*i_chunk_id, true);
-                if let Some(o_rec) = self.doc_store.get_muvera_record(*i_chunk_id) {
-                    self.doc_store
-                        .bucket_remove_chunk(o_rec.i_bucket_key, *i_chunk_id);
-                }
+                let _ = self.embedding_store.delete_chunk_embedding(*i_chunk_id);
             }
+
+            self.rebuild_posting_store()?;
         }
+
+        Ok(())
     }
 
+    /**********************************************************************************************
+     * Beschreibung
+     * - Query mit 5 gram Recall, BM25 Reranking, boolescher Filterung und optionaler Embedding Fusion.
+     *
+     * Historie
+     * 16.05.2026   MS   - Erste Query Version
+     * 17.05.2026   MS   - Embedding Rescore ergaenzt
+     * 17.05.2026   MS   - Boolesche Operatoren AND OR NOT wieder eingebaut
+     **********************************************************************************************/
     pub fn query_with_options(&self, s_query: &str, opts: QueryOptions) -> Vec<VecSearchHit> {
         if s_query.trim().is_empty() || opts.i_k == 0 {
             return Vec::new();
         }
 
-        let v_query_posting_tokens = tokenize_for_postings(s_query);
-        let v_query_token_vectors = self.encode_text_to_token_vectors(s_query);
-        let v_query_muvera =
-            self.project_query_token_vectors_to_muvera(s_query, &v_query_token_vectors);
-        let a_query_simhash = self.simhash_for_vector(&v_query_muvera);
-        let i_query_bucket_key = self.bucket_key_from_simhash(&a_query_simhash);
+        let o_bool_query = parse_bool_query(s_query);
+        let s_lexical_query = build_lexical_query_from_bool(&o_bool_query);
 
-        let cfg = self
-            .model
-            .lock()
-            .expect("muvera_model_lock_failed")
-            .cfg
-            .clone();
+        if s_lexical_query.trim().is_empty() {
+            return Vec::new();
+        }
 
-        let b_short_query = is_short_query_text(s_query);
+        let v_query_grams = build_five_grams(&s_lexical_query);
+        if v_query_grams.is_empty() {
+            return Vec::new();
+        }
 
+        let mut h_query_tf: HashMap<String, usize> = HashMap::new();
+        for s_gram in v_query_grams.iter() {
+            *h_query_tf.entry(s_gram.clone()).or_insert(0) += 1;
+        }
+
+        let v_all_chunk_ids = self.doc_store.iter_all_chunk_ids();
+        let i_chunk_count = v_all_chunk_ids.len().max(1);
+
+        let mut h_candidate_score: HashMap<ChunkId, f32> = HashMap::new();
         let mut h_candidate_ids: HashSet<ChunkId> = HashSet::new();
-        let mut h_subword_match_count: HashMap<ChunkId, usize> = HashMap::new();
-        let mut h_word_match_count: HashMap<ChunkId, usize> = HashMap::new();
 
-        for s_token in v_query_posting_tokens.iter() {
-            let b_is_subword = s_token.starts_with("g:");
-            let b_is_word = s_token.starts_with("w:");
+        for (s_gram, i_q_tf) in h_query_tf.iter() {
+            let Some(o_meta) = self.doc_store.get_gram_posting_meta(s_gram) else {
+                continue;
+            };
 
-            for i_chunk_id in self
-                .doc_store
-                .token_postings_list_chunks(s_token, I_TOKEN_POSTING_PER_TERM_LIMIT)
-                .into_iter()
-            {
-                h_candidate_ids.insert(i_chunk_id);
+            let v_postings = match self.posting_store.read_posting_list_range(
+                o_meta.i_offset,
+                o_meta.i_byte_len,
+                I_POSTING_PER_GRAM_LIMIT,
+            ) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
 
-                if b_is_subword {
-                    *h_subword_match_count.entry(i_chunk_id).or_insert(0) += 1;
+            let d_idf = compute_bm25_idf(o_meta.i_doc_freq as usize, i_chunk_count);
+
+            for o_posting in v_postings.into_iter() {
+                if h_candidate_ids.len() >= I_TARGET_CANDIDATES
+                    && !h_candidate_ids.contains(&o_posting.i_chunk_id)
+                {
+                    continue;
                 }
-                if b_is_word {
-                    *h_word_match_count.entry(i_chunk_id).or_insert(0) += 1;
-                }
 
-                if h_candidate_ids.len() >= I_TOKEN_POSTING_TARGET_CANDIDATES {
-                    break;
-                }
-            }
+                h_candidate_ids.insert(o_posting.i_chunk_id);
 
-            if h_candidate_ids.len() >= I_TOKEN_POSTING_TARGET_CANDIDATES {
-                break;
-            }
-        }
-
-        let v_bucket_keys = self.expand_bucket_keys_near(i_query_bucket_key);
-        for i_bucket_key in v_bucket_keys.iter() {
-            for i_chunk_id in self
-                .doc_store
-                .bucket_list_chunks(*i_bucket_key, cfg.i_query_preselect)
-                .into_iter()
-            {
-                h_candidate_ids.insert(i_chunk_id);
-                if h_candidate_ids.len() >= cfg.i_query_preselect.saturating_mul(3) {
-                    break;
-                }
-            }
-        }
-
-        if h_candidate_ids.is_empty() {
-            for i_chunk_id in self
-                .doc_store
-                .iter_all_chunk_ids()
-                .into_iter()
-                .take(cfg.i_query_preselect)
-            {
-                h_candidate_ids.insert(i_chunk_id);
+                let d_add = (*i_q_tf as f32) * (o_posting.i_tf as f32) * d_idf.max(0.0);
+                *h_candidate_score
+                    .entry(o_posting.i_chunk_id)
+                    .or_insert(0.0) += d_add;
             }
         }
 
         let mut v_preselected: Vec<(ChunkId, f32)> = Vec::new();
 
-        for i_chunk_id in h_candidate_ids.into_iter() {
+        for (i_chunk_id, d_posting_score_raw) in h_candidate_score.into_iter() {
             let Some(o_chunk) = self.doc_store.get_chunk(i_chunk_id) else {
                 continue;
             };
@@ -1215,60 +1251,52 @@ impl VectorIndex {
                 continue;
             }
 
-            let Some(o_muvera_rec) = self.doc_store.get_muvera_record(i_chunk_id) else {
+            if !matches_bool_query(&o_chunk.s_text, &o_bool_query) {
                 continue;
-            };
-
-            let v_chunk_muvera = match self
-                .muvera_store
-                .read_vector_f32(o_muvera_rec.i_file_offset, o_muvera_rec.i_dim as usize)
-            {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let d_cos = cosine(&v_query_muvera, &v_chunk_muvera);
-            let d_hash = simhash_similarity(&a_query_simhash, &o_muvera_rec.a_simhash);
-
-            let i_subword_hits = *h_subword_match_count.get(&i_chunk_id).unwrap_or(&0) as f32;
-            let i_word_hits = *h_word_match_count.get(&i_chunk_id).unwrap_or(&0) as f32;
-
-            let d_subword_bonus = if i_subword_hits > 0.0 {
-                i_subword_hits.min(12.0) / 12.0
-            } else {
-                0.0
-            };
-
-            let d_word_bonus = if i_word_hits > 0.0 {
-                i_word_hits.min(6.0) / 6.0
-            } else {
-                0.0
-            };
-
-            let d_candidate_bonus = if b_short_query {
-                D_SUBWORD_CANDIDATE_WEIGHT_SHORT_QUERY * d_subword_bonus
-                    + D_WORD_CANDIDATE_WEIGHT_SHORT_QUERY * d_word_bonus
-            } else {
-                D_SUBWORD_CANDIDATE_WEIGHT_NORMAL_QUERY * d_subword_bonus
-                    + D_WORD_CANDIDATE_WEIGHT_NORMAL_QUERY * d_word_bonus
-            };
-
-            let mut d_score = if b_short_query {
-                0.45 * d_cos + 0.10 * d_hash + d_candidate_bonus
-            } else {
-                0.60 * d_cos + 0.15 * d_hash + d_candidate_bonus
-            };
-
-            if opts.b_enable_token_level_rescore && v_preselected.len() < cfg.i_fine_score_top_k {
-                let d_fine = self.token_level_rescore(i_chunk_id, &v_query_token_vectors);
-                d_score = 0.60 * d_score + 0.40 * d_fine;
             }
 
-            v_preselected.push((i_chunk_id, d_score));
+            let d_posting_score = d_posting_score_raw / (1.0 + d_posting_score_raw);
+            let d_soft_score =
+                self.compute_soft_gram_score(&s_lexical_query, &o_chunk.s_text, d_posting_score);
+
+            v_preselected.push((i_chunk_id, d_soft_score));
+        }
+
+        if v_preselected.is_empty() {
+            for i_chunk_id in self.doc_store.iter_all_chunk_ids().into_iter() {
+                let Some(o_chunk) = self.doc_store.get_chunk(i_chunk_id) else {
+                    continue;
+                };
+                if o_chunk.b_deleted {
+                    continue;
+                }
+
+                let Some(o_doc) = self.doc_store.get_document_meta(o_chunk.i_doc_id) else {
+                    continue;
+                };
+                if o_doc.b_deleted {
+                    continue;
+                }
+
+                if !matches_filters(&o_doc.payload, &opts.v_filters)
+                    && !matches_filters(&o_chunk.payload, &opts.v_filters)
+                {
+                    continue;
+                }
+
+                if !matches_bool_query(&o_chunk.s_text, &o_bool_query) {
+                    continue;
+                }
+
+                let d_soft_score =
+                    self.compute_soft_gram_score(&s_lexical_query, &o_chunk.s_text, 0.0);
+
+                v_preselected.push((i_chunk_id, d_soft_score));
+            }
         }
 
         v_preselected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-        v_preselected.truncate(cfg.i_query_preselect.max(cfg.i_bm25_top_k));
+        v_preselected.truncate(I_BM25_TOP_CANDIDATES.max(opts.i_k * 4));
 
         let mut v_texts: Vec<(u64, String)> = Vec::new();
         let mut h_vec_score: HashMap<ChunkId, f32> = HashMap::new();
@@ -1280,15 +1308,26 @@ impl VectorIndex {
             if o_chunk.b_deleted {
                 continue;
             }
+
             h_vec_score.insert(i_chunk_id, d_score);
             v_texts.push((i_chunk_id, o_chunk.s_text.clone()));
         }
 
-        let v_bm25 = bm25_rerank_top_k(&v_texts, s_query, cfg.i_bm25_top_k);
+        let v_bm25 = bm25_rerank_top_k(&v_texts, &s_lexical_query, I_BM25_TOP_CANDIDATES);
+        let mut h_bm25_score: HashMap<ChunkId, f32> = HashMap::new();
+        for (i_chunk_id, d_bm25) in v_bm25.into_iter() {
+            h_bm25_score.insert(i_chunk_id, d_bm25);
+        }
+
+        let o_query_embedding = if opts.b_enable_embedding_rescore {
+            self.encode_text_embedding(&s_lexical_query).ok()
+        } else {
+            None
+        };
 
         let mut h_doc_best: HashMap<DocId, VecSearchHit> = HashMap::new();
 
-        for (i_chunk_id, d_bm25) in v_bm25.into_iter() {
+        for (i_chunk_id, d_soft) in h_vec_score.into_iter() {
             let Some(o_chunk) = self.doc_store.get_chunk(i_chunk_id) else {
                 continue;
             };
@@ -1296,13 +1335,30 @@ impl VectorIndex {
                 continue;
             };
 
-            let d_vec = *h_vec_score.get(&i_chunk_id).unwrap_or(&0.0);
-            let d_final = 0.45 * d_vec + 0.55 * d_bm25;
+            let d_bm25 = *h_bm25_score.get(&i_chunk_id).unwrap_or(&0.0);
+
+            let d_embedding = if let Some(v_query_embedding) = o_query_embedding.as_ref() {
+                if let Some(o_embedding) = self.get_chunk_embedding(i_chunk_id) {
+                    cosine_similarity(v_query_embedding, &o_embedding.v_embedding)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            let d_final = if o_query_embedding.is_some() {
+                D_HYBRID_LEXICAL_WEIGHT * d_soft
+                    + D_HYBRID_BM25_WEIGHT * d_bm25
+                    + D_HYBRID_EMBEDDING_WEIGHT * d_embedding
+            } else {
+                0.50 * d_soft + 0.50 * d_bm25
+            };
 
             let o_hit = VecSearchHit {
                 s_doc: o_doc.s_doc_path.clone(),
                 d_score: d_final,
-                s_snippet: build_snippet_for_query(&o_chunk.s_text, s_query),
+                s_snippet: build_snippet_for_query(&o_chunk.s_text, &s_lexical_query),
             };
 
             match h_doc_best.get(&o_doc.i_doc_id) {
@@ -1330,6 +1386,7 @@ impl VectorIndex {
                 i_k,
                 v_filters: Vec::new(),
                 b_enable_token_level_rescore: false,
+                b_enable_embedding_rescore: true,
             },
         )
     }
@@ -1342,271 +1399,187 @@ impl VectorIndex {
     }
 
     pub fn rebuild_now(&self, p_root: &Path) {
-        let v_samples = self.collect_token_sample_vectors(p_root, 2000, 8);
-        let i_token_dim = self.token_dim();
-
-        let mut cfg = self
-            .model
-            .lock()
-            .expect("muvera_model_lock_failed")
-            .cfg
-            .clone();
-
-        cfg.i_token_dim = i_token_dim;
-        cfg.i_model_version = cfg.i_model_version.saturating_add(1);
-
-        let v_centroids = train_kmeans_centroids(&v_samples, cfg.i_cluster_count, 6, i_token_dim);
-
-        let o_new_model = MuveraModel {
-            cfg: cfg.clone(),
-            v_centroids,
-        };
-
-        if save_model_staging(p_root, &o_new_model).is_ok() {
-            if atomic_activate_staging_model(p_root).is_ok() {
-                let mut g = self.model.lock().expect("muvera_model_lock_failed");
-                *g = o_new_model;
-            }
-        }
-
-        for i_chunk_id in self.doc_store.iter_all_chunk_ids().into_iter() {
-            self.doc_store.mark_chunk_dirty_for_reproject(i_chunk_id);
-        }
-
-        self.reproject_dirty_async(50_000);
+        let _ = p_root;
+        let v_chunk_ids = self.doc_store.iter_all_chunk_ids();
+        self.reproject_chunks_now(&v_chunk_ids);
     }
 
+    /**********************************************************************************************
+     * Beschreibung
+     * - Reproject fuehrt hier den Rebuild der Posting Listen und Embeddings aus.
+     *
+     * Historie
+     * 16.05.2026   MS   - Kompatibilitaetsfunktion
+     * 17.05.2026   MS   - Embedding Rebuild integriert
+     **********************************************************************************************/
     pub fn reproject_chunks_now(&self, v_chunk_ids: &[ChunkId]) {
-        let i_model_version = self
-            .model
-            .lock()
-            .expect("muvera_model_lock_failed")
-            .cfg
-            .i_model_version;
+        let _ = self.rebuild_posting_store();
+        let _ = self.rebuild_embeddings(v_chunk_ids);
+    }
 
-        for i_chunk_id in v_chunk_ids.iter() {
-            let Some(mut o_chunk) = self.doc_store.get_chunk(*i_chunk_id) else {
+    pub fn save(&self, p_root: &Path) {
+        let _ = p_root;
+    }
+
+    pub fn load(&self, p_root: &Path) {
+        let _ = p_root;
+    }
+
+    pub fn repair_five_gram_postings(&self) -> Result<(), String> {
+        for i_chunk_id in self.doc_store.iter_all_chunk_ids().into_iter() {
+            let Some(o_chunk) = self.doc_store.get_chunk(i_chunk_id) else {
+                continue;
+            };
+            if o_chunk.b_deleted {
+                continue;
+            }
+
+            let v_terms = build_five_grams(&o_chunk.s_text);
+            self.doc_store.save_chunk_terms(i_chunk_id, &v_terms);
+        }
+
+        self.rebuild_posting_store()?;
+        Ok(())
+    }
+
+    /**********************************************************************************************
+     * Beschreibung
+     * - Baut Embeddings fuer die angegebenen Chunks neu auf.
+     *
+     * Historie
+     * 17.05.2026   MS   - Funktion erstellt
+     **********************************************************************************************/
+    pub fn rebuild_embeddings(&self, v_chunk_ids: &[ChunkId]) -> Result<(), String> {
+        let v_targets: Vec<ChunkId> = if v_chunk_ids.is_empty() {
+            self.doc_store.iter_all_chunk_ids()
+        } else {
+            v_chunk_ids.to_vec()
+        };
+
+        for i_chunk_id in v_targets.into_iter() {
+            let Some(o_chunk) = self.doc_store.get_chunk(i_chunk_id) else {
                 continue;
             };
 
             if o_chunk.b_deleted {
-                self.doc_store.clear_chunk_dirty_for_reproject(*i_chunk_id);
+                let _ = self.embedding_store.delete_chunk_embedding(i_chunk_id);
                 continue;
             }
 
-            let Some(o_token_rec) = self.doc_store.get_token_record(*i_chunk_id) else {
+            let Some(o_doc) = self.doc_store.get_document_meta(o_chunk.i_doc_id) else {
                 continue;
             };
 
-            let v_token_vectors = if o_token_rec.b_quantized_i8 {
-                match self.token_store.read_matrix_i8_quantized(
-                    o_token_rec.i_file_offset,
-                    o_token_rec.i_token_count as usize,
-                    o_token_rec.i_vector_dim as usize,
-                ) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                }
-            } else {
+            if o_doc.b_deleted {
+                let _ = self.embedding_store.delete_chunk_embedding(i_chunk_id);
                 continue;
-            };
+            }
 
-            o_chunk.i_model_version = i_model_version;
-            self.doc_store.save_chunk(&o_chunk);
-            let _ = self.write_chunk_projection(&o_chunk, &v_token_vectors);
+            let v_embedding = self.encode_text_embedding(&o_chunk.s_text)?;
+            self.save_chunk_embedding(i_chunk_id, v_embedding)?;
         }
+
+        Ok(())
     }
 
-    pub fn save(&self, p_root: &Path) {
-        let g = self.model.lock().expect("muvera_model_lock_failed");
-        let _ = save_model_active(p_root, &g);
-    }
-
-    pub fn load(&self, p_root: &Path) {
-        let i_token_dim = self.token_dim();
-        let o_model = load_or_create_model_active(p_root, i_token_dim);
-        let mut g = self.model.lock().expect("muvera_model_lock_failed");
-        *g = o_model;
-    }
-
-    fn token_dim(&self) -> usize {
-        self.backend.dim().max(I_VEC_DIM_DEFAULT)
-    }
-
-    fn encode_text_to_token_vectors(&self, s_text: &str) -> Vec<Vec<f32>> {
-        let v_segments = split_text_for_token_vectors(s_text);
-        if v_segments.is_empty() {
-            return vec![vec![0.0; self.token_dim()]];
-        }
-        match self.backend.encode_many(&v_segments) {
-            Ok(vs) if !vs.is_empty() => vs,
-            _ => v_segments
-                .iter()
-                .map(|_| vec![0.0; self.token_dim()])
-                .collect(),
-        }
-    }
-
-    fn project_token_vectors_to_muvera(&self, v_token_vectors: &[Vec<f32>]) -> Vec<f32> {
-        let g = self.model.lock().expect("muvera_model_lock_failed");
-        project_token_vectors_to_muvera_doc(&g, v_token_vectors)
-    }
-
-    fn project_query_token_vectors_to_muvera(
+    fn compute_soft_gram_score(
         &self,
         s_query: &str,
-        v_query_token_vectors: &[Vec<f32>],
-    ) -> Vec<f32> {
-        let g = self.model.lock().expect("muvera_model_lock_failed");
-        let b_short_query = is_short_query_text(s_query);
-        project_token_vectors_to_muvera_query(&g, v_query_token_vectors, b_short_query)
+        s_chunk_text: &str,
+        d_posting_score: f32,
+    ) -> f32 {
+        let v_query_grams = build_five_grams(s_query);
+        let v_doc_grams = build_five_grams(s_chunk_text);
+
+        let d_dice_score = dice_similarity(&v_query_grams, &v_doc_grams);
+        let d_prefix_score = prefix_match_score(s_query, s_chunk_text);
+        let d_exact_score = exact_match_score(s_query, s_chunk_text);
+
+        let d_final_score =
+            0.65 * d_dice_score +
+            0.20 * d_prefix_score +
+            0.15 * d_exact_score +
+            0.10 * d_posting_score.min(1.0);
+
+        d_final_score
     }
 
-    fn simhash_for_vector(&self, v_vec: &[f32]) -> Vec<u64> {
-        let i_bits = self
-            .model
-            .lock()
-            .expect("muvera_model_lock_failed")
-            .cfg
-            .i_simhash_bits
-            .max(8);
-        compute_simhash(v_vec, i_bits)
-    }
+    fn rebuild_posting_store(&self) -> Result<(), String> {
+        self.posting_store.reset_file()?;
+        self.doc_store.clear_gram_posting_meta()?;
 
-    fn bucket_key_from_simhash(&self, a_simhash: &[u64]) -> u32 {
-        let i_prefix_bits = self
-            .model
-            .lock()
-            .expect("muvera_model_lock_failed")
-            .cfg
-            .i_bucket_prefix_bits
-            .clamp(1, 32);
-        let i_first = *a_simhash.get(0).unwrap_or(&0u64);
-        let i_shift = 64usize.saturating_sub(i_prefix_bits);
-        (i_first >> i_shift) as u32
-    }
+        let mut h_gram_to_postings: HashMap<String, Vec<GramPostingRecord>> = HashMap::new();
 
-    fn expand_bucket_keys_near(&self, i_bucket_key: u32) -> Vec<u32> {
-        let i_prefix_bits = self
-            .model
-            .lock()
-            .expect("muvera_model_lock_failed")
-            .cfg
-            .i_bucket_prefix_bits
-            .clamp(1, 32);
-
-        let i_mask: u32 = if i_prefix_bits >= 32 {
-            u32::MAX
-        } else {
-            (1u32 << i_prefix_bits) - 1
-        };
-
-        let mut v_out: Vec<u32> = Vec::new();
-        let mut h_seen: HashSet<u32> = HashSet::new();
-
-        let mut add_bucket = |i_val: u32| {
-            let i_masked = i_val & i_mask;
-            if h_seen.insert(i_masked) {
-                v_out.push(i_masked);
-            }
-        };
-
-        add_bucket(i_bucket_key);
-
-        for i_bit in 0..i_prefix_bits {
-            add_bucket(i_bucket_key ^ (1u32 << i_bit));
-        }
-
-        let i_max_two_bit = 16usize;
-        let mut i_count = 0usize;
-        'outer: for i_a in 0..i_prefix_bits {
-            for i_b in (i_a + 1)..i_prefix_bits {
-                add_bucket(i_bucket_key ^ ((1u32 << i_a) | (1u32 << i_b)));
-                i_count = i_count.saturating_add(1);
-                if i_count >= i_max_two_bit {
-                    break 'outer;
-                }
-            }
-        }
-
-        v_out
-    }
-
-    fn token_level_rescore(&self, i_chunk_id: ChunkId, v_query_tokens: &[Vec<f32>]) -> f32 {
-        let Some(o_token_rec) = self.doc_store.get_token_record(i_chunk_id) else {
-            return 0.0;
-        };
-
-        let v_doc_tokens = if o_token_rec.b_quantized_i8 {
-            match self.token_store.read_matrix_i8_quantized(
-                o_token_rec.i_file_offset,
-                o_token_rec.i_token_count as usize,
-                o_token_rec.i_vector_dim as usize,
-            ) {
-                Ok(v) => v,
-                Err(_) => return 0.0,
-            }
-        } else {
-            return 0.0;
-        };
-
-        if v_doc_tokens.is_empty() || v_query_tokens.is_empty() {
-            return 0.0;
-        }
-
-        let mut d_sum_best = 0.0f32;
-        let mut i_cnt = 0usize;
-
-        for v_q in v_query_tokens.iter() {
-            let mut d_best = f32::MIN;
-            for v_d in v_doc_tokens.iter() {
-                let d = cosine(v_q, v_d);
-                if d > d_best {
-                    d_best = d;
-                }
-            }
-            if d_best.is_finite() {
-                d_sum_best += d_best.max(0.0);
-                i_cnt = i_cnt.saturating_add(1);
-            }
-        }
-
-        if i_cnt == 0 {
-            0.0
-        } else {
-            d_sum_best / (i_cnt as f32)
-        }
-    }
-
-    fn collect_token_sample_vectors(
-        &self,
-        p_root: &Path,
-        i_doc_limit: usize,
-        i_chunks_per_doc: usize,
-    ) -> Vec<Vec<f32>> {
-        let mut v_jobs: Vec<(PathBuf, PayloadMap)> = Vec::new();
-        Self::crawl_collect(p_root, &mut v_jobs);
-
-        let mut v_out: Vec<Vec<f32>> = Vec::new();
-
-        for (p_path, _) in v_jobs.into_iter().take(i_doc_limit) {
-            let Ok(s_text) = extract_doc_text(&p_path) else {
+        for i_chunk_id in self.doc_store.iter_all_chunk_ids().into_iter() {
+            let Some(o_chunk) = self.doc_store.get_chunk(i_chunk_id) else {
                 continue;
             };
-            let v_chunks = chunk_text(&s_text, &self.chunk_cfg);
-            for s_chunk in v_chunks.into_iter().take(i_chunks_per_doc) {
-                let v_token_vectors = self.encode_text_to_token_vectors(&s_chunk);
-                for v in v_token_vectors.into_iter().take(4) {
-                    v_out.push(v);
-                }
+
+            if o_chunk.b_deleted {
+                continue;
+            }
+
+            let Some(o_doc) = self.doc_store.get_document_meta(o_chunk.i_doc_id) else {
+                continue;
+            };
+
+            if o_doc.b_deleted {
+                continue;
+            }
+
+            let v_terms = self.doc_store.get_chunk_terms(i_chunk_id);
+            let mut h_tf: HashMap<String, u32> = HashMap::new();
+
+            for s_term in v_terms.into_iter() {
+                *h_tf.entry(s_term).or_insert(0) += 1;
+            }
+
+            for (s_gram, i_tf) in h_tf.into_iter() {
+                h_gram_to_postings
+                    .entry(s_gram)
+                    .or_insert_with(Vec::new)
+                    .push(GramPostingRecord {
+                        i_chunk_id,
+                        i_tf,
+                    });
             }
         }
 
-        if v_out.is_empty() {
-            v_out.push(vec![0.0; self.token_dim()]);
+        let mut v_grams: Vec<(String, Vec<GramPostingRecord>)> =
+            h_gram_to_postings.into_iter().collect();
+        v_grams.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (_, v_postings) in v_grams.iter_mut() {
+            v_postings.sort_by(|a, b| a.i_chunk_id.cmp(&b.i_chunk_id));
         }
 
-        v_out
+        for (s_gram, v_postings) in v_grams.into_iter() {
+            let (i_offset, i_byte_len) = self
+                .posting_store
+                .append_posting_list(&v_postings)
+                .map_err(|_| "posting_store_write_failed".to_string())?;
+
+            let i_record_count = if i_byte_len >= 4 {
+                (i_byte_len - 4) / 12
+            } else {
+                0
+            };
+
+            if i_record_count != v_postings.len() as u64 {
+                return Err("posting_store_record_count_mismatch".to_string());
+            }
+
+            self.doc_store.save_gram_posting_meta(
+                &s_gram,
+                &GramPostingFileEntry {
+                    i_offset,
+                    i_byte_len,
+                    i_doc_freq: v_postings.len() as u32,
+                },
+            );
+        }
+
+        Ok(())
     }
 
     fn collect_paths_from_fs(&self, p_root: &Path) -> Vec<String> {
@@ -1617,21 +1590,26 @@ impl VectorIndex {
 
     fn collect_paths_recursive(&self, p_dir: &Path, v_out: &mut Vec<String>) {
         let _ = &self;
+
         if let Ok(rd) = fs::read_dir(p_dir) {
             for entry in rd.flatten() {
                 let p_path = entry.path();
+
                 if p_path.is_dir() {
                     self.collect_paths_recursive(&p_path, v_out);
                     continue;
                 }
+
                 let s_ext = p_path
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_ascii_lowercase();
+
                 let a_ok_ext = [
                     "txt", "md", "rs", "py", "json", "pdf", "docx", "xlsx", "xls", "csv", "pptx",
                 ];
+
                 if a_ok_ext.contains(&s_ext.as_str()) {
                     v_out.push(canonicalize_best_effort(&p_path));
                 }
@@ -1644,8 +1622,9 @@ impl VectorIndex {
             let Some(o_doc) = self.doc_store.get_document_meta(i_doc_id) else {
                 continue;
             };
+
             if !h_seen.contains(&o_doc.s_doc_path) {
-                self.delete_document_now(&o_doc.s_doc_path);
+                let _ = self.delete_document_now(&o_doc.s_doc_path);
             }
         }
     }
@@ -1654,21 +1633,26 @@ impl VectorIndex {
         if let Ok(rd) = fs::read_dir(p_dir) {
             for entry in rd.flatten() {
                 let p_path = entry.path();
+
                 if p_path.is_dir() {
                     Self::crawl_collect(&p_path, v_jobs);
                     continue;
                 }
+
                 let a_ok_ext = [
                     "txt", "md", "rs", "py", "json", "pdf", "docx", "xlsx", "xls", "csv", "pptx",
                 ];
+
                 let s_ext = p_path
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_ascii_lowercase();
+
                 if !a_ok_ext.contains(&s_ext.as_str()) {
                     continue;
                 }
+
                 let mut payload = PayloadMap::new();
                 payload.insert("source_type".to_string(), s_ext.clone());
                 payload.insert("indexed_at".to_string(), now_ts().to_string());
@@ -1719,575 +1703,42 @@ fn chunk_text(s_text: &str, cfg: &ChunkingConfig) -> Vec<String> {
         let i_end = (i_start + i_chunk_chars).min(v_chars.len());
         let s_chunk: String = v_chars[i_start..i_end].iter().collect();
         let s_chunk = s_chunk.trim().to_string();
+
         if !s_chunk.is_empty() {
             v_out.push(s_chunk);
         }
+
         if i_end >= v_chars.len() {
             break;
         }
+
         let i_next = i_end.saturating_sub(i_overlap);
         if i_next <= i_start {
             break;
         }
+
         i_start = i_next;
     }
 
     v_out
 }
 
-fn split_text_for_token_vectors(s_text: &str) -> Vec<String> {
-    let s_norm = normalize_for_match(s_text);
-    if s_norm.is_empty() {
-        return Vec::new();
-    }
-
-    let v_words: Vec<&str> = s_norm.split_whitespace().collect();
-    if v_words.is_empty() {
-        return Vec::new();
-    }
-
-    let mut h_seen: HashSet<String> = HashSet::new();
-    let mut v_out: Vec<String> = Vec::new();
-
-    let i_window = 6usize;
-    let i_stride = 3usize;
-    let mut i_pos = 0usize;
-
-    while i_pos < v_words.len() {
-        let i_end = (i_pos + i_window).min(v_words.len());
-        let s_part = v_words[i_pos..i_end].join(" ");
-        if !s_part.is_empty() && h_seen.insert(s_part.clone()) {
-            v_out.push(s_part);
-        }
-        if i_end >= v_words.len() {
-            break;
-        }
-        let i_next = i_pos.saturating_add(i_stride);
-        if i_next <= i_pos {
-            break;
-        }
-        i_pos = i_next;
-    }
-
-    for s_word in v_words.iter() {
-        if s_word.len() >= 2 {
-            let s_word_owned = (*s_word).to_string();
-            if h_seen.insert(s_word_owned.clone()) {
-                v_out.push(s_word_owned);
-            }
-        }
-    }
-
-    for s_word in v_words.iter() {
-        if s_word.len() < 3 {
-            continue;
-        }
-        for i_n in I_MUVERA_CHAR_NGRAM_MIN..=I_MUVERA_CHAR_NGRAM_MAX {
-            for s_ng in to_char_ngrams(s_word, i_n, "") {
-                if s_ng.len() >= 3 {
-                    let s_token = format!("cg {}", s_ng);
-                    if h_seen.insert(s_token.clone()) {
-                        v_out.push(s_token);
-                    }
-                }
-            }
-        }
-    }
-
-    if v_out.is_empty() {
-        v_out.push(s_norm);
-    }
-
-    v_out
-}
-
-fn tokenize_for_postings(s_text: &str) -> Vec<String> {
-    let s_norm = normalize_for_match(s_text);
-    if s_norm.is_empty() {
-        return Vec::new();
-    }
-
-    let mut h_seen: HashSet<String> = HashSet::new();
-    let mut v_out: Vec<String> = Vec::new();
-
-    for s_word in s_norm.split_whitespace() {
-        if s_word.len() < 2 {
-            continue;
-        }
-
-        let s_word_token = format!("w:{}", s_word);
-        if h_seen.insert(s_word_token.clone()) {
-            v_out.push(s_word_token);
-        }
-
-        for i_n in 3..=5 {
-            for s_ng in to_char_ngrams(s_word, i_n, "") {
-                if s_ng.len() < 3 {
-                    continue;
-                }
-                let s_ng_token = format!("g:{}", s_ng);
-                if h_seen.insert(s_ng_token.clone()) {
-                    v_out.push(s_ng_token);
-                }
-            }
-        }
-    }
-
-    v_out
-}
-
-fn is_short_query_text(s_text: &str) -> bool {
-    let s_norm = normalize_for_match(s_text);
-    if s_norm.is_empty() {
-        return true;
-    }
-    let v_words: Vec<&str> = s_norm.split_whitespace().collect();
-    v_words.len() <= I_MUVERA_SHORT_QUERY_WORD_THRESHOLD
-}
-
 fn matches_filters(payload: &PayloadMap, v_filters: &[PayloadFilter]) -> bool {
     for f in v_filters.iter() {
         let s_val = payload.get(&f.s_field).map(|s| s.as_str()).unwrap_or("");
+
         let b_ok = match f.op {
             PayloadFilterOp::Eq => s_val == f.s_value,
             PayloadFilterOp::Ne => s_val != f.s_value,
             PayloadFilterOp::Contains => s_val.contains(&f.s_value),
         };
+
         if !b_ok {
             return false;
         }
     }
+
     true
-}
-
-fn model_active_path(p_root: &Path) -> PathBuf {
-    let mut p = p_root.to_path_buf();
-    p.push(S_MODEL_ACTIVE_FILE);
-    p
-}
-
-fn model_staging_path(p_root: &Path) -> PathBuf {
-    let mut p = p_root.to_path_buf();
-    p.push(S_MODEL_STAGING_FILE);
-    p
-}
-
-fn load_or_create_model_active(p_root: &Path, i_token_dim: usize) -> MuveraModel {
-    let p_model = model_active_path(p_root);
-    if let Ok(v_buf) = fs::read(&p_model) {
-        if let Ok(o_model) = bincode::deserialize::<MuveraModel>(&v_buf) {
-            return o_model;
-        }
-    }
-
-    let cfg = MuveraConfig {
-        i_token_dim,
-        ..MuveraConfig::default()
-    };
-
-    let mut v_centroids: Vec<ClusterCentroid> = Vec::new();
-    for i_idx in 0..cfg.i_cluster_count {
-        let mut v_center = vec![0.0f32; i_token_dim];
-        if i_idx < i_token_dim {
-            v_center[i_idx] = 1.0;
-        } else if !v_center.is_empty() {
-            let i_len = v_center.len();
-            let i_pos = i_idx % i_len;
-            v_center[i_pos] = 1.0;
-        }
-        v_centroids.push(ClusterCentroid {
-            i_cluster_id: i_idx as u32,
-            v_center,
-        });
-    }
-
-    let o_model = MuveraModel { cfg, v_centroids };
-    let _ = save_model_active(p_root, &o_model);
-    o_model
-}
-
-fn save_model_active(p_root: &Path, o_model: &MuveraModel) -> Result<(), String> {
-    let p_model = model_active_path(p_root);
-    if let Some(p_parent) = p_model.parent() {
-        let _ = fs::create_dir_all(p_parent);
-    }
-    let v_buf = bincode::serialize(o_model).map_err(|_| "model_serialize_failed".to_string())?;
-    fs::write(p_model, v_buf).map_err(|_| "model_write_failed".to_string())
-}
-
-fn save_model_staging(p_root: &Path, o_model: &MuveraModel) -> Result<(), String> {
-    let p_model = model_staging_path(p_root);
-    if let Some(p_parent) = p_model.parent() {
-        let _ = fs::create_dir_all(p_parent);
-    }
-    let v_buf = bincode::serialize(o_model).map_err(|_| "model_serialize_failed".to_string())?;
-    fs::write(p_model, v_buf).map_err(|_| "model_staging_write_failed".to_string())
-}
-
-fn atomic_activate_staging_model(p_root: &Path) -> Result<(), String> {
-    let p_staging = model_staging_path(p_root);
-    let p_active = model_active_path(p_root);
-    if !p_staging.exists() {
-        return Err("model_staging_missing".to_string());
-    }
-    let p_backup = {
-        let mut p = p_root.to_path_buf();
-        p.push("muvera_model_backup.bin");
-        p
-    };
-    if p_active.exists() {
-        let _ = fs::rename(&p_active, &p_backup);
-    }
-    fs::rename(&p_staging, &p_active).map_err(|_| "model_atomic_swap_failed".to_string())?;
-    let _ = fs::remove_file(&p_backup);
-    Ok(())
-}
-
-fn nearest_centroid_index(v_vec: &[f32], v_centroids: &[ClusterCentroid]) -> usize {
-    if v_centroids.is_empty() {
-        return 0;
-    }
-    let mut i_best = 0usize;
-    let mut d_best = f32::MIN;
-    for (i_idx, c) in v_centroids.iter().enumerate() {
-        let d_score = cosine(v_vec, &c.v_center);
-        if d_score > d_best {
-            d_best = d_score;
-            i_best = i_idx;
-        }
-    }
-    i_best
-}
-
-fn nearest_centroid_indices_weighted(
-    v_vec: &[f32],
-    v_centroids: &[ClusterCentroid],
-    i_top_k: usize,
-) -> Vec<(usize, f32)> {
-    if v_centroids.is_empty() || i_top_k == 0 {
-        return Vec::new();
-    }
-
-    let mut v_scores: Vec<(usize, f32)> = v_centroids
-        .iter()
-        .enumerate()
-        .map(|(i_idx, c)| (i_idx, cosine(v_vec, &c.v_center)))
-        .collect();
-
-    v_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-    v_scores.truncate(i_top_k.min(v_scores.len()));
-
-    let mut d_sum_pos = 0.0f32;
-    for (_, d_score) in v_scores.iter() {
-        d_sum_pos += d_score.max(0.0);
-    }
-
-    if d_sum_pos <= 0.0 {
-        let d_uniform = 1.0 / (v_scores.len().max(1) as f32);
-        return v_scores
-            .into_iter()
-            .map(|(i_idx, _)| (i_idx, d_uniform))
-            .collect();
-    }
-
-    v_scores
-        .into_iter()
-        .map(|(i_idx, d_score)| (i_idx, d_score.max(0.0) / d_sum_pos))
-        .collect()
-}
-
-fn train_kmeans_centroids(
-    v_samples: &[Vec<f32>],
-    i_cluster_count: usize,
-    i_iterations: usize,
-    i_dim: usize,
-) -> Vec<ClusterCentroid> {
-    if v_samples.is_empty() {
-        let mut v_centroids: Vec<ClusterCentroid> = Vec::new();
-        for i_idx in 0..i_cluster_count.max(1) {
-            let mut v = vec![0.0; i_dim.max(1)];
-            if !v.is_empty() {
-                let i_len = v.len();
-                let i_pos = i_idx % i_len;
-                v[i_pos] = 1.0;
-            }
-            v_centroids.push(ClusterCentroid {
-                i_cluster_id: i_idx as u32,
-                v_center: v,
-            });
-        }
-        return v_centroids;
-    }
-
-    let i_k = i_cluster_count.min(v_samples.len()).max(1);
-    let mut v_centers: Vec<Vec<f32>> = v_samples.iter().take(i_k).cloned().collect();
-
-    while v_centers.len() < i_cluster_count {
-        let i_len = v_centers.len();
-        let i_src = i_len % i_k;
-        let v_clone = v_centers[i_src].clone();
-        v_centers.push(v_clone);
-    }
-
-    for _ in 0..i_iterations.max(1) {
-        let mut v_sum = vec![vec![0.0f32; i_dim]; i_cluster_count];
-        let mut v_cnt = vec![0usize; i_cluster_count];
-
-        for v_s in v_samples.iter() {
-            let mut i_best = 0usize;
-            let mut d_best = f32::MIN;
-            for (i_idx, v_c) in v_centers.iter().enumerate() {
-                let d = cosine(v_s, v_c);
-                if d > d_best {
-                    d_best = d;
-                    i_best = i_idx;
-                }
-            }
-            add_in_place(&mut v_sum[i_best], v_s);
-            v_cnt[i_best] = v_cnt[i_best].saturating_add(1);
-        }
-
-        for i_idx in 0..i_cluster_count {
-            if v_cnt[i_idx] > 0 {
-                scale_in_place(&mut v_sum[i_idx], 1.0 / (v_cnt[i_idx] as f32));
-                l2_normalize_in_place(&mut v_sum[i_idx]);
-                v_centers[i_idx] = v_sum[i_idx].clone();
-            }
-        }
-    }
-
-    v_centers
-        .into_iter()
-        .enumerate()
-        .map(|(i_idx, v_center)| ClusterCentroid {
-            i_cluster_id: i_idx as u32,
-            v_center,
-        })
-        .collect()
-}
-
-fn project_token_vectors_to_muvera_doc(
-    o_model: &MuveraModel,
-    v_token_vectors: &[Vec<f32>],
-) -> Vec<f32> {
-    let i_cluster_count = o_model.cfg.i_cluster_count.max(1);
-    let i_token_dim = o_model.cfg.i_token_dim.max(1);
-
-    let mut v_bucket_sum = vec![vec![0.0f32; i_token_dim]; i_cluster_count];
-    let mut v_bucket_max = vec![vec![f32::MIN; i_token_dim]; i_cluster_count];
-    let mut v_bucket_weight = vec![0.0f32; i_cluster_count];
-
-    for v_tok in v_token_vectors.iter() {
-        let v_assign =
-            nearest_centroid_indices_weighted(v_tok, &o_model.v_centroids, I_MUVERA_ASSIGN_TOP_K);
-
-        for (i_cluster, d_weight) in v_assign.into_iter() {
-            if i_cluster >= i_cluster_count || d_weight <= 0.0 {
-                continue;
-            }
-            for i_dim in 0..i_token_dim {
-                let d_val = *v_tok.get(i_dim).unwrap_or(&0.0);
-                v_bucket_sum[i_cluster][i_dim] += d_val * d_weight;
-                let d_weighted = d_val * d_weight;
-                if d_weighted > v_bucket_max[i_cluster][i_dim] {
-                    v_bucket_max[i_cluster][i_dim] = d_weighted;
-                }
-            }
-            v_bucket_weight[i_cluster] += d_weight;
-        }
-    }
-
-    let mut v_out: Vec<f32> = Vec::with_capacity(i_cluster_count * i_token_dim);
-
-    for i_cluster in 0..i_cluster_count {
-        let mut v_mean = v_bucket_sum[i_cluster].clone();
-        if v_bucket_weight[i_cluster] > 0.0 {
-            scale_in_place(&mut v_mean, 1.0 / v_bucket_weight[i_cluster]);
-        }
-
-        let mut v_max = v_bucket_max[i_cluster].clone();
-        for d_val in v_max.iter_mut() {
-            if !d_val.is_finite() || *d_val == f32::MIN {
-                *d_val = 0.0;
-            }
-        }
-
-        l2_normalize_in_place(&mut v_mean);
-        l2_normalize_in_place(&mut v_max);
-
-        let mut v_mix = vec![0.0f32; i_token_dim];
-        for i_dim in 0..i_token_dim {
-            v_mix[i_dim] = D_MUVERA_DOC_MEAN_POOL_WEIGHT * v_mean[i_dim]
-                + D_MUVERA_DOC_MAX_POOL_WEIGHT * v_max[i_dim];
-        }
-
-        l2_normalize_in_place(&mut v_mix);
-        v_out.extend_from_slice(&v_mix);
-    }
-
-    l2_normalize_in_place(&mut v_out);
-    v_out
-}
-
-fn project_token_vectors_to_muvera_query(
-    o_model: &MuveraModel,
-    v_token_vectors: &[Vec<f32>],
-    b_short_query: bool,
-) -> Vec<f32> {
-    let i_cluster_count = o_model.cfg.i_cluster_count.max(1);
-    let i_token_dim = o_model.cfg.i_token_dim.max(1);
-
-    let mut v_bucket_sum = vec![vec![0.0f32; i_token_dim]; i_cluster_count];
-    let mut v_bucket_max = vec![vec![f32::MIN; i_token_dim]; i_cluster_count];
-    let mut v_bucket_weight = vec![0.0f32; i_cluster_count];
-
-    for v_tok in v_token_vectors.iter() {
-        let v_assign =
-            nearest_centroid_indices_weighted(v_tok, &o_model.v_centroids, I_MUVERA_ASSIGN_TOP_K);
-
-        for (i_cluster, d_weight) in v_assign.into_iter() {
-            if i_cluster >= i_cluster_count || d_weight <= 0.0 {
-                continue;
-            }
-            for i_dim in 0..i_token_dim {
-                let d_val = *v_tok.get(i_dim).unwrap_or(&0.0);
-                v_bucket_sum[i_cluster][i_dim] += d_val * d_weight;
-                let d_weighted = d_val * d_weight;
-                if d_weighted > v_bucket_max[i_cluster][i_dim] {
-                    v_bucket_max[i_cluster][i_dim] = d_weighted;
-                }
-            }
-            v_bucket_weight[i_cluster] += d_weight;
-        }
-    }
-
-    let d_mean_w = if b_short_query {
-        D_MUVERA_QUERY_MEAN_POOL_WEIGHT_SHORT
-    } else {
-        D_MUVERA_DOC_MEAN_POOL_WEIGHT
-    };
-
-    let d_max_w = if b_short_query {
-        D_MUVERA_QUERY_MAX_POOL_WEIGHT_SHORT
-    } else {
-        D_MUVERA_DOC_MAX_POOL_WEIGHT
-    };
-
-    let mut v_out: Vec<f32> = Vec::with_capacity(i_cluster_count * i_token_dim);
-
-    for i_cluster in 0..i_cluster_count {
-        let mut v_mean = v_bucket_sum[i_cluster].clone();
-        if v_bucket_weight[i_cluster] > 0.0 {
-            scale_in_place(&mut v_mean, 1.0 / v_bucket_weight[i_cluster]);
-        }
-
-        let mut v_max = v_bucket_max[i_cluster].clone();
-        for d_val in v_max.iter_mut() {
-            if !d_val.is_finite() || *d_val == f32::MIN {
-                *d_val = 0.0;
-            }
-        }
-
-        l2_normalize_in_place(&mut v_mean);
-        l2_normalize_in_place(&mut v_max);
-
-        let mut v_mix = vec![0.0f32; i_token_dim];
-        for i_dim in 0..i_token_dim {
-            v_mix[i_dim] = d_mean_w * v_mean[i_dim] + d_max_w * v_max[i_dim];
-        }
-
-        l2_normalize_in_place(&mut v_mix);
-        v_out.extend_from_slice(&v_mix);
-    }
-
-    l2_normalize_in_place(&mut v_out);
-    v_out
-}
-
-fn add_in_place(v_target: &mut [f32], v_add: &[f32]) {
-    for (d_t, d_a) in v_target.iter_mut().zip(v_add.iter()) {
-        *d_t += *d_a;
-    }
-}
-
-fn scale_in_place(v_target: &mut [f32], d_scale: f32) {
-    for d in v_target.iter_mut() {
-        *d *= d_scale;
-    }
-}
-
-fn l2_normalize_in_place(v_vec: &mut [f32]) {
-    let d_norm = v_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if d_norm > 0.0 {
-        for d in v_vec.iter_mut() {
-            *d /= d_norm;
-        }
-    }
-}
-
-fn compute_simhash(v_vec: &[f32], i_bits: usize) -> Vec<u64> {
-    let i_bits_eff = i_bits.max(8);
-    let i_word_count = i_bits_eff.div_ceil(64);
-    let mut v_acc = vec![0.0f32; i_word_count * 64];
-
-    for (i_idx, d_val) in v_vec.iter().enumerate() {
-        for i_bit in 0..(i_word_count * 64) {
-            let i_mix = ((i_idx as u64).wrapping_mul(0x9E3779B185EBCA87u64))
-                ^ ((i_bit as u64).wrapping_mul(0xC2B2AE3D27D4EB4Fu64));
-            let b_pos = (i_mix.count_ones() & 1) == 0;
-            if b_pos {
-                v_acc[i_bit] += *d_val;
-            } else {
-                v_acc[i_bit] -= *d_val;
-            }
-        }
-    }
-
-    let mut v_out = vec![0u64; i_word_count];
-    for i_bit in 0..i_bits_eff {
-        if v_acc[i_bit] >= 0.0 {
-            let i_word = i_bit / 64;
-            let i_off = i_bit % 64;
-            v_out[i_word] |= 1u64 << i_off;
-        }
-    }
-
-    v_out
-}
-
-fn simhash_similarity(a: &[u64], b: &[u64]) -> f32 {
-    let i_len = a.len().min(b.len());
-    if i_len == 0 {
-        return 0.0;
-    }
-
-    let mut i_same_bits = 0u32;
-    let mut i_total_bits = 0u32;
-
-    for i_idx in 0..i_len {
-        let i_xor = a[i_idx] ^ b[i_idx];
-        let i_diff = i_xor.count_ones();
-        let i_bits = 64u32;
-        i_same_bits = i_same_bits.saturating_add(i_bits.saturating_sub(i_diff));
-        i_total_bits = i_total_bits.saturating_add(i_bits);
-    }
-
-    if i_total_bits == 0 {
-        0.0
-    } else {
-        (i_same_bits as f32) / (i_total_bits as f32)
-    }
-}
-
-pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let d_dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let d_n1 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let d_n2 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if d_n1 == 0.0 || d_n2 == 0.0 {
-        0.0
-    } else {
-        d_dot / (d_n1 * d_n2)
-    }
 }
 
 fn normalize_for_match(s_in: &str) -> String {
@@ -2295,27 +1746,82 @@ fn normalize_for_match(s_in: &str) -> String {
     let mut b_prev_space = false;
 
     for ch in s_in.chars().take(I_SNIPPET_SCAN_MAX_LEN) {
-        let ch_l = ch.to_ascii_lowercase();
-        if ch_l.is_ascii_alphanumeric() {
-            s_out.push(ch_l);
-            b_prev_space = false;
-        } else if !b_prev_space {
-            s_out.push(' ');
-            b_prev_space = true;
+        let s_lower = ch.to_lowercase().to_string();
+
+        for ch_l in s_lower.chars() {
+            if ch_l.is_ascii_alphanumeric() {
+                s_out.push(ch_l);
+                b_prev_space = false;
+            } else if !b_prev_space {
+                s_out.push(' ');
+                b_prev_space = true;
+            }
         }
     }
 
     s_out.split_whitespace().collect::<Vec<&str>>().join(" ")
 }
 
+fn normalize_heuristic(s_text: &str) -> String {
+    let mut s_out = String::with_capacity(s_text.len());
+    let mut b_prev_space = false;
+
+    for ch in s_text.chars() {
+        let s_lower = ch.to_lowercase().to_string();
+
+        for ch_l in s_lower.chars() {
+            if ch_l.is_ascii_alphanumeric() {
+                s_out.push(ch_l);
+                b_prev_space = false;
+            } else if !b_prev_space {
+                s_out.push(' ');
+                b_prev_space = true;
+            }
+        }
+    }
+
+    s_out.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+fn build_five_grams(s_text: &str) -> Vec<String> {
+    let s_norm = normalize_heuristic(s_text);
+    if s_norm.is_empty() {
+        return Vec::new();
+    }
+
+    let s_joined = s_norm.replace(' ', "_");
+    let v_chars: Vec<char> = s_joined.chars().collect();
+
+    if v_chars.is_empty() {
+        return Vec::new();
+    }
+
+    if v_chars.len() < I_FIVE_GRAM_SIZE {
+        let s_single: String = v_chars.iter().collect();
+        return vec![s_single];
+    }
+
+    let mut v_out: Vec<String> =
+        Vec::with_capacity(v_chars.len().saturating_sub(I_FIVE_GRAM_SIZE) + 1);
+
+    for i_pos in 0..=(v_chars.len() - I_FIVE_GRAM_SIZE) {
+        let s_part: String = v_chars[i_pos..i_pos + I_FIVE_GRAM_SIZE].iter().collect();
+        v_out.push(s_part);
+    }
+
+    v_out
+}
+
 fn extract_query_tokens(s_query: &str) -> Vec<String> {
     let s_norm = normalize_for_match(s_query);
     let mut v_out: Vec<String> = Vec::new();
+
     for s_t in s_norm.split_whitespace() {
         if s_t.len() >= 2 {
             v_out.push(s_t.to_string());
         }
     }
+
     v_out
 }
 
@@ -2336,6 +1842,7 @@ fn build_snippet_for_query(s_text: &str, s_query: &str) -> String {
     }
 
     let mut i_best_pos: Option<usize> = None;
+
     for s_t in &v_q {
         if let Some(i_pos) = s_norm.find(s_t) {
             i_best_pos = match i_best_pos {
@@ -2363,34 +1870,60 @@ fn build_snippet_for_query(s_text: &str, s_query: &str) -> String {
     s_slice.split_whitespace().collect::<Vec<&str>>().join(" ")
 }
 
-fn bm25_ngram_from_env() -> usize {
-    let s_val = std::env::var("BM25_NGRAM").unwrap_or_else(|_| String::new());
-    let mut i_n = s_val.trim().parse::<usize>().unwrap_or(I_BM25_NGRAM_DEFAULT);
-    if i_n < I_BM25_NGRAM_MIN {
-        i_n = I_BM25_NGRAM_MIN;
+fn dice_similarity(v_query_grams: &[String], v_doc_grams: &[String]) -> f32 {
+    if v_query_grams.is_empty() || v_doc_grams.is_empty() {
+        return 0.0;
     }
-    if i_n > I_BM25_NGRAM_MAX {
-        i_n = I_BM25_NGRAM_MAX;
+
+    let h_query: HashSet<&str> = v_query_grams.iter().map(|s| s.as_str()).collect();
+    let h_doc: HashSet<&str> = v_doc_grams.iter().map(|s| s.as_str()).collect();
+
+    let i_intersection = h_query.intersection(&h_doc).count() as f32;
+    let i_total = (h_query.len() + h_doc.len()) as f32;
+
+    if i_total <= 0.0 {
+        0.0
+    } else {
+        (2.0 * i_intersection) / i_total
     }
-    i_n
 }
 
-fn normalize_heuristic(s_text: &str) -> String {
-    let mut s_out = String::with_capacity(s_text.len());
-    let mut b_prev_space = false;
+fn prefix_match_score(s_query: &str, s_chunk_text: &str) -> f32 {
+    let s_query_norm = normalize_for_match(s_query);
+    let s_chunk_norm = normalize_for_match(s_chunk_text);
 
-    for ch in s_text.chars() {
-        let ch_l = ch.to_ascii_lowercase();
-        if ch_l.is_ascii_alphanumeric() {
-            s_out.push(ch_l);
-            b_prev_space = false;
-        } else if !b_prev_space {
-            s_out.push(' ');
-            b_prev_space = true;
+    if s_query_norm.is_empty() || s_chunk_norm.is_empty() {
+        return 0.0;
+    }
+
+    for s_word in s_chunk_norm.split_whitespace() {
+        if s_word.starts_with(&s_query_norm) || s_query_norm.starts_with(s_word) {
+            return 1.0;
         }
     }
 
-    s_out.split_whitespace().collect::<Vec<&str>>().join(" ")
+    0.0
+}
+
+fn exact_match_score(s_query: &str, s_chunk_text: &str) -> f32 {
+    let s_query_norm = normalize_for_match(s_query);
+    let s_chunk_norm = normalize_for_match(s_chunk_text);
+
+    if s_query_norm.is_empty() || s_chunk_norm.is_empty() {
+        return 0.0;
+    }
+
+    for s_word in s_chunk_norm.split_whitespace() {
+        if s_word == s_query_norm {
+            return 1.0;
+        }
+    }
+
+    0.0
+}
+
+fn bm25_ngram_from_env() -> usize {
+    5
 }
 
 fn to_char_ngrams(s_text: &str, i_n: usize, s_boundary: &str) -> Vec<String> {
@@ -2399,7 +1932,7 @@ fn to_char_ngrams(s_text: &str, i_n: usize, s_boundary: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    let i_n_eff = i_n.clamp(I_BM25_NGRAM_MIN, I_BM25_NGRAM_MAX);
+    let i_n_eff = i_n.max(1);
     let mut v_out: Vec<String> = Vec::new();
 
     for s_word in s_norm.split_whitespace() {
@@ -2408,15 +1941,16 @@ fn to_char_ngrams(s_text: &str, i_n: usize, s_boundary: &str) -> Vec<String> {
         }
 
         let s_w = format!("{}{}{}", s_boundary, s_word, s_boundary);
-        let i_len = s_w.len();
+        let v_chars: Vec<char> = s_w.chars().collect();
 
-        if i_len < i_n_eff {
+        if v_chars.len() < i_n_eff {
             v_out.push(s_w);
             continue;
         }
 
-        for i_pos in 0..=(i_len - i_n_eff) {
-            v_out.push(s_w[i_pos..i_pos + i_n_eff].to_string());
+        for i_pos in 0..=(v_chars.len() - i_n_eff) {
+            let s_part: String = v_chars[i_pos..i_pos + i_n_eff].iter().collect();
+            v_out.push(s_part);
         }
     }
 
@@ -2439,6 +1973,7 @@ fn bm25_scores(
     let d_avgdl = (i_sum_len.max(1) as f32) / (v_doc_lens.len().max(1) as f32);
 
     let mut h_df: HashMap<String, usize> = HashMap::new();
+
     for v_doc in v_docs_tokens.iter() {
         let mut h_seen: HashSet<&str> = HashSet::new();
         for s_term in v_doc.iter() {
@@ -2449,6 +1984,7 @@ fn bm25_scores(
     }
 
     let mut h_idf: HashMap<String, f32> = HashMap::new();
+
     for (s_term, i_df) in h_df.iter() {
         let d_df = *i_df as f32;
         let d_idf = ((i_n_docs - d_df + 0.5) / (d_df + 0.5) + 1.0).ln();
@@ -2456,6 +1992,7 @@ fn bm25_scores(
     }
 
     let mut v_tf: Vec<HashMap<&str, usize>> = Vec::with_capacity(v_docs_tokens.len());
+
     for v_doc in v_docs_tokens.iter() {
         let mut h_tf: HashMap<&str, usize> = HashMap::new();
         for s_t in v_doc.iter() {
@@ -2475,11 +2012,13 @@ fn bm25_scores(
             if i_f <= 0.0 {
                 continue;
             }
+
             let d_idf_t = *h_idf.get(s_term).unwrap_or(&0.0);
             let d_den = i_f + d_k1 * (1.0 - d_b + d_b * (i_dl / d_avgdl));
             if d_den <= 0.0 {
                 continue;
             }
+
             let d_num = d_idf_t * i_f * (d_k1 + 1.0);
             d_score += d_num / d_den;
         }
@@ -2522,4 +2061,187 @@ fn bm25_rerank_top_k(v_texts: &[(u64, String)], s_query: &str, i_k: usize) -> Ve
     v_out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
     v_out.truncate(i_k);
     v_out
+}
+
+fn compute_bm25_idf(i_df: usize, i_doc_count: usize) -> f32 {
+    let d_df = i_df.max(1) as f32;
+    let d_n = i_doc_count.max(1) as f32;
+    ((d_n - d_df + 0.5) / (d_df + 0.5) + 1.0).ln()
+}
+
+/**********************************************************************************************
+ * Beschreibung
+ * - Berechnet Kosinus Aehnlichkeit zweier Embeddings.
+ *
+ * Historie
+ * 17.05.2026   MS   - Funktion erstellt
+ **********************************************************************************************/
+
+pub fn cosine_similarity(v_left: &[f32], v_right: &[f32]) -> f32 {
+    if v_left.is_empty() || v_right.is_empty() {
+        return 0.0;
+    }
+
+    if v_left.len() != v_right.len() {
+        return 0.0;
+    }
+
+    let mut d_dot: f32 = 0.0;
+    let mut d_norm_left: f32 = 0.0;
+    let mut d_norm_right: f32 = 0.0;
+
+    for (d_l, d_r) in v_left.iter().zip(v_right.iter()) {
+        d_dot += d_l * d_r;
+        d_norm_left += d_l * d_l;
+        d_norm_right += d_r * d_r;
+    }
+
+    if d_norm_left <= 0.0 || d_norm_right <= 0.0 {
+        return 0.0;
+    }
+
+    d_dot / (d_norm_left.sqrt() * d_norm_right.sqrt())
+}
+
+/**********************************************************************************************
+ * Beschreibung
+ * - Parst boolesche Operatoren aus einer Query.
+ * - Unterstuetzt Beispiele:
+ *   - angebot AND 2026
+ *   - rechnung OR mahnung
+ *   - vertrag NOT alt
+ *
+ * Historie
+ * 17.05.2026   MS   - Funktion erstellt
+ **********************************************************************************************/
+
+fn parse_bool_query(s_query: &str) -> ParsedBoolQuery {
+    let v_tokens_raw: Vec<&str> = s_query.split_whitespace().collect();
+
+    let mut v_required_terms: Vec<String> = Vec::new();
+    let mut v_optional_terms: Vec<String> = Vec::new();
+    let mut v_excluded_terms: Vec<String> = Vec::new();
+
+    let mut o_pending_op: Option<BoolOp> = None;
+
+    for s_token_raw in v_tokens_raw.into_iter() {
+        let s_token_upper = s_token_raw.trim().to_ascii_uppercase();
+
+        if s_token_upper == "AND" || s_token_upper == "UND" {
+            o_pending_op = Some(BoolOp::And);
+            continue;
+        }
+
+        if s_token_upper == "OR" || s_token_upper == "ODER" {
+            o_pending_op = Some(BoolOp::Or);
+            continue;
+        }
+
+        if s_token_upper == "NOT" || s_token_upper == "NICHT" {
+            o_pending_op = Some(BoolOp::Not);
+            continue;
+        }
+
+        let s_term = normalize_for_match(s_token_raw);
+        if s_term.is_empty() {
+            continue;
+        }
+
+        match o_pending_op {
+            Some(BoolOp::And) => {
+                v_required_terms.push(s_term);
+            }
+            Some(BoolOp::Or) => {
+                v_optional_terms.push(s_term);
+            }
+            Some(BoolOp::Not) => {
+                v_excluded_terms.push(s_term);
+            }
+            None => {
+                v_required_terms.push(s_term);
+            }
+        }
+
+        o_pending_op = None;
+    }
+
+    v_required_terms.sort();
+    v_required_terms.dedup();
+    v_optional_terms.sort();
+    v_optional_terms.dedup();
+    v_excluded_terms.sort();
+    v_excluded_terms.dedup();
+
+    ParsedBoolQuery {
+        v_required_terms,
+        v_optional_terms,
+        v_excluded_terms,
+    }
+}
+
+fn build_lexical_query_from_bool(o_bool_query: &ParsedBoolQuery) -> String {
+    let mut v_terms: Vec<String> = Vec::new();
+
+    for s_term in o_bool_query.v_required_terms.iter() {
+        v_terms.push(s_term.clone());
+    }
+
+    for s_term in o_bool_query.v_optional_terms.iter() {
+        if !v_terms.contains(s_term) {
+            v_terms.push(s_term.clone());
+        }
+    }
+
+    v_terms.join(" ")
+}
+
+fn matches_bool_query(s_text: &str, o_bool_query: &ParsedBoolQuery) -> bool {
+    let s_norm = normalize_for_match(s_text);
+
+    if s_norm.is_empty() {
+        return false;
+    }
+
+    for s_term in o_bool_query.v_excluded_terms.iter() {
+        if contains_term(&s_norm, s_term) {
+            return false;
+        }
+    }
+
+    for s_term in o_bool_query.v_required_terms.iter() {
+        if !contains_term(&s_norm, s_term) {
+            return false;
+        }
+    }
+
+    if !o_bool_query.v_optional_terms.is_empty() {
+        let mut b_any_optional_match = false;
+
+        for s_term in o_bool_query.v_optional_terms.iter() {
+            if contains_term(&s_norm, s_term) {
+                b_any_optional_match = true;
+                break;
+            }
+        }
+
+        if o_bool_query.v_required_terms.is_empty() && !b_any_optional_match {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn contains_term(s_text_norm: &str, s_term_norm: &str) -> bool {
+    if s_text_norm.is_empty() || s_term_norm.is_empty() {
+        return false;
+    }
+
+    for s_word in s_text_norm.split_whitespace() {
+        if s_word == s_term_norm {
+            return true;
+        }
+    }
+
+    false
 }
