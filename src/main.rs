@@ -82,6 +82,7 @@ mod vector_idx;
 use crate::vector_idx::VecSearchHit;
 use crate::vector_idx::VectorIndex;
 use vector_idx::{load_or_init_index, persist_index};
+
 /* --- Eigene Importe IAM ------------------------------------------------------------------- */
 mod iam;
 mod iam_net;
@@ -99,7 +100,9 @@ pub mod embedding_backend;
 mod web_server;
 use crate::web_server::{
     run_web_server, web_command, web_doc_text_resp, web_ok_resp, web_peer_view,
-    web_search_dispatch_resp, web_search_hit, web_search_resp, web_shared_state, web_status_view, web_file_fetch_resp, web_docs_entry, I_EVENT_RING_MAX,
+    web_search_dispatch_resp, web_search_hit, web_search_resp, web_shared_state, web_status_view, web_file_fetch_resp, web_docs_entry, 
+    
+    I_EVENT_RING_MAX,
 };
 
 mod config;
