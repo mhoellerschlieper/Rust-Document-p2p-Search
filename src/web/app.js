@@ -7,6 +7,8 @@ Description
 - Compact SPA logic for ExpChat.ai FileButler.
 - Adds docs explorer across all peers including local peer.
 - Adds colorful icon aware button labels and safe docs explorer rendering.
+- Improves search result rendering with unified result card background, wrapped peer id,
+  filename before title, and title cleanup without duplicated filename.
 History
 2026-05-14  Marcus Schlieper
 - Full compact implementation with improved navigation and icon based UI handling
@@ -18,6 +20,11 @@ History
 - Added search result table model and enriched peer table model
 2026-05-16  Marcus Schlieper
 - Added docs explorer for all peers and local peer
+2026-05-18  Marcus Schlieper
+- Added utf8 safe snippet rendering, query hit highlighting and updated split layout support
+2026-05-19  Marcus Schlieper
+- Improved search result layout with consistent background, wrapped peer id,
+  filename before title, and removed duplicated filename from title
 ============================================================================================ */
 "use strict";
 
@@ -26,6 +33,7 @@ const api = {
     async json_get(s_url) {
         return await api._fetch_json(s_url, { method: "GET" });
     },
+
     async json_post(s_url, o_body) {
         return await api._fetch_json(s_url, {
             method: "POST",
@@ -33,10 +41,12 @@ const api = {
             body: JSON.stringify(o_body || {}),
         });
     },
+
     async _fetch_json(s_url, o_opts) {
         const o_ctrl = new AbortController();
         const i_timeout_ms = 10000;
         const i_timer_id = window.setTimeout(() => o_ctrl.abort(), i_timeout_ms);
+
         try {
             const o_resp = await fetch(s_url, { ...o_opts, signal: o_ctrl.signal, cache: "no-store" });
             if (!o_resp.ok) {
@@ -51,10 +61,12 @@ const api = {
                     s_error: "http_error_" + String(o_resp.status) + (s_body ? ": " + s_body.slice(0, 400) : ""),
                 };
             }
+
             const s_content_type = String(o_resp.headers.get("content-type") || "").toLowerCase();
             if (s_content_type.indexOf("application/json") < 0) {
                 return { b_ok: false, s_error: "unexpected_content_type" };
             }
+
             return await o_resp.json();
         } catch (o_err) {
             return {
@@ -139,6 +151,45 @@ function title_from_path(s_path) {
     const i_dot = s_name.lastIndexOf(".");
     const s_base = i_dot > 0 ? s_name.slice(0, i_dot) : s_name;
     return s_base.replace(/[_-]+/g, " ").trim() || s_name;
+}
+
+function clean_title_remove_file_name(s_title, s_file_name) {
+    const s_safe_title = String(s_title || "").trim();
+    const s_safe_file_name = String(s_file_name || "").trim();
+    if (!s_safe_title) {
+        return "";
+    }
+    if (!s_safe_file_name) {
+        return s_safe_title;
+    }
+
+    const i_dot = s_safe_file_name.lastIndexOf(".");
+    const s_file_without_ext = i_dot > 0 ? s_safe_file_name.slice(0, i_dot) : s_safe_file_name;
+
+    let s_result = s_safe_title;
+
+    if (s_result.toLowerCase() === s_safe_file_name.toLowerCase()) {
+        return "";
+    }
+
+    if (s_result.toLowerCase() === s_file_without_ext.toLowerCase()) {
+        return "";
+    }
+
+    s_result = s_result.replace(new RegExp("^" + escape_regex_literal(s_safe_file_name) + "\\s*[-:|]\\s*", "i"), "");
+    s_result = s_result.replace(new RegExp("^" + escape_regex_literal(s_file_without_ext) + "\\s*[-:|]\\s*", "i"), "");
+    s_result = s_result.replace(new RegExp("\\s*[-:|]\\s*" + escape_regex_literal(s_safe_file_name) + "$", "i"), "");
+    s_result = s_result.replace(new RegExp("\\s*[-:|]\\s*" + escape_regex_literal(s_file_without_ext) + "$", "i"), "");
+
+    if (s_result.trim().toLowerCase() === s_safe_file_name.toLowerCase()) {
+        return "";
+    }
+
+    if (s_result.trim().toLowerCase() === s_file_without_ext.toLowerCase()) {
+        return "";
+    }
+
+    return s_result.trim();
 }
 
 function classify_doc_from_path(s_path) {
@@ -264,8 +315,75 @@ function doc_icon_class_from_path(s_path) {
 
 function create_doc_icon_svg() {
     const o_wrap = document.createElement("div");
-    o_wrap.innerHTML = '<svg class="icon_svg" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6"></path></svg>';
+    o_wrap.innerHTML = "";
     return o_wrap.firstChild;
+}
+
+function decode_html_entities(s_text) {
+    const o_area = document.createElement("textarea");
+    o_area.innerHTML = String(s_text || "");
+    return o_area.value;
+}
+
+function normalize_snippet_text(s_text) {
+    return decode_html_entities(String(s_text || ""));
+}
+
+function escape_regex_literal(s_text) {
+    return String(s_text || "").replace(/[.*+?^${}()]|[$\$]/g, "\\$&");
+}
+
+function split_query_terms(s_query) {
+    const s_safe = safe_trim(s_query, 4096).toLowerCase();
+    if (!s_safe) {
+        return [];
+    }
+    return Array.from(new Set(
+        s_safe
+            .split(/\s+/)
+            .map((s_term) => s_term.trim())
+            .filter((s_term) => s_term.length >= 2)
+            .slice(0, 20)
+    ));
+}
+
+function append_highlighted_text(o_parent, s_text, v_terms) {
+    const s_input = String(s_text || "");
+    if (!v_terms || v_terms.length < 1) {
+        o_parent.textContent = s_input;
+        return;
+    }
+
+    const s_pattern = v_terms.map((s_term) => escape_regex_literal(s_term)).join("|");
+    if (!s_pattern) {
+        o_parent.textContent = s_input;
+        return;
+    }
+
+    const o_regex = new RegExp("(" + s_pattern + ")", "giu");
+    let i_last_index = 0;
+    let o_match = null;
+
+    while ((o_match = o_regex.exec(s_input)) !== null) {
+        const i_index = Number(o_match.index || 0);
+        const s_match = String(o_match[0] || "");
+        if (i_index > i_last_index) {
+            o_parent.appendChild(document.createTextNode(s_input.slice(i_last_index, i_index)));
+        }
+        const o_mark = document.createElement("mark");
+        o_mark.className = "snippet_hit";
+        o_mark.textContent = s_match;
+        o_parent.appendChild(o_mark);
+        i_last_index = i_index + s_match.length;
+
+        if (s_match.length < 1) {
+            break;
+        }
+    }
+
+    if (i_last_index < s_input.length) {
+        o_parent.appendChild(document.createTextNode(s_input.slice(i_last_index)));
+    }
 }
 
 let g_docs_last_requested = Object.create(null);
@@ -354,10 +472,8 @@ async function refresh_status() {
 function render_peers_table(v_peers) {
     const o_tb = by_id("peers_table");
     o_tb.innerHTML = "";
-
     const s_local_peer_id = String((opt_by_id("st_peer_id") && by_id("st_peer_id").textContent) || "-");
     const v_rows = [];
-
     v_rows.push({
         s_peer_id: s_local_peer_id,
         b_online: true,
@@ -369,7 +485,6 @@ function render_peers_table(v_peers) {
         s_last_online: "now",
         s_last_action: "local active",
     });
-
     if (Array.isArray(v_peers)) {
         v_peers.forEach((o_peer) => {
             const s_peer_id = String((o_peer && o_peer.s_peer_id) || "");
@@ -646,39 +761,63 @@ function render_search_results(v_hits, b_partial) {
         return;
     }
 
+    const s_query = String((opt_by_id("search_query") && by_id("search_query").value) || "");
+    const v_query_terms = split_query_terms(s_query);
+
     v_hits.forEach((o_hit) => {
         const s_doc = String((o_hit && o_hit.s_doc) || "");
         const s_peer = String((o_hit && o_hit.s_peer_id) || "");
         const d_score = Number((o_hit && o_hit.d_score) || 0);
-        const s_snippet = "";
-        const s_title = title_from_path(s_doc);
+        const s_snippet = normalize_snippet_text((o_hit && o_hit.s_snippet) || "");
         const s_file = safe_file_name_from_path(s_doc);
+        const s_raw_title = title_from_path(s_doc);
+        const s_title = clean_title_remove_file_name(s_raw_title, s_file);
         const s_peer_name = derive_peer_name(s_peer, false);
         const s_class = classify_doc_from_path(s_doc);
         const v_tags = build_tags_from_hit(o_hit);
 
-        const o_tr = document.createElement("tr");
+        const o_tr_title = document.createElement("tr");
+        o_tr_title.className = "search_result_row search_result_title_row";
 
         const o_td_title = document.createElement("td");
-        const o_title_wrap = document.createElement("div");
-        const o_title_main = document.createElement("div");
-        o_title_main.className = "result_title_main";
-        o_title_main.textContent = s_title;
-        const o_title_sub = document.createElement("div");
-        o_title_sub.className = "result_title_sub";
-        o_title_sub.textContent = s_snippet || "-";
-        o_title_wrap.appendChild(o_title_main);
-        o_title_wrap.appendChild(o_title_sub);
-        o_td_title.appendChild(o_title_wrap);
+        o_td_title.colSpan = 8;
+        o_td_title.className = "search_result_title_cell";
 
-        const o_td_file = document.createElement("td");
+        const o_title_wrap = document.createElement("div");
+        o_title_wrap.className = "result_title_wrap";
+
+        const o_file_row = document.createElement("div");
+        o_file_row.className = "result_file_row";
+
         const o_file_chip = document.createElement("span");
         o_file_chip.className = "file_chip";
         o_file_chip.textContent = s_file;
-        o_td_file.appendChild(o_file_chip);
+        o_file_row.appendChild(o_file_chip);
+
+        o_title_wrap.appendChild(o_file_row);
+
+        if (s_title) {
+            const o_title_main = document.createElement("div");
+            o_title_main.className = "result_title_main";
+            o_title_main.textContent = s_title;
+            o_title_wrap.appendChild(o_title_main);
+        }
+
+        o_td_title.appendChild(o_title_wrap);
+        o_tr_title.appendChild(o_td_title);
+
+        const o_tr_meta = document.createElement("tr");
+        o_tr_meta.className = "search_result_row search_result_meta_row";
+        o_tr_meta.addEventListener("click", async () => {
+            await fetch_doc_text(s_peer, s_doc);
+        });
+
+        const o_td_file = document.createElement("td");
+        o_td_file.className = "search_result_hidden_cell";
+        o_td_file.textContent = "";
 
         const o_td_peer = document.createElement("td");
-        o_td_peer.className = "mono";
+        o_td_peer.className = "mono search_peer_id_cell";
         o_td_peer.textContent = s_peer || "-";
 
         const o_td_peer_name = document.createElement("td");
@@ -734,19 +873,39 @@ function render_search_results(v_hits, b_partial) {
         o_actions.appendChild(o_btn_download);
         o_td_actions.appendChild(o_actions);
 
-        o_tr.addEventListener("click", async () => {
+        o_tr_meta.appendChild(o_td_file);
+        o_tr_meta.appendChild(o_td_peer);
+        o_tr_meta.appendChild(o_td_peer_name);
+        o_tr_meta.appendChild(o_td_score);
+        o_tr_meta.appendChild(o_td_tags);
+        o_tr_meta.appendChild(o_td_class);
+        o_tr_meta.appendChild(o_td_actions);
+
+        const o_tr_snippet = document.createElement("tr");
+        o_tr_snippet.className = "search_result_row search_result_snippet_row";
+        o_tr_snippet.addEventListener("click", async () => {
             await fetch_doc_text(s_peer, s_doc);
         });
 
-        o_tr.appendChild(o_td_title);
-        o_tr.appendChild(o_td_file);
-        o_tr.appendChild(o_td_peer);
-        o_tr.appendChild(o_td_peer_name);
-        o_tr.appendChild(o_td_score);
-        o_tr.appendChild(o_td_tags);
-        o_tr.appendChild(o_td_class);
-        o_tr.appendChild(o_td_actions);
-        o_tb.appendChild(o_tr);
+        const o_td_snippet = document.createElement("td");
+        o_td_snippet.colSpan = 8;
+        o_td_snippet.className = "search_result_snippet_cell";
+
+        const o_snippet_wrap = document.createElement("div");
+        o_snippet_wrap.className = "result_snippet_box";
+
+        if (s_snippet) {
+            append_highlighted_text(o_snippet_wrap, s_snippet, v_query_terms);
+        } else {
+            o_snippet_wrap.textContent = "-";
+        }
+
+        o_td_snippet.appendChild(o_snippet_wrap);
+        o_tr_snippet.appendChild(o_td_snippet);
+
+        o_tb.appendChild(o_tr_title);
+        o_tb.appendChild(o_tr_meta);
+        o_tb.appendChild(o_tr_snippet);
     });
 }
 
@@ -785,6 +944,7 @@ async function do_search() {
     set_text("search_id", "-");
     render_search_results([], true);
     clear_doc_view();
+
     const o_res = await api.json_post("/api/search/combi/dispatch", {
         s_query: s_query,
         i_limit: i_limit,
@@ -798,10 +958,12 @@ async function do_search() {
         toast("invalid_search_id");
         return;
     }
+
     g_last_search_id = i_search_id;
     set_text("search_id", String(i_search_id));
     set_text("search_poll_state", "polling");
     toast("search_dispatched");
+
     let i_ticks = 0;
     const i_max_ticks = 14;
     g_search_poll_timer = window.setInterval(async () => {
@@ -812,6 +974,7 @@ async function do_search() {
             set_text("search_poll_state", "stopped");
         }
     }, 450);
+
     await poll_search_result_once();
 }
 
@@ -1000,7 +1163,7 @@ function build_docs_from_local_and_peers(v_peers, s_local_peer_id) {
     if (s_search_query.length > 0) {
         v_seed_paths.push({
             s_peer_id: s_local_peer_id,
-            s_path: s_search_query.replace(/[^a-zA-Z0-9._\-\/ ]/g, "_") + ".txt",
+            s_path: s_search_query.replace(/[^a-zA-Z0-9._\-\ /]/g, "_") + ".txt",
         });
     }
 
@@ -1052,7 +1215,6 @@ function build_docs_from_local_and_peers(v_peers, s_local_peer_id) {
 function normalize_docs_rows(v_rows) {
     const h_seen = Object.create(null);
     const v_out = [];
-
     v_rows.forEach((o_row) => {
         const s_peer_id = String((o_row && o_row.s_peer_id) || "");
         const s_path = String((o_row && o_row.s_path) || "");
@@ -1076,7 +1238,6 @@ function normalize_docs_rows(v_rows) {
             b_local: !!o_row.b_local,
         });
     });
-
     v_out.sort((a, b) => {
         if (a.b_local && !b.b_local) {
             return -1;
@@ -1086,14 +1247,12 @@ function normalize_docs_rows(v_rows) {
         }
         return String(a.s_name).localeCompare(String(b.s_name));
     });
-
     return v_out;
 }
 
 function render_docs_explorer(v_rows) {
     const o_tb = by_id("docs_explorer_table");
     o_tb.innerHTML = "";
-
     if (!Array.isArray(v_rows) || v_rows.length < 1) {
         const o_tr = document.createElement("tr");
         const o_td = document.createElement("td");
@@ -1190,7 +1349,6 @@ function render_docs_explorer(v_rows) {
         o_tr.appendChild(o_td_created);
         o_tr.appendChild(o_td_last);
         o_tr.appendChild(o_td_download);
-
         o_tb.appendChild(o_tr);
     });
 }
@@ -1198,22 +1356,18 @@ function render_docs_explorer(v_rows) {
 async function refresh_docs_explorer() {
     const o_status = await api.json_get("/api/status");
     const v_peers = await api.json_get("/api/peers");
-
     let s_local_peer_id = "-";
     if (o_status && o_status.s_node_peer_id) {
         s_local_peer_id = String(o_status.s_node_peer_id);
     }
-
     let v_rows = [];
     v_rows = v_rows.concat(build_docs_from_local_and_peers(v_peers, s_local_peer_id));
-
     if (g_last_search_id && Number.isFinite(g_last_search_id)) {
         const o_search = await api.json_get("/api/search/combi/result/" + encodeURIComponent(String(g_last_search_id)));
         if (o_search && o_search.b_ok === true && Array.isArray(o_search.v_hits)) {
             v_rows = v_rows.concat(build_docs_from_search_hits(o_search.v_hits));
         }
     }
-
     render_docs_explorer(normalize_docs_rows(v_rows));
 }
 
@@ -1297,12 +1451,14 @@ async function refresh_iam_groups_select() {
     o_default.disabled = true;
     o_default.selected = true;
     o_select.appendChild(o_default);
+
     const v_groups = await api.json_get("/api/iam/groups");
     if (!Array.isArray(v_groups)) {
         const s_err = v_groups && v_groups.s_error ? String(v_groups.s_error) : "na";
         toast("groups_list_failed: " + s_err);
         return;
     }
+
     v_groups.forEach((o_group) => {
         const s_group = safe_trim((o_group && o_group.s_group) || "", 64);
         if (s_group.length < 1) {

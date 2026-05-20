@@ -17,6 +17,7 @@
  * - Normale Suche: Bool wirkt als Score.
  * - Explizite Bool Query: Bool wirkt als Score Filter.
  * - Explizites AND wird logarithmisch stark geboostet, damit sehr genaue Treffer dominieren.
+ * - Umlaute werden korrekt verarbeitet, gespeichert und im Snippet originalgetreu zurueckgeliefert.
  *
  * Historie
  * 13.11.2025   MS   - Ausgangsmodul fuer einfachen Vektor Index
@@ -28,6 +29,7 @@
  * 17.05.2026   MS   - Delta Reindexing fuer neue und geaenderte Dokumente ergaenzt
  * 17.05.2026   MS   - Bool Scoring fuer normale Suche und Bool Score Filter ergaenzt
  * 17.05.2026   MS   - Logarithmischer AND Boost fuer hochpraezise Treffer ergaenzt
+ * 19.05.2026   MS   - Unicode und Umlaute in Verarbeitung, Speicherung und Rueckgabe verbessert
  **********************************************************************************************/
 
 #![allow(clippy::needless_return)]
@@ -213,10 +215,10 @@ impl Default for NormalizationConfig {
     fn default() -> Self {
         return Self {
             b_to_lowercase: true,
-            b_ascii_only: true,
+            b_ascii_only: false,
             b_collapse_whitespace: true,
             b_keep_alphanumeric_only: true,
-            b_map_umlauts: true,
+            b_map_umlauts: false,
             v_stopwords: Vec::new(),
         };
     }
@@ -318,7 +320,7 @@ impl EmbeddingBackend for SimpleHashEmbeddingBackend {
                 -1.0f32
             };
 
-            let d_weight = 1.0f32 + (s_token.len() as f32 / 32.0f32);
+            let d_weight = 1.0f32 + (s_token.chars().count() as f32 / 32.0f32);
             v_out[i_idx] += d_sign * d_weight;
             i_non_zero = i_non_zero.saturating_add(1);
         }
@@ -388,20 +390,19 @@ impl InvertedIndexStore {
         s_gram: &str,
         v_postings: &[GramPostingRecord],
     ) -> std::io::Result<(String, u64)> {
-        /*
-        Beschreibung:
-        - Schreibt eine Posting Liste fuer genau ein 5 gram in eine eigene Datei.
-        - Format:
-          u32 count
-          count mal:
-            u64 chunk_id
-            u32 tf
-        - Die Datei liegt im Verzeichnis inv_idx.
-        - Der Rueckgabewert enthaelt den relativen Dateinamen und die Byte Laenge.
-
-        Historie:
-        - 17.05.2026   Marcus Schlieper   - Umstellung von Sammeldatei auf invertierten Dateindex
-        */
+        /* Beschreibung:
+         * - Schreibt eine Posting Liste fuer genau ein 5 gram in eine eigene Datei.
+         * - Format:
+         *   u32 count
+         *   count mal:
+         *     u64 chunk_id
+         *     u32 tf
+         * - Die Datei liegt im Verzeichnis inv_idx.
+         * - Der Rueckgabewert enthaelt den relativen Dateinamen und die Byte Laenge.
+         *
+         * Historie:
+         * - 17.05.2026   Marcus Schlieper   - Umstellung von Sammeldatei auf invertierten Dateindex
+         */
         if s_gram.is_empty() {
             return Err(Error::new(ErrorKind::InvalidInput, "gram_empty"));
         }
@@ -1058,8 +1059,8 @@ impl VectorIndex {
     pub fn load_dictionary_json(&self, p_file: &Path) -> Result<(), String> {
         let s_json =
             fs::read_to_string(p_file).map_err(|_| "dictionary_json_read_failed".to_string())?;
-        let o_cfg: DictionaryConfig =
-            serde_json::from_str(&s_json).map_err(|_| "dictionary_json_parse_failed".to_string())?;
+        let o_cfg: DictionaryConfig = serde_json::from_str(&s_json)
+            .map_err(|_| "dictionary_json_parse_failed".to_string())?;
 
         let mut h_terms = self
             .h_dictionary_terms
@@ -1103,10 +1104,10 @@ impl VectorIndex {
                 &s_word,
                 &NormalizationConfig {
                     b_to_lowercase: true,
-                    b_ascii_only: true,
+                    b_ascii_only: false,
                     b_collapse_whitespace: true,
                     b_keep_alphanumeric_only: true,
-                    b_map_umlauts: true,
+                    b_map_umlauts: false,
                     v_stopwords: Vec::new(),
                 },
             );
@@ -1312,7 +1313,7 @@ impl VectorIndex {
             .iter_all_chunk_ids()
             .into_iter()
             .take(i_limit)
-            .collect::<Vec<_>>();
+            .collect::<Vec<ChunkId>>();
 
         if !v_chunk_ids.is_empty() {
             let _ = self.o_bg.tx.send(IndexJob::ReprojectDirty { v_chunk_ids });
@@ -1320,16 +1321,15 @@ impl VectorIndex {
     }
 
     pub fn sync(self: &Arc<Self>, root: &Path) {
-        /*
-        Beschreibung:
-        - Dateisystem Sync arbeitet delta basiert.
-        - Nur neue oder geaenderte Dokumente werden neu indexiert.
-        - Unveraenderte Dokumente bleiben unangetastet.
-        - Fehlende Dokumente werden soft geloescht und aus den betroffenen Teilindizes entfernt.
-
-        Historie:
-        - 17.05.2026   Marcus Schlieper   - Zyklisches Delta Sync statt Vollrebuild
-        */
+        /* Beschreibung:
+         * - Dateisystem Sync arbeitet delta basiert.
+         * - Nur neue oder geaenderte Dokumente werden neu indexiert.
+         * - Unveraenderte Dokumente bleiben unangetastet.
+         * - Fehlende Dokumente werden soft geloescht und aus den betroffenen Teilindizes entfernt.
+         *
+         * Historie:
+         * - 17.05.2026   Marcus Schlieper   - Zyklisches Delta Sync statt Vollrebuild
+         */
         let mut v_jobs: Vec<(PathBuf, PayloadMap)> = Vec::new();
         Self::crawl_collect(root, &mut v_jobs);
 
@@ -1351,7 +1351,15 @@ impl VectorIndex {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+            
+        // check change in DateTime
+        if let Some(o_old) = self.doc_store.get_source_state(&s_doc_path) {
+            if o_old.i_last_modified_ts == i_modified_ts {
+               return Ok(());
+            }
+        }
 
+           
         let s_text = extract_doc_text(p_path).map_err(|_| "extract_doc_text_failed".to_string())?;
         if s_text.trim().is_empty() {
             return Err("empty_document".to_string());
@@ -1359,12 +1367,14 @@ impl VectorIndex {
 
         let a_sha256 = DocStore::compute_source_hash(&s_text);
 
+        // check change in context
         if let Some(o_old) = self.doc_store.get_source_state(&s_doc_path) {
-            if o_old.i_last_modified_ts == i_modified_ts && o_old.a_sha256 == a_sha256 {
+            if o_old.a_sha256 == a_sha256 {
                 return Ok(());
             }
         }
 
+        // new document
         let o_doc = self.doc_store.upsert_document_meta(&s_doc_path, payload.clone());
         let v_old_chunk_ids = self.doc_store.list_chunk_ids_by_doc(o_doc.i_doc_id);
 
@@ -1838,16 +1848,16 @@ impl VectorIndex {
     }
 
     fn refresh_grams_incremental(&self, h_dirty_grams: &HashSet<String>) -> Result<(), String> {
-        /*
-        Beschreibung:
-        - Aktualisiert nur die Posting Dateien der betroffenen 5 gram Terme.
-        - Neue Dokumente ergaenzen bestehende Indizes.
-        - Geaenderte Dokumente ersetzen nur ihre eigenen Chunk Eintraege innerhalb der betroffenen Terme.
-        - Leere Posting Listen loeschen die zugehoerige Posting Datei und Metadaten.
-
-        Historie:
-        - 17.05.2026   Marcus Schlieper   - Delta Update fuer invertierten Dateindex
-        */
+        /* Beschreibung:
+         * - Aktualisiert nur die Posting Dateien der betroffenen 5 gram Terme.
+         * - Neue Dokumente ergaenzen bestehende Indizes.
+         * - Geaenderte Dokumente ersetzen nur ihre eigenen Chunk Eintraege innerhalb der betroffenen Terme.
+         * - Leere Posting Listen loeschen die zugehoerige Posting Datei und Metadaten.
+         *
+         * Historie:
+         * - 17.05.2026   Marcus Schlieper   - Delta Update fuer invertierten Dateindex
+         * - 19.05.2026   Marcus Schlieper   - Unicode faehige Grams bleiben unveraendert erhalten
+         */
         if h_dirty_grams.is_empty() {
             return Ok(());
         }
@@ -2022,17 +2032,17 @@ impl VectorIndex {
     }
 
     fn compute_bool_soft_score(&self, s_text: &str, o_bool_query: &ParsedBoolQuery) -> f32 {
-        /*
-        Beschreibung:
-        - Berechnet einen weichen Bool Score fuer normale Suche und explizite Bool Query.
-        - Der Score liegt zwischen 0.0 und 1.0.
-        - Required Treffer erhoehen den Score.
-        - Fehlende Required Begriffe und ausgeschlossene Begriffe senken den Score.
-
-        Historie:
-        - 17.05.2026   Marcus Schlieper   - Erste Version fuer weiches Bool Ranking
-        - 17.05.2026   Marcus Schlieper   - Grundlage fuer logarithmischen AND Boost
-        */
+        /* Beschreibung:
+         * - Berechnet einen weichen Bool Score fuer normale Suche und explizite Bool Query.
+         * - Der Score liegt zwischen 0.0 und 1.0.
+         * - Required Treffer erhoehen den Score.
+         * - Fehlende Required Begriffe und ausgeschlossene Begriffe senken den Score.
+         *
+         * Historie:
+         * - 17.05.2026   Marcus Schlieper   - Erste Version fuer weiches Bool Ranking
+         * - 17.05.2026   Marcus Schlieper   - Grundlage fuer logarithmischen AND Boost
+         * - 19.05.2026   Marcus Schlieper   - Unicode weiche Termpruefung fuer Umlaute verbessert
+         */
         let s_norm = self.apply_dictionary_replacements(s_text);
         if s_norm.is_empty() {
             return 0.0;
@@ -2085,16 +2095,15 @@ impl VectorIndex {
     }
 
     fn compute_and_log_boost_factor(&self, s_text: &str, o_bool_query: &ParsedBoolQuery) -> f32 {
-        /*
-        Beschreibung:
-        - Bei expliziten AND Queries wird die Praezision stark bevorzugt.
-        - Wenn alle Required Terms gefunden werden, steigt der Faktor logarithmisch deutlich.
-        - Bei Teiltreffern wird der Faktor stark abgesenkt.
-        - Ziel ist, dass exakte AND Treffer praktisch alle anderen Dokumente dominieren.
-
-        Historie:
-        - 17.05.2026   Marcus Schlieper   - Logarithmischer AND Boost fuer praezise Bool Queries
-        */
+        /* Beschreibung:
+         * - Bei expliziten AND Queries wird die Praezision stark bevorzugt.
+         * - Wenn alle Required Terms gefunden werden, steigt der Faktor logarithmisch deutlich.
+         * - Bei Teiltreffern wird der Faktor stark abgesenkt.
+         * - Ziel ist, dass exakte AND Treffer praktisch alle anderen Dokumente dominieren.
+         *
+         * Historie:
+         * - 17.05.2026   Marcus Schlieper   - Logarithmischer AND Boost fuer praezise Bool Queries
+         */
         if o_bool_query.i_and_term_count == 0 || o_bool_query.v_required_terms.is_empty() {
             return 1.0;
         }
@@ -2420,27 +2429,34 @@ fn normalize_text_default(s_in: &str) -> String {
     normalize_text_with_config(s_in, &NormalizationConfig::default())
 }
 
+fn map_umlauts_ascii_fallback(s_in: &str) -> String {
+    return s_in.to_owned();
+        
+}
+
 fn normalize_text_with_config(s_in: &str, o_cfg: &NormalizationConfig) -> String {
     let mut s_work = s_in.to_string();
 
-    if o_cfg.b_to_lowercase {
-        s_work = s_work.to_lowercase();
+    if o_cfg.b_map_umlauts {
+        s_work = map_umlauts_ascii_fallback(&s_work);
     }
 
-    if o_cfg.b_map_umlauts {
-        s_work = s_work
-            .replace("ae", "ae")
-            .replace("oe", "oe")
-            .replace("ue", "ue")
-            .replace("ss", "ss");
+    if o_cfg.b_to_lowercase {
+        s_work = s_work.to_lowercase();
     }
 
     let mut s_out = String::with_capacity(s_work.len().min(I_SNIPPET_SCAN_MAX_LEN));
     let mut b_prev_space = false;
 
     for ch in s_work.chars().take(I_SNIPPET_SCAN_MAX_LEN) {
-        let b_keep = if o_cfg.b_keep_alphanumeric_only {
+        let b_alpha_num = if o_cfg.b_ascii_only {
             ch.is_ascii_alphanumeric()
+        } else {
+            ch.is_alphanumeric()
+        };
+
+        let b_keep = if o_cfg.b_keep_alphanumeric_only {
+            b_alpha_num
         } else {
             !ch.is_control()
         };
@@ -2512,7 +2528,7 @@ fn extract_query_tokens(s_query: &str) -> Vec<String> {
     let mut v_out: Vec<String> = Vec::new();
 
     for s_t in s_norm.split_whitespace() {
-        if s_t.len() >= 2 {
+        if s_t.chars().count() >= 2 {
             v_out.push(s_t.to_string());
         }
     }
@@ -2536,21 +2552,37 @@ fn build_snippet_for_query(s_text: &str, s_query: &str) -> String {
         return s_text_trim.chars().take(I_SNIPPET_MAX_LEN).collect::<String>();
     }
 
-    let mut i_best_pos: Option<usize> = None;
+    let mut i_best_char_pos_norm: Option<usize> = None;
+    let v_norm_chars: Vec<char> = s_norm.chars().collect();
+
     for s_t in &v_q {
-        if let Some(i_pos) = s_norm.find(s_t) {
-            i_best_pos = match i_best_pos {
-                None => Some(i_pos),
-                Some(i_old) => Some(i_old.min(i_pos)),
-            };
+        let s_t_chars: Vec<char> = s_t.chars().collect();
+        if s_t_chars.is_empty() || s_t_chars.len() > v_norm_chars.len() {
+            continue;
+        }
+
+        for i_pos in 0..=(v_norm_chars.len() - s_t_chars.len()) {
+            let b_match = v_norm_chars[i_pos..i_pos + s_t_chars.len()]
+                .iter()
+                .copied()
+                .eq(s_t_chars.iter().copied());
+            if b_match {
+                i_best_char_pos_norm = match i_best_char_pos_norm {
+                    None => Some(i_pos),
+                    Some(i_old) => Some(i_old.min(i_pos)),
+                };
+                break;
+            }
         }
     }
 
-    let Some(i_pos_norm) = i_best_pos else {
+    let Some(i_pos_norm) = i_best_char_pos_norm else {
         return s_text_trim.chars().take(I_SNIPPET_MAX_LEN).collect::<String>();
     };
 
-    let d_ratio = (s_text_trim.len().max(1) as f64) / (s_norm.len().max(1) as f64);
+    let i_text_len = s_text_trim.chars().count().max(1);
+    let i_norm_len = s_norm.chars().count().max(1);
+    let d_ratio = (i_text_len as f64) / (i_norm_len as f64);
     let i_pos_orig = ((i_pos_norm as f64) * d_ratio) as usize;
     let i_half = I_SNIPPET_MAX_LEN / 2;
     let i_start = i_pos_orig.saturating_sub(i_half);
@@ -2563,7 +2595,7 @@ fn build_snippet_for_query(s_text: &str, s_query: &str) -> String {
 
     s_slice
         .split_whitespace()
-        .collect::<Vec<_>>()
+        .collect::<Vec<&str>>()
         .join(" ")
 }
 
@@ -2803,14 +2835,14 @@ fn contains_term(s_text_norm: &str, s_term_norm: &str) -> bool {
 }
 
 fn contains_term_soft(s_text_norm: &str, s_term_norm: &str) -> bool {
-    /*
-    Beschreibung:
-    - Weiche Termpruefung fuer Bool Scoring.
-    - Exakter Worttreffer ist positiv.
-    - Prefix Treffer ist positiv.
-    - Gemeinsame 5 gram Treffer sind positiv.
-    - So bleiben Angebot und Angebote in der Bool Bewertung verwandt.
-    */
+    /* Beschreibung:
+     * - Weiche Termpruefung fuer Bool Scoring.
+     * - Exakter Worttreffer ist positiv.
+     * - Prefix Treffer ist positiv.
+     * - Gemeinsame 5 gram Treffer sind positiv.
+     * - So bleiben Angebot und Angebote in der Bool Bewertung verwandt.
+     * - Unicode Begriffe wie fuer, loesung, kueche oder straeusse werden sauber behandelt.
+     */
     if s_text_norm.is_empty() || s_term_norm.is_empty() {
         return false;
     }

@@ -7,11 +7,12 @@
  *  - Axum based web server for secure_p2p_ext web UI.
  *  - Provides a small REST API used by app.js and serves the static UI assets.
  *  - Uses a command bridge (tokio mpsc) to forward requests into the main event loop.
- *  - Adds IAM groups listing endpoint GET /api/iam/groups (JSON array).
+ *  - Supports unicode search queries and returns utf-8 JSON responses, including Umlaute.
  *
  *  History
  *  2026-01-11  Marcus Schlieper  - Initial web server module: API endpoints + static files
  *  2026-01-11  Marcus Schlieper  - Add: /api/iam/groups and unified router state type
+ *  2026-05-19  Marcus Schlieper  - Fix compile errors and enable unicode safe search handling
  **********************************************************************************************/
 
 #![allow(dead_code)]
@@ -19,12 +20,11 @@
 
 use axum::{
     extract::{Path as AxumPath, State},
-    http::{header, HeaderMap, StatusCode,HeaderValue},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
@@ -33,7 +33,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, oneshot};
-use tokio::net::TcpListener;
 
 /* ============================================================================================
  * Constants
@@ -43,7 +42,7 @@ use tokio::net::TcpListener;
 pub const I_EVENT_RING_MAX: usize = 200;
 
 /* ============================================================================================
- * DTOs (web views)
+ * DTOs
  * ============================================================================================
  */
 
@@ -126,16 +125,15 @@ pub struct web_docs_entry {
     pub s_status: String,
     pub s_availability: String,
 }
-/* --- NEW request DTO --------------------------------------------------------------------- */
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct req_doc_text_get {
     pub s_peer_id: String,
     pub s_path: String,
 }
 
-
 /* ============================================================================================
- * Shared state (owned by main, mirrored for web UI)
+ * Shared state
  * ============================================================================================
  */
 
@@ -159,10 +157,6 @@ pub struct web_doc_state {
     pub s_text: String,
     pub s_error: String,
 }
-
-/* ============================================================================================
- * Shared state
- * ============================================================================================ */
 
 #[derive(Clone, Debug)]
 pub struct web_file_state {
@@ -202,6 +196,7 @@ impl web_shared_state {
             h_file_cache: HashMap::new(),
         }
     }
+
     pub fn push_event(&mut self, s_event: String) {
         self.v_event_ring.push_back(s_event);
         while self.v_event_ring.len() > I_EVENT_RING_MAX {
@@ -213,7 +208,9 @@ impl web_shared_state {
         if let Some(st) = self.h_search_cache.get_mut(&i_search_id) {
             st.v_hits.append(&mut v_hits);
             st.v_hits.sort_by(|a, b| {
-                b.d_score.partial_cmp(&a.d_score).unwrap_or(std::cmp::Ordering::Equal)
+                b.d_score
+                    .partial_cmp(&a.d_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
             if st.v_hits.len() > st.i_limit {
                 st.v_hits.truncate(st.i_limit);
@@ -245,7 +242,6 @@ impl web_shared_state {
         self.h_search_cache.get(&i_search_id).map(|st| st.v_hits.len())
     }
 
-    
     pub fn search_cache_get(&self, i_search_id: u64) -> Option<web_search_state> {
         self.h_search_cache.get(&i_search_id).cloned()
     }
@@ -300,6 +296,7 @@ impl web_shared_state {
             );
         }
     }
+
     pub fn file_cache_insert_pending(
         &mut self,
         i_req_id: u64,
@@ -367,78 +364,72 @@ pub struct web_file_fetch_resp {
 }
 
 /* ============================================================================================
- * Command bridge (web -> main)
+ * Command bridge
  * ============================================================================================
  */
 
 #[derive(Debug)]
 pub enum web_command {
     status_get {
-        tx: tokio::sync::oneshot::Sender<web_status_view>,
+        tx: oneshot::Sender<web_status_view>,
     },
     peers_get {
-        tx: tokio::sync::oneshot::Sender<Vec<web_peer_view>>,
+        tx: oneshot::Sender<Vec<web_peer_view>>,
     },
     events_get {
-        tx: tokio::sync::oneshot::Sender<Vec<String>>,
+        tx: oneshot::Sender<Vec<String>>,
     },
-
     docs_explorer_get {
-        tx: tokio::sync::oneshot::Sender<Vec<web_docs_entry>>,
+        tx: oneshot::Sender<Vec<web_docs_entry>>,
     },
-
     p2p_connect_by_peer_id {
         s_peer_id: String,
-        tx: tokio::sync::oneshot::Sender<web_ok_resp>,
+        tx: oneshot::Sender<web_ok_resp>,
     },
     p2p_send_text {
         s_text: String,
-        tx: tokio::sync::oneshot::Sender<web_ok_resp>,
+        tx: oneshot::Sender<web_ok_resp>,
     },
-
     search_network_combi_dispatch {
         s_query: String,
         i_limit: usize,
-        tx: tokio::sync::oneshot::Sender<web_search_dispatch_resp>,
+        tx: oneshot::Sender<web_search_dispatch_resp>,
     },
     search_network_combi_get {
         i_search_id: u64,
-        tx: tokio::sync::oneshot::Sender<web_search_resp>,
+        tx: oneshot::Sender<web_search_resp>,
     },
-
     doc_text_get {
         s_peer_id: String,
         s_path: String,
-        tx: tokio::sync::oneshot::Sender<web_doc_text_resp>,
+        tx: oneshot::Sender<web_doc_text_resp>,
     },
-
     file_fetch_get {
         s_peer_id: String,
         s_path: String,
-        tx: tokio::sync::oneshot::Sender<web_file_fetch_resp>,
+        tx: oneshot::Sender<web_file_fetch_resp>,
     },
     file_fetch_result_get {
         i_req_id: u64,
-        tx: tokio::sync::oneshot::Sender<web_file_fetch_resp>,
+        tx: oneshot::Sender<web_file_fetch_resp>,
     },
-
     iam_login_local {
         s_user: String,
         s_password: String,
-        tx: tokio::sync::oneshot::Sender<web_login_resp>,
+        tx: oneshot::Sender<web_login_resp>,
     },
     iam_group_add {
         s_actor: String,
         s_group: String,
         s_rights: String,
-        tx: tokio::sync::oneshot::Sender<web_ok_resp>,
+        tx: oneshot::Sender<web_ok_resp>,
     },
     iam_user_add {
         s_actor: String,
         s_user: String,
         s_password: String,
         s_group: String,
-        tx: tokio::sync::oneshot::Sender<web_ok_resp>,
+        tx: oneshot::Sender<web_ok_resp>,
     },
     iam_path_add {
         s_actor: String,
@@ -446,32 +437,23 @@ pub enum web_command {
         s_group_or_dash: String,
         b_public: bool,
         s_rights: String,
-        tx: tokio::sync::oneshot::Sender<web_ok_resp>,
+        tx: oneshot::Sender<web_ok_resp>,
     },
-
     iam_groups_get {
-        tx: tokio::sync::oneshot::Sender<Vec<web_iam_group_view>>,
+        tx: oneshot::Sender<Vec<web_iam_group_view>>,
     },
 }
 
-async fn route_api_docs_explorer(State(ctx): State<web_server_ctx>) -> Response {
-    match cmd_roundtrip(&ctx.tx_web_cmd, |tx| web_command::docs_explorer_get { tx }).await {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(_) => json_err("docs_explorer_failed", StatusCode::INTERNAL_SERVER_ERROR),
-    }
-}
 /* ============================================================================================
- * Router state (axum state must be consistent)
+ * Router state
  * ============================================================================================
  */
-
 
 #[derive(Clone)]
 pub struct web_server_ctx {
     pub tx_web_cmd: mpsc::Sender<web_command>,
     pub st_web: Arc<Mutex<web_shared_state>>,
 }
-
 
 /* ============================================================================================
  * Request DTOs
@@ -483,6 +465,7 @@ pub struct req_file_fetch_get {
     pub s_peer_id: String,
     pub s_path: String,
 }
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct req_p2p_connect {
     pub s_peer_id: String,
@@ -526,6 +509,12 @@ pub struct req_iam_path_add {
     pub s_rights: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct web_search_dispatch_req {
+    pub s_query: String,
+    pub i_limit: Option<u32>,
+}
+
 /* ============================================================================================
  * Utilities
  * ============================================================================================
@@ -540,8 +529,8 @@ fn now_ms() -> u64 {
 
 fn safe_trim(s_in: &str, i_max_len: usize) -> String {
     let s_t = s_in.trim();
-    if s_t.len() > i_max_len {
-        return s_t[..i_max_len].to_string();
+    if s_t.chars().count() > i_max_len {
+        return s_t.chars().take(i_max_len).collect();
     }
     s_t.to_string()
 }
@@ -556,17 +545,41 @@ fn is_reasonable_ascii(s: &str) -> bool {
     s.chars().all(|c| c.is_ascii() && (c.is_ascii_graphic() || c == ' '))
 }
 
-fn parse_limit_clamped(i_limit: i64, i_min: i64, i_max: i64, i_fallback: i64) -> i64 {
-    if i_limit < i_min {
-        return i_min;
+fn validate_search_query_or_err(s_query: &str) -> Result<String, String> {
+    let s_t = s_query.trim();
+
+    if s_t.is_empty() {
+        return Err("empty_query".to_string());
     }
-    if i_limit > i_max {
-        return i_max;
+
+    if s_t.chars().count() > 4096 {
+        return Err("query_too_long".to_string());
     }
-    if i_limit == 0 {
-        return i_fallback;
+
+    for ch in s_t.chars() {
+        if ch.is_control() {
+            return Err("query_has_control_chars".to_string());
+        }
     }
-    i_limit
+
+    Ok(s_t.to_string())
+}
+
+fn clamp_limit(o_limit: Option<u32>) -> usize {
+    let i_default: u32 = 10;
+    let i_min: u32 = 1;
+    let i_max: u32 = 50;
+
+    let mut i_v = o_limit.unwrap_or(i_default);
+
+    if i_v < i_min {
+        i_v = i_min;
+    }
+    if i_v > i_max {
+        i_v = i_max;
+    }
+
+    i_v as usize
 }
 
 fn json_err(s_error: &str, i_status: StatusCode) -> Response {
@@ -577,36 +590,24 @@ fn json_err(s_error: &str, i_status: StatusCode) -> Response {
     (i_status, Json(resp)).into_response()
 }
 
-async fn cmd_roundtrip<T: Send + 'static>(
+async fn cmd_roundtrip<T>(
     tx_web_cmd: &mpsc::Sender<web_command>,
     mk_cmd: impl FnOnce(oneshot::Sender<T>) -> web_command,
-) -> Result<T, String> {
+) -> Result<T, String>
+where
+    T: Send + 'static,
+{
     let (tx, rx) = oneshot::channel::<T>();
+
     tx_web_cmd
         .send(mk_cmd(tx))
         .await
         .map_err(|_| "web_cmd_send_failed".to_string())?;
+
     rx.await.map_err(|_| "web_cmd_recv_failed".to_string())
 }
 
-/* ============================================================================================
- * Static files (embedded placeholders)
- *
- * NOTE:
- * - In a production setup, these should be served from disk or embedded via include_str!.
- * - This module provides minimal placeholders to keep the server self contained.
- * ============================================================================================
- */
-/* ==========================================================================================
- * Cache control helper
- * ========================================================================================== */
-
 fn no_cache_headers() -> HeaderMap {
-    // Defensive caching strategy for dev consoles:
-    // - no-store: do not store in any cache
-    // - no-cache: must revalidate
-    // - max-age=0: immediately stale
-    // - pragma/expires: legacy compatibility
     let mut h = HeaderMap::new();
     h.insert(
         "Cache-Control",
@@ -617,12 +618,12 @@ fn no_cache_headers() -> HeaderMap {
     h
 }
 
-/* ==========================================================================================
- * Static endpoints (requested to be re-integrated)
- * ========================================================================================== */
+/* ============================================================================================
+ * Static endpoints
+ * ============================================================================================
+ */
 
 async fn api_static_index() -> impl IntoResponse {
-    // text/html is set by Html wrapper
     (no_cache_headers(), Html(include_str!("./web/index.html"))).into_response()
 }
 
@@ -632,19 +633,17 @@ async fn api_static_app_js() -> impl IntoResponse {
         "Content-Type",
         HeaderValue::from_static("application/javascript; charset=utf-8"),
     );
-
     (h, (StatusCode::OK, include_str!("./web/app.js"))).into_response()
 }
 
 async fn api_static_app_css() -> impl IntoResponse {
     let mut h = no_cache_headers();
     h.insert("Content-Type", HeaderValue::from_static("text/css; charset=utf-8"));
-
     (h, (StatusCode::OK, include_str!("./web/app.css"))).into_response()
 }
 
 /* ============================================================================================
- * Route handlers: API
+ * Route handlers
  * ============================================================================================
  */
 
@@ -669,8 +668,19 @@ async fn route_api_events(State(ctx): State<web_server_ctx>) -> Response {
     }
 }
 
-async fn route_api_p2p_connect(State(ctx): State<web_server_ctx>, Json(req): Json<req_p2p_connect>) -> Response {
+async fn route_api_docs_explorer(State(ctx): State<web_server_ctx>) -> Response {
+    match cmd_roundtrip(&ctx.tx_web_cmd, |tx| web_command::docs_explorer_get { tx }).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(_) => json_err("docs_explorer_failed", StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn route_api_p2p_connect(
+    State(ctx): State<web_server_ctx>,
+    Json(req): Json<req_p2p_connect>,
+) -> Response {
     let s_peer_id = safe_trim(&req.s_peer_id, 256);
+
     if s_peer_id.len() < 4 || !is_reasonable_ascii(&s_peer_id) {
         return json_err("invalid_peer_id", StatusCode::BAD_REQUEST);
     }
@@ -686,60 +696,29 @@ async fn route_api_p2p_connect(State(ctx): State<web_server_ctx>, Json(req): Jso
     }
 }
 
-async fn route_api_p2p_send_text(State(ctx): State<web_server_ctx>, Json(req): Json<req_p2p_send_text>) -> Response {
+async fn route_api_p2p_send_text(
+    State(ctx): State<web_server_ctx>,
+    Json(req): Json<req_p2p_send_text>,
+) -> Response {
     let s_text = safe_trim(&req.s_text, 10000);
-    if s_text.is_empty() || !is_reasonable_ascii(&s_text) {
+
+    if s_text.is_empty() {
         return json_err("invalid_text", StatusCode::BAD_REQUEST);
     }
 
-    match cmd_roundtrip(&ctx.tx_web_cmd, |tx| web_command::p2p_send_text { s_text: s_text.clone(), tx }).await {
+    if s_text.chars().any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t') {
+        return json_err("invalid_text", StatusCode::BAD_REQUEST);
+    }
+
+    match cmd_roundtrip(&ctx.tx_web_cmd, |tx| web_command::p2p_send_text {
+        s_text: s_text.clone(),
+        tx,
+    })
+    .await
+    {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(_) => json_err("send_failed", StatusCode::INTERNAL_SERVER_ERROR),
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct web_search_dispatch_req {
-    pub s_query: String,
-    pub i_limit: Option<u32>,
-}
-
-fn validate_search_query_or_err(s_query: &str) -> Result<String, String> {
-    let s_t = s_query.trim();
-    if s_t.is_empty() {
-        return Err("empty_query".to_string());
-    }
-
-    /* Defensive: bound by chars, not bytes; unicode allowed. */
-    let i_max_chars: usize = 4096;
-    if s_t.chars().count() > i_max_chars {
-        return Err("query_too_long".to_string());
-    }
-
-    /* Defensive: reject control chars. */
-    for ch in s_t.chars() {
-        if ch.is_control() {
-            return Err("query_has_control_chars".to_string());
-        }
-    }
-
-    Ok(s_t.to_string())
-}
-
-fn clamp_limit(o_limit: Option<u32>) -> usize {
-    let i_default: u32 = 10;
-    let i_min: u32 = 1;
-    let i_max: u32 = 50;
-
-    let mut i_v = o_limit.unwrap_or(i_default);
-    if i_v < i_min {
-        i_v = i_min;
-    }
-    if i_v > i_max {
-        i_v = i_max;
-    }
-
-    i_v as usize
 }
 
 pub async fn route_api_search_combi_dispatch(
@@ -760,7 +739,6 @@ pub async fn route_api_search_combi_dispatch(
 
     let i_limit: usize = clamp_limit(req.i_limit);
 
-    /* Optional diagnostic event; keep ASCII-only log message. */
     {
         let mut g = match ctx.st_web.lock() {
             Ok(guard) => guard,
@@ -781,8 +759,7 @@ pub async fn route_api_search_combi_dispatch(
         ));
     }
 
-    /* Bridge to main via web_command. */
-    let (tx, rx) = tokio::sync::oneshot::channel::<web_search_dispatch_resp>();
+    let (tx, rx) = oneshot::channel::<web_search_dispatch_resp>();
 
     let cmd = web_command::search_network_combi_dispatch {
         s_query,
@@ -822,13 +799,21 @@ async fn route_api_search_combi_result(
     State(ctx): State<web_server_ctx>,
     AxumPath(i_search_id): AxumPath<u64>,
 ) -> Response {
-    match cmd_roundtrip(&ctx.tx_web_cmd, |tx| web_command::search_network_combi_get { i_search_id, tx }).await {
+    match cmd_roundtrip(&ctx.tx_web_cmd, |tx| web_command::search_network_combi_get {
+        i_search_id,
+        tx,
+    })
+    .await
+    {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(_) => json_err("search_get_failed", StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
-async fn route_api_iam_login(State(ctx): State<web_server_ctx>, Json(req): Json<req_iam_login>) -> Response {
+async fn route_api_iam_login(
+    State(ctx): State<web_server_ctx>,
+    Json(req): Json<req_iam_login>,
+) -> Response {
     let s_user = safe_trim(&req.s_user, 64);
     let s_password = safe_trim(&req.s_password, 256);
 
@@ -851,7 +836,10 @@ async fn route_api_iam_login(State(ctx): State<web_server_ctx>, Json(req): Json<
     }
 }
 
-async fn route_api_iam_group_add(State(ctx): State<web_server_ctx>, Json(req): Json<req_iam_group_add>) -> Response {
+async fn route_api_iam_group_add(
+    State(ctx): State<web_server_ctx>,
+    Json(req): Json<req_iam_group_add>,
+) -> Response {
     let s_group = safe_trim(&req.s_group, 64);
     let s_rights = safe_trim(&req.s_rights, 32);
 
@@ -877,7 +865,10 @@ async fn route_api_iam_group_add(State(ctx): State<web_server_ctx>, Json(req): J
     }
 }
 
-async fn route_api_iam_user_add(State(ctx): State<web_server_ctx>, Json(req): Json<req_iam_user_add>) -> Response {
+async fn route_api_iam_user_add(
+    State(ctx): State<web_server_ctx>,
+    Json(req): Json<req_iam_user_add>,
+) -> Response {
     let s_user = safe_trim(&req.s_user, 64);
     let s_password = safe_trim(&req.s_password, 256);
     let s_group = safe_trim(&req.s_group, 64);
@@ -908,7 +899,10 @@ async fn route_api_iam_user_add(State(ctx): State<web_server_ctx>, Json(req): Js
     }
 }
 
-async fn route_api_iam_path_add(State(ctx): State<web_server_ctx>, Json(req): Json<req_iam_path_add>) -> Response {
+async fn route_api_iam_path_add(
+    State(ctx): State<web_server_ctx>,
+    Json(req): Json<req_iam_path_add>,
+) -> Response {
     let s_path = safe_trim(&req.s_path, 512);
     let s_group_or_dash = safe_trim(&req.s_group_or_dash, 64);
     let s_rights = safe_trim(&req.s_rights, 32);
@@ -973,10 +967,6 @@ async fn route_api_doc_text_get(
     }
 }
 
-/* ============================================================================================
- * Route handlers: API
- * ============================================================================================ */
-
 async fn route_api_file_fetch_get(
     State(ctx): State<web_server_ctx>,
     Json(req): Json<req_file_fetch_get>,
@@ -1019,7 +1009,7 @@ async fn route_api_file_fetch_result(
 }
 
 /* ============================================================================================
- * Router build + server run
+ * Router build
  * ============================================================================================
  */
 
@@ -1035,10 +1025,16 @@ fn build_router(ctx: web_server_ctx) -> Router {
         .route("/api/p2p/connect", post(route_api_p2p_connect))
         .route("/api/p2p/send_text", post(route_api_p2p_send_text))
         .route("/api/search/combi/dispatch", post(route_api_search_combi_dispatch))
-        .route("/api/search/combi/result/:i_search_id", get(route_api_search_combi_result))
+        .route(
+            "/api/search/combi/result/:i_search_id",
+            get(route_api_search_combi_result),
+        )
         .route("/api/doc/text_get", post(route_api_doc_text_get))
         .route("/api/file/fetch_get", post(route_api_file_fetch_get))
-        .route("/api/file/fetch_result/:i_req_id", get(route_api_file_fetch_result))
+        .route(
+            "/api/file/fetch_result/:i_req_id",
+            get(route_api_file_fetch_result),
+        )
         .route("/api/iam/login", post(route_api_iam_login))
         .route("/api/iam/group_add", post(route_api_iam_group_add))
         .route("/api/iam/user_add", post(route_api_iam_user_add))
@@ -1047,6 +1043,10 @@ fn build_router(ctx: web_server_ctx) -> Router {
         .with_state(ctx)
 }
 
+/* ============================================================================================
+ * Server run
+ * ============================================================================================
+ */
 
 pub async fn run_web_server(
     s_bind: &str,
@@ -1055,6 +1055,7 @@ pub async fn run_web_server(
 ) -> Result<(), String> {
     /* History
      * 2026-01-11 Marcus Schlieper - Web server entry: build router, bind and serve.
+     * 2026-05-19 Marcus Schlieper - Keep utf-8 handling for JSON and static assets.
      */
 
     let addr: SocketAddr = s_bind
@@ -1062,7 +1063,6 @@ pub async fn run_web_server(
         .map_err(|_| "invalid_bind_addr".to_string())?;
 
     let ctx = web_server_ctx { tx_web_cmd, st_web };
-
     let app = build_router(ctx);
 
     let listener = tokio::net::TcpListener::bind(addr)
